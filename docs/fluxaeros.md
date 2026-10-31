@@ -76,7 +76,7 @@ For the CLI, substitute `build/bin/bel-cli` and use `-st -p "Your prompt" -n 128
 
 `--moe-slots 5000` controls the total device expert slots shared across layers, not context length or host-cache size. `--moe-profile PATH` seeds likely hot experts from a profile; it is not a cache snapshot and does not guarantee 22 tok/s. Workload routing and available startup seeding budget still matter.
 
-For diagnostics, set `MOE_IO_DIAG=1 MOE_DIAG=1`. These report demand bytes, cache hits/saves and actual CUDA Graph capture/replay. `MOE_VERIFY_ROUTER=/local/file` records raw router logits for exact comparisons. Traces contain workload-dependent data and should not be bundled in public archives.
+Routine paging statistics use debug logging. Add `--verbose` (`-verbose` or `-v`) for doorbell, cache/audit and backend traces; set `MOE_IO_DIAG=1 MOE_DIAG=1` as well for demand bytes, cache hits/saves and CUDA Graph capture/replay. Those environment variables do not bypass verbosity. `MOE_VERIFY_ROUTER=/local/file` records raw router logits for exact comparisons. Traces contain workload-dependent data and should not be bundled in public archives.
 
 Demand read/DMA failure is fatal rather than substituting zero expert weights. This protects output correctness; it is not automatic request recovery. Shut down the process, repair the storage/pack problem and restart. The single-context ownership guard rejects a second paged context rather than sharing global worker state unsafely.
 
@@ -137,6 +137,10 @@ An additional prefill-capture ablation measured 16.19 / 21.86 TG and 13.43 / 18.
 - The test exercised prefill chunks with no final-layer output rows; those empty FFNs must not introduce references to absent expert payloads. Nonempty routed layers still require the paging pool.
 - `/health`, `/v1/models`, tokenizer round-trip and an eight-token OpenAI chat completion passed. Native `bel-cli` connected to that server, showed the Betelgeuse banner, streamed an eight-token reply and exited. These short functional checks are not throughput measurements.
 - Tiny malformed inputs were rejected: stripped model without paging, non-expert offset outside the file, and truncated PLE. GGUF descriptor offsets remain subject to the standard contiguous-layout check.
+- The complete four-file bundle was moved to the Btrfs model directory and all four published SHA-256 hashes matched. The original duplicate shards/pack/index and Windows bundle copy were removed; the separate MTP sidecar was preserved.
+- Direct `bel-cli -m ...` was exercised with two interactive chat turns, `/clear` and `/exit`, without `--server-base`; it exited with code 0. Both native binaries displayed the embedded SVG star rendering in captured terminal output, and the server became healthy and exited cleanly.
+- The direct-CLI shutdown test exposed cache discard touching released mmap holes reused by anonymous mappings. `drop_cache` and `advise_random` now operate only on owned fragments. The deterministic `test-mmap` canary regression failed before the fix and passed after it; `test-arg-parser` also passed.
+- Quiet colored chat completed two turns with no routine MoE diagnostics; monochrome and simple-I/O modes also exited cleanly without color sequences. The exact `-verbose` flag restored doorbell telemetry and opt-in I/O counters. Reasoning-to-answer label/color transitions were exercised, and the native terminal screen was inspected. These are functional checks, not new throughput benchmarks.
 
 ## Historical release validation (before the stripped bundle)
 

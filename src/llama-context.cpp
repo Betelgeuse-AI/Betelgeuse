@@ -138,7 +138,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         const size_t stride = moe_doorbell_stage_stride();
         const int stage_cap = moe_doorbell_stage_cap();
         if (!stage_host || stride == 0 || stage_cap <= 0) {
-            fprintf(stderr, "[doorbell_worker] no pinned stage, worker disabled\n");
+            LLAMA_LOG_WARN("[doorbell_worker] no pinned stage, worker disabled\n");
             g_doorbell_running.store(false);
             return;
         }
@@ -150,7 +150,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         // submits the whole layer at once so the reads overlap.
         struct io_uring ring;
         bool ring_ok = io_uring_queue_init(512, &ring, 0) == 0;
-        fprintf(stderr, "[doorbell_worker] STARTED for %d layers, stage %d x %zu, uring=%d\n",
+        LLAMA_LOG_DEBUG("[doorbell_worker] STARTED for %d layers, stage %d x %zu, uring=%d\n",
                 n_layer, stage_cap, stride, ring_ok ? 1 : 0);
 
         std::vector<char>    pinned;
@@ -201,16 +201,16 @@ static void start_doorbell_worker(llama_context * ctx) {
         auto spec_started = std::chrono::steady_clock::now();
         auto log_io = [&]() {
             if (!io_diag) return;
-            fprintf(stderr, "[moe_io] served=%ld logical_bytes=%llu demand_queued=%ld demand_bytes=%llu spec_submitted=%ld spec_bytes=%llu spec_completed=%ld spec_cancelled=%ld spec_short=%ld cancel_requested=%ld ready_reused=%ld inflight_eligible=%ld inflight_joined=%ld join_retries=%ld duplicate_submissions=%ld spec_ms=%.3f join_lead_ms=%.3f submit_ms=%.3f\n",
+            LLAMA_LOG_DEBUG("[moe_io] served=%ld logical_bytes=%llu demand_queued=%ld demand_bytes=%llu spec_submitted=%ld spec_bytes=%llu spec_completed=%ld spec_cancelled=%ld spec_short=%ld cancel_requested=%ld ready_reused=%ld inflight_eligible=%ld inflight_joined=%ld join_retries=%ld duplicate_submissions=%ld spec_ms=%.3f join_lead_ms=%.3f submit_ms=%.3f\n",
                     served, (unsigned long long) logical_bytes, demand_queued, (unsigned long long) demand_bytes,
                     spec_submitted, (unsigned long long) spec_bytes, spec_completed, spec_cancelled, spec_short,
                     cancel_requested, ready_reused, inflight_eligible, inflight_joined, join_retries, duplicate_submissions,
                     spec_completed ? spec_elapsed_ms / spec_completed : 0.0,
                     inflight_eligible ? join_lead_ms / inflight_eligible : 0.0,
                     spec_submitted ? spec_submit_ms / spec_submitted : 0.0);
-            if (moe_doorbell_dma_enabled()) fprintf(stderr, "[moe_dma_io] copies=%llu h2d_bytes=%llu\n",
+            if (moe_doorbell_dma_enabled()) LLAMA_LOG_DEBUG("[moe_dma_io] copies=%llu h2d_bytes=%llu\n",
                 (unsigned long long) dma_copies, (unsigned long long) dma_bytes);
-            if (victim_cache) fprintf(stderr, "[moe_victim_cache] saved=%llu hits=%llu bytes=%llu cache_evict=%ld\n", (unsigned long long) victim_saved, (unsigned long long) victim_hits, (unsigned long long) victim_bytes, ctx->pager.stats_cache_evict());
+            if (victim_cache) LLAMA_LOG_DEBUG("[moe_victim_cache] saved=%llu hits=%llu bytes=%llu cache_evict=%ld\n", (unsigned long long) victim_saved, (unsigned long long) victim_hits, (unsigned long long) victim_bytes, ctx->pager.stats_cache_evict());
         };
         auto drain_spec = [&]() {
             if (!spec_ok) return;
@@ -603,7 +603,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         }
                         io_uring_queue_exit(&ring);
                         ring_ok = false;
-                        fprintf(stderr, "[doorbell_worker] io_uring submit failed, falling back to pread\n");
+                        LLAMA_LOG_WARN("[doorbell_worker] io_uring submit failed, falling back to pread\n");
                     }
 
                     // pre-failed experts must release the kernel now
@@ -681,7 +681,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 ok = got == want;
                             }
                             if (!ok) {
-                                fprintf(stderr, "[doorbell] short read layer=%d expert=%d role=%d res=%d want=%zu\n",
+                                LLAMA_LOG_ERROR("[doorbell] short read layer=%d expert=%d role=%d res=%d want=%zu\n",
                                         il, misses[(size_t) ci], r, res, want);
                                 read_fail[(size_t) ci] = 1;
                             }
@@ -726,7 +726,7 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 if ((served % 512) == 0) {
                     log_io();
-                    fprintf(stderr, "[doorbell] served=%ld layer=%d n=%d miss=%zu copy=%d failed=%ld "
+                    LLAMA_LOG_DEBUG("[doorbell] served=%ld layer=%d n=%d miss=%zu copy=%d failed=%ld "
                             "hit=%.1f%% read=%.2f ms/expert wait=%.2f ms/expert\n",
                             served, il, n, misses.size(), ncopy, failed,
                             n_sel ? 100.0 * (double) n_hit / (double) n_sel : 0.0,
@@ -741,7 +741,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                             compared += prediction->compared;
                             overlap += prediction->overlap;
                         }
-                        fprintf(stderr, "[prekick] pre_attn_topk/post_attn_topk overlap=%.2f%% matched=%llu compared=%llu submitted=%ld reused=%ld\n",
+                        LLAMA_LOG_DEBUG("[prekick] pre_attn_topk/post_attn_topk overlap=%.2f%% matched=%llu compared=%llu submitted=%ld reused=%ld\n",
                                 compared ? 100.0 * (double) overlap / compared : 0.0,
                                 (unsigned long long) overlap, (unsigned long long) compared, spec_submitted, spec_reused);
                     }
@@ -942,7 +942,7 @@ static void moe_slot_resolve_sync(
             }
         }
         if ((ctx->look_need % 20000) < (long) nk) {
-            fprintf(stderr, "[moe_look] need=%ld acc=%.1f%% pushed=%ld\n",
+            LLAMA_LOG_DEBUG("[moe_look] need=%ld acc=%.1f%% pushed=%ld\n",
                 ctx->look_need, 100.0 * ctx->look_hit / std::max(1L, ctx->look_need), ctx->look_push);
         }
     }
@@ -1063,7 +1063,7 @@ static void moe_slot_resolve_sync(
             xl_n += (long) uniq.size();
             if (xl_n >= 20000) {
                 xl_n = 0;
-                fprintf(stderr, "[moe_co] need=%ld cover=%.1f%% pushed=%ld ra_done=%ld\n",
+                LLAMA_LOG_DEBUG("[moe_co] need=%ld cover=%.1f%% pushed=%ld ra_done=%ld\n",
                     ctx->co_need, ctx->co_need ? 100.0 * ctx->co_cover / ctx->co_need : 0.0,
                     ctx->co_push, ctx->moe.ra_done.load());
             }
@@ -1140,7 +1140,7 @@ static void moe_slot_resolve_sync(
         p_warm = ctx->moe.n_warm_hit; p_pack = ctx->moe.n_pack_hit;
         const long wus = ctx->io_warm_us.load(), wn = ctx->io_warm_n.load();
         const long cus = ctx->io_cold_us.load(), cn = ctx->io_cold_n.load();
-        fprintf(stderr,
+        LLAMA_LOG_DEBUG(
                 "[moe_res] n=%ld tok=%ld nt=%ld sync_ms=%.1f io_ms=%.1f tot_ms=%.1f miss=%ld host=%ld warm=%ld/%ld warm_ms=%.2f cold_ms=%.2f\n",
                 s_nres, s_ntok, nt, s_ta, s_tio, s_tres, s_nmiss, s_host, d_warm, d_warm + d_pack,
                 wn ? (double) wus / wn / 1000.0 : 0.0, cn ? (double) cus / cn / 1000.0 : 0.0);
@@ -1348,7 +1348,7 @@ static void moe_cache_scan(llama_context * ctx, const char * tag, bool drop_dup)
             }
         }
     }
-    fprintf(stderr, "[moe_cache] %s vram=%ld ram=%ld dup=%ld warm=%ld warm_ram=%ld (%.1f%%) dropped=%.2f GiB\n",
+    LLAMA_LOG_DEBUG("[moe_cache] %s vram=%ld ram=%ld dup=%ld warm=%ld warm_ram=%ld (%.1f%%) dropped=%.2f GiB\n",
             tag, n_vram, n_ram, n_both, n_warm, n_warm_ram,
             n_warm ? 100.0 * (double) n_warm_ram / (double) n_warm : 0.0,
             dropped / 1073741824.0);
@@ -2094,7 +2094,7 @@ llama_context::llama_context(
                                 if (drop) {
                                     const size_t dropped = model.drop_mmap_cache();
                                     const bool dropped_backing = dropped > 0 && pager.pack_mode() && pager.drop_gguf_pages();
-                                    fprintf(stderr, "[moe_cache] GGUF mmap residency released (%.2f MiB mapped), backing cache drop=%d\n",
+                                    LLAMA_LOG_DEBUG("[moe_cache] GGUF mmap residency released (%.2f MiB mapped), backing cache drop=%d\n",
                                             (double) dropped / 1048576.0, dropped_backing ? 1 : 0);
                                 }
                             }
@@ -3280,12 +3280,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             std::chrono::high_resolution_clock::now() - t_gpu0).count();
         if (ubatch.n_tokens == 1 && !seen_tg) {
             seen_tg = true;
-            fprintf(stderr, "%s: first decode splits=%d nodes=%d n_tokens=%u n_ubatch=%u compute=%.2f ms\n",
+            LLAMA_LOG_DEBUG("%s: first decode splits=%d nodes=%d n_tokens=%u n_ubatch=%u compute=%.2f ms\n",
                 __func__, ggml_backend_sched_get_n_splits(sched.get()),
                 ggml_graph_n_nodes(res->get_gf()), ubatch.n_tokens, cparams.n_ubatch, ms);
         } else if (ubatch.n_tokens > 1 && !seen_pp) {
             seen_pp = true;
-            fprintf(stderr, "%s: first prefill splits=%d nodes=%d n_tokens=%u n_ubatch=%u compute=%.2f ms\n",
+            LLAMA_LOG_DEBUG("%s: first prefill splits=%d nodes=%d n_tokens=%u n_ubatch=%u compute=%.2f ms\n",
                 __func__, ggml_backend_sched_get_n_splits(sched.get()),
                 ggml_graph_n_nodes(res->get_gf()), ubatch.n_tokens, cparams.n_ubatch, ms);
             {
@@ -3301,9 +3301,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     (is_cpu ? cpu_ops : cuda_ops)[op ? op : "?"]++;
                 }
                 for (const auto & kv : cpu_ops) {
-                    fprintf(stderr, "[moe_be] prefill CPU op=%s n=%ld\n", kv.first.c_str(), kv.second);
+                    LLAMA_LOG_DEBUG("[moe_be] prefill CPU op=%s n=%ld\n", kv.first.c_str(), kv.second);
                 }
-                fprintf(stderr, "[moe_be] prefill cuda ops=%zu cpu ops=%zu\n", cuda_ops.size(), cpu_ops.size());
+                LLAMA_LOG_DEBUG("[moe_be] prefill cuda ops=%zu cpu ops=%zu\n", cuda_ops.size(), cpu_ops.size());
             }
         }
         if (ubatch.n_tokens > 1) {
@@ -3314,7 +3314,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             dc_splits = ggml_backend_sched_get_n_splits(sched.get());
         }
         if (pf_tok + dc_tok >= 2048) {
-            fprintf(stderr, "[moe_ub] prefill tok=%ld ms=%.0f (%.1f ms/tok) splits=%d | decode tok=%ld ms=%.0f (%.1f ms/tok) splits=%d\n",
+            LLAMA_LOG_DEBUG("[moe_ub] prefill tok=%ld ms=%.0f (%.1f ms/tok) splits=%d | decode tok=%ld ms=%.0f (%.1f ms/tok) splits=%d\n",
                 pf_tok, pf_ms, pf_ms / std::max(1L, pf_tok), pf_splits,
                 dc_tok, dc_ms, dc_ms / std::max(1L, dc_tok), dc_splits);
             pf_ms = 0.0; dc_ms = 0.0; pf_tok = 0; dc_tok = 0;
@@ -3337,7 +3337,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         s_t2 += moe_diag_publish_ms;
         moe_diag_publish_ms = 0.0;
         if (++s_n == 20) {
-            LLAMA_LOG_INFO("%s: DIAG steps=%ld T1_compute=%.2f ms T2_publish=%.2f ms per step\n",
+            LLAMA_LOG_DEBUG("%s: DIAG steps=%ld T1_compute=%.2f ms T2_publish=%.2f ms per step\n",
                            __func__, s_n, s_t1 / s_n, s_t2 / s_n);
             s_t1 = s_t2 = 0.0;
             s_n = 0;
@@ -6987,11 +6987,10 @@ void llama_context::moe_predict_and_prefetch() {
     if (s_pred_steps == 1 || (s_pred_steps % 25 == 0)) {
         const double acc = moe.pred_fresh > 0 ? 100.0 * (double) moe.pred_hit /
                 (double) (moe.pred_fresh * n_used) : 0.0;
-        fprintf(stderr, "[moe_predictor] step=%ld lat=%.4f ms (mean=%.4f ms), enq=%d total_enq=%ld "
+        LLAMA_LOG_DEBUG("[moe_predictor] step=%ld lat=%.4f ms (mean=%.4f ms), enq=%d total_enq=%ld "
                 "acc=%.1f%% ra_done=%ld\n",
             s_pred_steps, lat_ms, s_lat_total / s_pred_steps, step_enqueued, s_pf_enqueued,
             acc, moe.ra_done.load());
-        fflush(stderr);
     }
 }
 

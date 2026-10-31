@@ -1,4 +1,5 @@
 #include "moe_predictor.h"
+#include "llama-impl.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -185,7 +186,7 @@ bool moe_predictor_init(const char * bin_path, int n_layer, int in_dim, int h_di
 
     FILE * f = fopen(bin_path, "rb");
     if (!f) {
-        fprintf(stderr, "%s: failed to open %s\n", __func__, bin_path);
+        LLAMA_LOG_ERROR("%s: failed to open %s\n", __func__, bin_path);
         return false;
     }
 
@@ -205,7 +206,7 @@ bool moe_predictor_init(const char * bin_path, int n_layer, int in_dim, int h_di
     fclose(f);
 
     if (rd != total_w_bytes) {
-        fprintf(stderr, "%s: weight size mismatch, got %zu, expected %zu\n", __func__, rd, total_w_bytes);
+        LLAMA_LOG_ERROR("%s: weight size mismatch, got %zu, expected %zu\n", __func__, rd, total_w_bytes);
         return false;
     }
 
@@ -245,7 +246,7 @@ bool moe_predictor_init(const char * bin_path, int n_layer, int in_dim, int h_di
     cudaStreamSynchronize(g_pred.stream);
 
     g_pred.ready = true;
-    fprintf(stderr, "%s: RouterPredictorV2 (60M) armed on GPU (%.2f MB VRAM, cold-mask enabled)\n",
+    LLAMA_LOG_DEBUG("%s: RouterPredictorV2 (60M) armed on GPU (%.2f MB VRAM, cold-mask enabled)\n",
             __func__, (total_w_bytes + hist_bytes + res_bytes + top16_bytes) / (1024.0 * 1024.0));
     return true;
 }

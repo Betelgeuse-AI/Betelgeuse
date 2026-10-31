@@ -1,5 +1,6 @@
 #include "cli-context.h"
 #include "cli-ui.h"
+#include "betelgeuse-terminal-logo.h"
 
 #include "arg.h"
 #include "base64.hpp"
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -20,6 +22,8 @@ using json = common_json;
 struct cli_context_impl {
     json messages      = json::array();
     json pending_media = json::array(); // staged multimodal content parts
+    std::string model_path;
+    int64_t n_ctx = 0;
 };
 
 cli_context::cli_context(const common_params & params) : params(params), impl(new cli_context_impl()) {}
@@ -38,16 +42,6 @@ static bool should_stop() {
 }
 
 static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
-
-const char * LLAMA_ASCII_LOGO = R"(
-▄▄ ▄▄
-██ ██
-██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
-██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
-██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
-                                    ██    ██
-                                    ▀▀    ▀▀
-)";
 
 // number of values an arg consumes on the command line
 static int arg_num_values(const common_arg & opt) {
@@ -116,7 +110,7 @@ bool cli_context::init() {
             return false;
         }
 
-        spinner.emplace("\n\nLoading model...");
+        spinner.emplace("\nLoading model...");
 
         server.emplace();
         if (!server->start(params)) {
@@ -185,6 +179,10 @@ bool cli_context::init() {
 void cli_context::fetch_server_props() {
     try {
         json props = json::parse(client.get("/props"));
+        impl->model_path = props.value("model_path", "");
+        if (props.contains("default_generation_settings") && props.at("default_generation_settings").is_object()) {
+            impl->n_ctx = props.at("default_generation_settings").value("n_ctx", int64_t(0));
+        }
         model_name = props.value("model_alias", "");
         if (model_name.empty()) {
             const std::string path = props.value("model_path", "");
@@ -424,38 +422,64 @@ int cli_context::run() {
         modalities += ", video";
     }
 
-    std::string banner;
-    banner += "\n";
-    banner += "Betelgeuse (Alpha-Orionis) | bel-cli\n";
-    banner += "\n";
-    banner += "build      : " + build_info + "\n";
-    banner += "model      : " + model_name + "\n";
-    if (!model_ftype.empty()) {
-        banner += "ftype      : " + model_ftype + "\n";
+    std::string_view model_label = server && !impl->model_path.empty() ? impl->model_path : model_name;
+    if (model_label.empty()) {
+        model_label = server ? params.model.path : client.model;
     }
-    banner += "modalities : " + modalities + "\n";
+    const size_t separator = model_label.find_last_of("/\\");
+    if (separator != std::string_view::npos) {
+        model_label.remove_prefix(separator + 1);
+    }
+    if (model_label.empty()) {
+        model_label = "unknown model";
+    }
+
+    ui::reset_display();
+    if (ui::use_color) {
+        console::log("%s\n", betelgeuse_terminal_logo);
+        ui::reset_display();
+    } else if (!params.simple_io) {
+        console::log("\n       ##\n     ######\n   ##########\n     ######\n       ##\n");
+    }
+
+    console::log("\n");
+    ui::set_style(ui::color_accent);
+    console::log("Betelgeuse");
+    ui::reset_display();
+    console::log(" / bel-cli\n");
+    ui::set_style(ui::color_amber);
+    console::log("ready");
+    ui::reset_display();
+    console::log(" | %.*s | %s", int(model_label.size()), model_label.data(), server ? "local" : "remote");
+    if (server) {
+        if (impl->n_ctx > 0) {
+            console::log(" | ctx %lld", (long long) impl->n_ctx);
+        } else {
+            console::log(" | ctx unavailable");
+        }
+    }
+    console::log("\n");
+    ui::set_style(ui::color_muted);
+    console::log("  %s | %s | build %s\n",
+        model_ftype.empty() ? "quantization unavailable" : model_ftype.c_str(),
+        modalities.c_str(), build_info.empty() ? "unavailable" : build_info.c_str());
     if (!params.system_prompt.empty()) {
-        banner += "using custom system prompt\n";
+        console::log("  custom system prompt\n");
     }
-    banner += "\n";
-    banner += "available commands:\n";
-    banner += "  /exit or Ctrl+C     stop or exit\n";
-    banner += "  /regen              regenerate the last response\n";
-    banner += "  /clear              clear the chat history\n";
-    banner += "  /read <file>        add a text file\n";
-    banner += "  /glob <pattern>     add text files using globbing pattern\n";
+    console::log("  /exit or Ctrl+C: stop/exit | /clear: reset | /regen: retry\n");
+    console::log("  /read <file> | /glob <pattern>");
     if (has_vision) {
-        banner += "  /image <file>       add an image file\n";
+        console::log(" | /image <file>");
     }
     if (has_audio) {
-        banner += "  /audio <file>       add an audio file\n";
+        console::log(" | /audio <file>");
     }
     if (has_video) {
-        banner += "  /video <file>       add a video file\n";
+        console::log(" | /video <file>");
     }
-    banner += "\n";
-
-    ui::show_message(banner);
+    console::log("\n");
+    ui::reset_display();
+    console::flush();
 
     // interactive loop
     std::string cur_msg;
@@ -626,7 +650,10 @@ int cli_context::run() {
 
         cli_timings timings;
         generated_content content;
+        const auto generation_start = params.show_timings ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         generate_completion(content, timings);
+        const double generation_seconds = params.show_timings ? std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - generation_start).count() : 0.0;
 
         json assistant_msg = {
             {"role",    "assistant"},
@@ -653,11 +680,7 @@ int cli_context::run() {
         }
 
         if (params.show_timings) {
-            ui::show_info(string_format(
-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
-                timings.prompt_per_second,
-                timings.predicted_per_second
-            ));
+            ui::show_timings(timings.prompt_per_second, timings.predicted_per_second, generation_seconds);
         }
 
         if (params.single_turn) {
@@ -665,7 +688,7 @@ int cli_context::run() {
         }
     }
 
-    ui::show_message("\n\nExiting...");
+    ui::show_message("\nGoodbye.");
 
     return 0;
 }

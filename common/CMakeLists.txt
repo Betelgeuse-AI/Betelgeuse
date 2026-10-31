@@ -55,6 +55,23 @@ set(TARGET llama-common)
 
 include(parsers/sources.cmake)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_program(BETELGEUSE_RSVG_CONVERT NAMES rsvg-convert REQUIRED)
+find_program(BETELGEUSE_IMAGE_TOOL NAMES magick convert REQUIRED)
+
+set(BETELGEUSE_TERMINAL_LOGO ${CMAKE_CURRENT_BINARY_DIR}/betelgeuse-terminal-logo.h)
+add_custom_command(
+    OUTPUT ${BETELGEUSE_TERMINAL_LOGO}
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/assets/generate_terminal_logo.py
+            --svg ${PROJECT_SOURCE_DIR}/assets/betelgeuse.svg
+            --output ${BETELGEUSE_TERMINAL_LOGO}
+            --rasterizer ${BETELGEUSE_RSVG_CONVERT}
+            --image-tool ${BETELGEUSE_IMAGE_TOOL}
+    DEPENDS ${PROJECT_SOURCE_DIR}/assets/betelgeuse.svg
+            ${PROJECT_SOURCE_DIR}/assets/generate_terminal_logo.py
+    VERBATIM
+)
+
 add_library(${TARGET}
     ${LLAMA_CHAT_PARSERS_SOURCES}
     arg.cpp
@@ -69,6 +86,7 @@ add_library(${TARGET}
     chat.cpp
     chat.h
     common.cpp
+    ${BETELGEUSE_TERMINAL_LOGO}
     common.h
     console.cpp
     console.h
@@ -133,7 +151,7 @@ set_target_properties(${TARGET} PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(${TARGET} PUBLIC .)
+target_include_directories(${TARGET} PUBLIC . ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 

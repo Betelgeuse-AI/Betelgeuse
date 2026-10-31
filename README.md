@@ -57,7 +57,7 @@ The profile seeds likely hot experts; it is neither weights nor a prewarmed cach
 
 ## Build native binaries
 
-The paged configuration targets **Linux x86-64, CUDA `sm_86`, RTX 3060 12 GB and local NVMe**. Install a C++17 compiler, CMake, CUDA toolkit/driver, liburing development files and the normal [llama.cpp build dependencies](docs/build.md).
+The paged configuration targets **Linux x86-64, CUDA `sm_86`, RTX 3060 12 GB and local NVMe**. Install a C++17 compiler, CMake, CUDA toolkit/driver, liburing development files and the normal [llama.cpp build dependencies](docs/build.md). Building the embedded terminal logo also requires Python 3, `rsvg-convert` (librsvg) and ImageMagick (`magick` or `convert`); the installed binaries need none of these image tools at runtime.
 
 ```bash
 cmake -S . -B build \
@@ -86,7 +86,7 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
 
 Open `http://127.0.0.1:8080` or use the OpenAI-compatible API. The systemd scope enforces the historical 12 GiB process and zero-swap limits on the 16 GB host; it does not allocate extra memory. Keep the server bound to localhost unless you have separately reviewed authentication and deployment security.
 
-For a single-turn CLI request, use the same memory envelope and paging parameters:
+For direct interactive CLI chat, use the same memory envelope and paging parameters. No separately started server or `--server-base` is needed:
 
 ```bash
 systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
@@ -95,8 +95,14 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
     --moe-direct-io --moe-pack-dir "$BUNDLE" \
     --moe-profile "$BUNDLE/profile-qwen4exp.bin" --moe-slots 5000 \
     -ngl 99 -np 1 -c 512 -ub 64 -t 6 --cache-warmup 0 \
-    -st -p "Explain why stars appear to twinkle." -n 128
+    --color on -n 256
 ```
+
+Enter messages at the `You >` prompt; `/clear` resets the conversation and `/exit` quits. Add `-st -p "Your prompt"` only for a single-turn invocation. The native CLI starts its inference engine internally, as the inherited llama.cpp CLI does.
+
+Both CLI and paged-server startup render the star from the approved `assets/betelgeuse.svg` as an embedded true-color terminal image, with a native text wordmark for readability. `--color on` forces it; `--color off` selects plain text, and the CLI also supports `--simple-io`. `NO_COLOR` disables automatic color selection. This is ANSI half-cell rasterization of the SVG artwork, not a terminal image-protocol requirement.
+
+Chat uses a compact readiness header, red/amber speaker accents, muted reasoning and a per-turn token-rate/elapsed-time footer. Routine paging diagnostics are quiet by default. Add `--verbose` (`-verbose` or `-v`) to see doorbell/cache/backend traces; storage and CUDA failures remain error messages.
 
 ### Paging and warmup flags are different controls
 

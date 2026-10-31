@@ -1501,7 +1501,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-co", "--color"}, "[on|off|auto]",
-        "Colorize output to distinguish prompt and user input from generations ('on', 'off', or 'auto', default: 'auto')\n"
+        "Colorize output and the startup banner ('on', 'off', or 'auto', default: 'auto')\n"
         "'auto' enables colors when output is to a terminal",
         [](common_params & params, const std::string & value) {
             if (is_truthy(value)) {
@@ -1515,7 +1515,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("error: unknown value for --color: '%s'\n", value.c_str()));
             }
         }
-    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
     add_opt(common_arg(
         {"-t", "--threads"}, "N",
         string_format("number of CPU threads to use during generation (default: %d)", params.cpuparams.n_threads),
@@ -4004,7 +4004,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOG_COLORS"));
     add_opt(common_arg(
-        {"-v", "--verbose", "--log-verbose"},
+        {"-v", "-verbose", "--verbose", "--log-verbose"},
         "Set verbosity level to infinity (i.e. log all messages, useful for debugging)",
         [](common_params & params) {
             params.verbosity = INT_MAX;

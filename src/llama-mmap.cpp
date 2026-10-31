@@ -688,13 +688,16 @@ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragme
 
 void llama_mmap::drop_cache() const {
 #ifdef _POSIX_MAPPED_FILES
-    void * base = pimpl->addr;
-    size_t len = pimpl->size;
-    if (!base || !len) return;
-    const size_t ps = (size_t) sysconf(_SC_PAGESIZE);
-    uintptr_t p0 = ((uintptr_t) base + ps - 1) & ~(ps - 1);
-    uintptr_t p1 = ((uintptr_t) base + len) & ~(ps - 1);
-    if (p1 > p0) madvise((void *) p0, p1 - p0, MADV_DONTNEED);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(pimpl->addr);
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    // Released holes can hold unrelated anonymous mappings, including thread stacks.
+    for (const auto & fragment : pimpl->mapped_fragments) {
+        const uintptr_t first = (base + fragment.first + page - 1) & ~(page - 1);
+        const uintptr_t last = (base + fragment.second) & ~(page - 1);
+        if (last > first) {
+            madvise(reinterpret_cast<void *>(first), last - first, MADV_DONTNEED);
+        }
+    }
 #else
     (void) 0;
 #endif
@@ -702,10 +705,10 @@ void llama_mmap::drop_cache() const {
 
 void llama_mmap::advise_random() const {
 #ifdef _POSIX_MAPPED_FILES
-    void * base = pimpl->addr;
-    size_t len = pimpl->size;
-    if (!base || !len) return;
-    posix_madvise(base, len, POSIX_MADV_RANDOM);
+    for (const auto & fragment : pimpl->mapped_fragments) {
+        posix_madvise(static_cast<char *>(pimpl->addr) + fragment.first,
+                      fragment.second - fragment.first, POSIX_MADV_RANDOM);
+    }
 #else
     (void) 0;
 #endif

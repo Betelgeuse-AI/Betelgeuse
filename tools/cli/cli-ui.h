@@ -127,48 +127,86 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
     return matches;
 }
 
-// note: make this view implementation generic, so that we can move to TUI in the future if we want to
 namespace ui {
+    static bool use_color = false;
+    static bool simple_io = false;
+    static constexpr const char * color_accent = "\033[1;38;2;152;30;50m";
+    static constexpr const char * color_amber = "\033[38;2;237;170;67m";
+    static constexpr const char * color_muted = "\033[2;38;2;170;150;141m";
+    static constexpr const char * color_timing = "\033[38;2;170;99;48m";
+
+    static void reset_display() {
+        console::set_display(DISPLAY_TYPE_RESET);
+        // The console cache does not track our private colors.
+        if (use_color) {
+            console::log("\033[0m");
+        }
+    }
+
+    static void set_style(const char * color) {
+        reset_display();
+        if (use_color) {
+            console::log("%s", color);
+        }
+    }
+
     static void init(const common_params & params) {
+        simple_io = params.simple_io;
+        use_color = params.use_color && !simple_io;
         // TODO: avoid using atexit() here by making `console` a singleton
-        console::init(params.simple_io, params.use_color);
-        atexit([]() { console::cleanup(); });
+        console::init(simple_io, use_color);
+        atexit([]() { reset_display(); console::cleanup(); });
 
         console::set_completion_callback(auto_completion_callback);
     }
 
     struct spinner {
-        spinner(const std::string & message) {
+        spinner(std::string_view message) {
             if (!message.empty()) {
-                console::log("%s ", message.c_str());
+                set_style(color_amber);
+                console::log("%.*s ", int(message.size()), message.data());
+                reset_display();
+                console::flush();
             }
             console::spinner::start();
         }
         ~spinner() {
             console::spinner::stop();
+            reset_display();
         }
     };
 
     struct user_turn {
         user_turn() {
-            console::set_display(DISPLAY_TYPE_USER_INPUT);
+            reset_display();
         }
         ~user_turn() {
-            console::set_display(DISPLAY_TYPE_RESET);
+            reset_display();
+            console::flush();
+        }
+        void print_prompt() {
+            console::log("\n");
+            set_style(color_amber);
+            console::log("%s", simple_io ? "> " : "You > ");
+            reset_display();
         }
         void echo(const std::string & buffer) {
+            print_prompt();
             if (buffer.size() > 500) {
-                console::log("\n> %s ... (truncated)\n", buffer.substr(0, 500).c_str());
+                console::log("%s ... (truncated)\n", buffer.substr(0, 500).c_str());
             } else {
-                console::log("\n> %s\n", buffer.c_str());
+                console::log("%s\n", buffer.c_str());
             }
         }
         std::string read_input(bool multiline_input, const char * prompt = nullptr) {
             if (prompt) {
+                set_style(color_amber);
                 console::log("%s", prompt);
+                reset_display();
             } else {
-                console::log("\n> ");
+                print_prompt();
             }
+            console::flush();
             std::string buffer;
             std::string line;
             bool another_line = true;
@@ -187,37 +225,35 @@ namespace ui {
     struct assistant_turn {
         assistant_display_mode mode = ASSISTANT_DISPLAY_MODE_CONTENT;
         bool trailing_newline = true;
-        bool is_inside_reasoning = false;
         assistant_turn() {
-            console::set_display(DISPLAY_TYPE_RESET);
+            set_style(color_accent);
+            console::log("\nAssistant:\n");
+            reset_display();
+            console::flush();
         }
         ~assistant_turn() {
-            console::set_display(DISPLAY_TYPE_RESET);
             add_newline_if_needed();
+            reset_display();
+            console::flush();
         }
         void push(assistant_display_mode m, const std::string & buffer) {
+            if (buffer.empty()) {
+                return;
+            }
             if (m != mode) {
                 add_newline_if_needed();
                 switch (m) {
                     case ASSISTANT_DISPLAY_MODE_CONTENT:
-                        {
-                            if (is_inside_reasoning) {
-                                console::log("[End thinking]\n\n");
-                                is_inside_reasoning = false;
-                            }
-                            console::set_display(DISPLAY_TYPE_RESET);
-                        } break;
+                        set_style(color_amber);
+                        console::log("Answer:\n");
+                        reset_display();
+                        break;
                     case ASSISTANT_DISPLAY_MODE_REASONING:
-                        {
-                            console::set_display(DISPLAY_TYPE_REASONING);
-                            is_inside_reasoning = true;
-                            console::log("\n[Start thinking]\n\n");
-                        } break;
+                        set_style(color_muted);
+                        console::log("Reasoning:\n");
+                        break;
                 }
-            }
-            mode = m;
-            if (buffer.empty()) {
-                return;
+                mode = m;
             }
             trailing_newline = buffer.back() == '\n';
             console::log("%s", buffer.c_str());
@@ -227,25 +263,30 @@ namespace ui {
             if (!trailing_newline) {
                 console::log("\n");
                 console::flush();
+                trailing_newline = true;
             }
         }
     };
 
     static void show_error(const std::string & title, const std::string & message = "") {
         console::spinner::stop();
+        reset_display();
         console::error("Error: %s\n", title.c_str());
         if (!message.empty()) {
             console::log("%s\n", message.c_str());
         }
+        reset_display();
     }
 
     static void show_message(const std::string & message) {
         console::log("%s\n", message.c_str());
     }
 
-    static void show_info(const std::string & message) {
-        console::set_display(DISPLAY_TYPE_INFO);
-        console::log("%s\n", message.c_str());
-        console::set_display(DISPLAY_TYPE_RESET);
+    static void show_timings(double prompt_per_second, double predicted_per_second, double elapsed_seconds) {
+        set_style(color_timing);
+        console::log("  %.1f tok/s | %.1fs | prompt %.1f tok/s\n",
+            predicted_per_second, elapsed_seconds, prompt_per_second);
+        reset_display();
+        console::flush();
     }
 }

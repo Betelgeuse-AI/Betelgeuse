@@ -4584,10 +4584,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             for (int index = 0; index < cgraph->n_nodes; ++index) {
                 if (cgraph->nodes[index]->op != GGML_OP_MOE_SLOT_RESOLVE_KICK) continue;
                 if (cuda_graph_update_required && !logged_capture) {
-                    fprintf(stderr, "[moe_graph] decode CUDA graph captured, nodes=%d\n", cgraph->n_nodes);
+                    GGML_LOG_DEBUG("[moe_graph] decode CUDA graph captured, nodes=%d\n", cgraph->n_nodes);
                     logged_capture = true;
                 } else if (!cuda_graph_update_required && !logged_replay) {
-                    fprintf(stderr, "[moe_graph] decode CUDA graph replay active, nodes=%d\n", cgraph->n_nodes);
+                    GGML_LOG_DEBUG("[moe_graph] decode CUDA graph replay active, nodes=%d\n", cgraph->n_nodes);
                     logged_replay = true;
                 }
                 break;

@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "betelgeuse-terminal-logo.h"
 
 #include "../src/llama-ext.h"
 
@@ -1492,12 +1493,16 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.moe_direct_io) {
-        LOG_INF("%s", "\n"
-                "      ##\n"
-                "    ######    Betelgeuse (Alpha-Orionis)\n"
-                "  ##########  demand-paged MoE\n"
-                "    ######\n"
-                "      ##\n\n");
+        if (params.use_color && !params.simple_io) {
+            LOG_INF("\n%s\nBetelgeuse (Alpha-Orionis) | demand-paged MoE\n\n", betelgeuse_terminal_logo);
+        } else {
+            LOG_INF("%s", "\n"
+                    "      ##\n"
+                    "    ######    Betelgeuse (Alpha-Orionis)\n"
+                    "  ##########  demand-paged MoE\n"
+                    "    ######\n"
+                    "      ##\n\n");
+        }
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);

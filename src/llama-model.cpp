@@ -2073,7 +2073,7 @@ void llama_model::audit_residency() const {
     };
     for (const auto & kv : tensors_by_name) put(kv.first, kv.second);
     for (const auto & kv : cat) {
-        fprintf(stderr, "[moe_audit] %-15s CUDA %8.0f MiB  HOST %8.0f MiB\n",
+        LLAMA_LOG_DEBUG("[moe_audit] %-15s CUDA %8.0f MiB  HOST %8.0f MiB\n",
             kv.first.c_str(), kv.second.cuda / 1048576.0, kv.second.host / 1048576.0);
     }
     {
@@ -2091,7 +2091,7 @@ void llama_model::audit_residency() const {
             if (in_map) vram_alias += (double) ggml_nbytes(t);
             else vram_real += (double) ggml_nbytes(t);
         }
-        fprintf(stderr, "[moe_audit] TRUE-VRAM real-copies %.0f MiB  host-aliased %.0f MiB\n",
+        LLAMA_LOG_DEBUG("[moe_audit] TRUE-VRAM real-copies %.0f MiB  host-aliased %.0f MiB\n",
             vram_real / 1048576.0, vram_alias / 1048576.0);
     }
     {
@@ -2102,7 +2102,7 @@ void llama_model::audit_residency() const {
         }
         std::sort(big.begin(), big.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
         for (size_t i = 0; i < big.size() && i < 20; i++) {
-            fprintf(stderr, "[moe_audit] host-big %-60s %8.0f MiB\n",
+            LLAMA_LOG_DEBUG("[moe_audit] host-big %-60s %8.0f MiB\n",
                 big[i].first.c_str(), (double) big[i].second / 1048576.0);
         }
     }

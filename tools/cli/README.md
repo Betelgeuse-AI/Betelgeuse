@@ -1,6 +1,6 @@
 # bel-cli: Betelgeuse command-line client
 
-`bel-cli` is this fork's native CLI, built from the existing `llama-cli` CMake target. The llama C API and `LLAMA_ARG_*` environment variables are unchanged. The paged MoE path is experimental and partly broken; **prefer [`bel-server`](../server/README.md)** for the documented RTX 3060 configuration.
+`bel-cli` is this fork's native CLI, built from the existing `llama-cli` CMake target. It loads a local model directly with `-m` and starts its inference engine internally; `--server-base` is optional, not required for chat. The llama C API and `LLAMA_ARG_*` environment variables are unchanged. The paged MoE path is experimental and partly broken; **prefer [`bel-server`](../server/README.md)** for the documented RTX 3060 configuration.
 
 ## Betelgeuse bundle
 
@@ -14,8 +14,16 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
     --moe-direct-io --moe-pack-dir "$BUNDLE" \
     --moe-profile "$BUNDLE/profile-qwen4exp.bin" --moe-slots 5000 \
     -ngl 99 -np 1 -c 512 -ub 64 -t 6 --cache-warmup 0 \
-    -st -p "Explain why stars appear to twinkle." -n 128
+    --color on -n 256
 ```
+
+This opens an interactive `You >` prompt (`>` with `--simple-io`). Enter messages normally, use `/clear` to reset the conversation and `/exit` to quit. Add `-st -p "Your prompt"` for one noninteractive turn. No separate server command or URL is needed.
+
+The startup banner embeds a true-color terminal rendering generated from the star in `assets/betelgeuse.svg`, with a native text wordmark. `--color on` shows it; `--color off` or `--simple-io` uses plain text, and `NO_COLOR` disables automatic color selection. Build dependencies are Python 3, `rsvg-convert` and ImageMagick; no image helper is launched at runtime.
+
+The compact header shows the model basename, local/remote mode, quantization and context. Speaker labels use Betelgeuse red/amber accents, reasoning is muted, and the footer shows decode rate, elapsed request time and prompt rate. Monochrome and simple-I/O modes keep readable labels without color sequences.
+
+Routine `[doorbell]`, cache/audit and pager traces do not print during ordinary chat. Use `--verbose`, `-verbose` or `-v` for diagnostics. `MOE_IO_DIAG=1` and `MOE_DIAG=1` select additional I/O and graph statistics, but these still require debug verbosity. Genuine I/O/CUDA failures remain visible.
 
 `--moe-direct-io` uses the buffered demand worker and a bounded VRAM expert pool; it is required for stripped expert tensors. `--moe-profile` supplies seeding hints, not a 22 tok/s guarantee. The 5,000 slots are shared across layers and are separate from the host victim cache.
 

@@ -413,7 +413,7 @@ Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-cre
 
 ## Build
 
-`bel-server` is built from the retained CMake target `llama-server`. For the paged configuration, use Linux with the CUDA toolkit and liburing development package:
+`bel-server` is built from the retained CMake target `llama-server`. For the paged configuration, use Linux with the CUDA toolkit and liburing development package. Python 3, `rsvg-convert` and ImageMagick generate the embedded SVG terminal banner at build time; no image tools are needed at runtime.
 
 - Using `CMake`:
 
@@ -451,6 +451,8 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
 ```
 
 Open `http://127.0.0.1:8080` for the web UI or use the API below. Do not expose the service to an untrusted network without an authentication and deployment review. Other platforms, upstream container images, larger contexts and multi-model routing are not certified for this paged bundle. The general API reference is retained for ordinary models as well.
+
+When paging initializes, the startup log displays the same true-color star rendering from `assets/betelgeuse.svg` as `bel-cli`, with a native text wordmark. Use `--color on` to force the ANSI image, or `--color off` for the plain-text banner. `NO_COLOR` disables automatic color selection.
 
 ## Using with CURL
 

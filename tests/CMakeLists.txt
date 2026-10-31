@@ -350,6 +350,10 @@ add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 llama_test(${TEST_TARGET})
 
+if (UNIX)
+    llama_build_and_test(test-mmap.cpp ../src/llama-mmap.cpp)
+endif()
+
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
     llama_build_and_test(test-gguf.cpp)

@@ -5,6 +5,7 @@
 // DMAs them to the caller. Nothing is cached on disk; the kernel page cache is
 // never consulted for the streamed bytes.
 #include "moe_pager.h"
+#include "llama-impl.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -354,7 +355,7 @@ int moe_pager::submit_(int key, bool demand) {
     q.got[0] = got_self[0]; q.got[1] = got_self[1]; q.got[2] = got_self[2];
     reqs_.push_back(q);
     int nsub = io_uring_submit((struct io_uring *) ring_);
-    if (nsub <= 0) { fprintf(stderr, "pager submit failed il=%d e=%d nsub=%d\n", il, e, nsub); }
+    if (nsub <= 0) { LLAMA_LOG_ERROR("pager submit failed il=%d e=%d nsub=%d\n", il, e, nsub); }
     if (pack_mode_) { io_ops_ += 1; io_bytes_ += (long) boff; n_pack_reads_ += 1; }
     else            { io_ops_ += 3; io_bytes_ += (long) boff; n_gguf_reads_ += 3; }
     return (int) reqs_.size() - 1;
@@ -503,8 +504,8 @@ bool moe_pager::init_cache(size_t bytes) {
         cache_slots_ = 0;
         return false;
     }
-    fprintf(stderr, "moe_pager: host cache anonymous=%d\n", anonymous ? 1 : 0);
-    fprintf(stderr, "moe_pager: Tier 1 host cache %.2f GiB, %d slots x %zu B\n",
+    LLAMA_LOG_DEBUG("moe_pager: host cache anonymous=%d\n", anonymous ? 1 : 0);
+    LLAMA_LOG_DEBUG("moe_pager: Tier 1 host cache %.2f GiB, %d slots x %zu B\n",
             (double) bytes / (1024.0*1024.0*1024.0), cache_slots_, cache_bytes_);
     cache_idx_.assign((size_t) n_layer_ * n_expert_, -1);
     cache_used_.assign((size_t) cache_slots_, 0);
@@ -824,7 +825,7 @@ void * moe_pager::worker_stream() {
         tried = true;
         cudaError_t e = cudaStreamCreateWithFlags(&ws, cudaStreamNonBlocking);
         if (e != cudaSuccess) {
-            fprintf(stderr, "pager worker_stream create failed: %d\n", (int) e);
+            LLAMA_LOG_ERROR("pager worker_stream create failed: %d\n", (int) e);
             ws = nullptr;
         }
     }
@@ -842,12 +843,12 @@ bool moe_pager::fetch(int il, int e, void * dst_gate, size_t gate_bytes,
 
 bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream, bool sync_gpu) {
     if (n_targets <= 0) return true;
-    fprintf(stderr, "[fetch_batch] START il=%d n_targets=%d\n", il, n_targets);
+    LLAMA_LOG_DEBUG("[fetch_batch] START il=%d n_targets=%d\n", il, n_targets);
     for (int i = 0; i < n_targets; ++i) {
-        fprintf(stderr, "[fetch_batch]   target i=%d exp=%d\n", i, targets[i].expert);
+        LLAMA_LOG_DEBUG("[fetch_batch]   target i=%d exp=%d\n", i, targets[i].expert);
     }
     std::lock_guard<std::mutex> lock(mtx_);
-    fprintf(stderr, "[fetch_batch] free_demand=%zu free_stage=%zu reqs=%zu\n",
+    LLAMA_LOG_DEBUG("[fetch_batch] free_demand=%zu free_stage=%zu reqs=%zu\n",
             free_demand_.size(), free_stage_.size(), reqs_.size());
     cudaStream_t ws = stream ? (cudaStream_t) stream : (cudaStream_t) worker_stream();
     if (!ws) {
@@ -954,7 +955,7 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
             }
         }
         if (pool.empty()) {
-            fprintf(stderr, "fetch_batch: no staging slots free for expert %d\n", targets[i].expert);
+            LLAMA_LOG_ERROR("fetch_batch: no staging slots free for expert %d\n", targets[i].expert);
             n_io_fail_++;
             continue;
         }
@@ -983,7 +984,7 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
         q.il = il; q.e = e; q.stage = st; q.done = 0; q.used = true; q.demand = true;
         q.got[0] = q.got[1] = q.got[2] = -1;
         reqs_.push_back(q);
-        fprintf(stderr, "[fetch_batch] PREP sqe i=%d exp=%d ridx=%d st=%d\n", i, e, ridx, st);
+        LLAMA_LOG_DEBUG("[fetch_batch] PREP sqe i=%d exp=%d ridx=%d st=%d\n", i, e, ridx, st);
         items[i].req_idx = ridx;
         pending_indices.push_back(i);
         if (pack_mode_) { io_ops_ += 1; io_bytes_ += (long) boff; n_pack_reads_ += 1; }
@@ -992,13 +993,17 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
 
     // 3. Submit ALL queued SQEs in ONE io_uring_submit call!
     int n_sub = io_uring_submit((struct io_uring *) ring_);
-    fprintf(stderr, "[fetch_batch] SUBMITTED %d sqes, pending=%zu\n", n_sub, pending_indices.size());
+    if (n_sub < 0) {
+        LLAMA_LOG_ERROR("[fetch_batch] io_uring submit failed: %d sqes, pending=%zu\n", n_sub, pending_indices.size());
+    } else {
+        LLAMA_LOG_DEBUG("[fetch_batch] SUBMITTED %d sqes, pending=%zu\n", n_sub, pending_indices.size());
+    }
     // 4. Reap completions: as each expert's reads complete, immediately enqueue cudaMemcpyAsync
     size_t pending_done = 0;
     while (pending_done < pending_indices.size()) {
         struct io_uring_cqe * cqe = nullptr;
         if (io_uring_wait_cqe((struct io_uring *) ring_, &cqe) < 0) {
-            fprintf(stderr, "[fetch_batch] io_uring_wait_cqe failed!\n");
+            LLAMA_LOG_ERROR("[fetch_batch] io_uring_wait_cqe failed!\n");
             break;
         }
         const uint64_t ud = cqe->user_data;
@@ -1007,7 +1012,7 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
 
         const int rr = (int)(ud / 4);
         const int role = (int)(ud % 4);
-        fprintf(stderr, "[fetch_batch] cqe res=%d ud=%lu rr=%d role=%d\n", res, (unsigned long)ud, rr, role);
+        LLAMA_LOG_DEBUG("[fetch_batch] cqe res=%d ud=%lu rr=%d role=%d\n", res, (unsigned long)ud, rr, role);
 
         if (rr >= 0 && rr < (int) reqs_.size() && reqs_[rr].used) {
             reqs_[rr].done++;
@@ -1025,6 +1030,8 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
                         bool ok = true;
                         for (int k = 0; k < need; k++) {
                             if (reqs_[rr].got[k] != (long) s[k].len) {
+                                LLAMA_LOG_ERROR("[fetch_batch] short read layer=%d expert=%d role=%d res=%ld want=%u\n",
+                                                il, e, k, reqs_[rr].got[k], s[k].len);
                                 ok = false;
                                 break;
                             }
@@ -1062,10 +1069,10 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
     if (sync_gpu) {
         cudaError_t se = cudaStreamSynchronize(ws);
         if (se != cudaSuccess) {
-            fprintf(stderr, "fetch_batch cudaStreamSynchronize failed: %d\n", (int) se);
+            LLAMA_LOG_ERROR("fetch_batch cudaStreamSynchronize failed: %d\n", (int) se);
             return false;
         }
     }
-    fprintf(stderr, "[fetch_batch] FINISHED il=%d pending_done=%zu\n", il, pending_done);
+    LLAMA_LOG_DEBUG("[fetch_batch] FINISHED il=%d pending_done=%zu\n", il, pending_done);
     return true;
 }
