@@ -1491,6 +1491,15 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         return res;
     }
 
+    if (params.moe_direct_io) {
+        LOG_INF("%s", "\n"
+                "      ##\n"
+                "    ######    Betelgeuse (Alpha-Orionis)\n"
+                "  ##########  demand-paged MoE\n"
+                "    ######\n"
+                "      ##\n\n");
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {

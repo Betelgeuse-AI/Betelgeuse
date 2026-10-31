@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 
 static double now_s() {
@@ -119,6 +120,9 @@ long moe_pager::warm_pack_ranges(const uint64_t * offs, const size_t * lens, siz
 }
 
 bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_used, std::string & err) {
+    if (!gguf_path || !gguf_path[0] || n_layer <= 0 || n_expert <= 0 || n_used <= 0 || n_used > n_expert) {
+        err = "invalid expert pager dimensions or path"; return false;
+    }
     path_ = gguf_path;
     n_layer_ = n_layer; n_expert_ = n_expert; n_used_ = n_used;
 
@@ -148,6 +152,29 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
             err = m; gguf_free(gctx); return false;
         }
         const int64_t tids[3] = { t_g, t_u, t_dn };
+        const int64_t * gne = gguf_get_tensor_ne(gctx, t_g);
+        const int64_t * une = gguf_get_tensor_ne(gctx, t_u);
+        const int64_t * dne = gguf_get_tensor_ne(gctx, t_dn);
+        if (gne[0] != une[0] || gne[1] != une[1] || gne[0] != dne[1] || gne[1] != dne[0] ||
+                gguf_get_tensor_type(gctx, t_g) != gguf_get_tensor_type(gctx, t_u)) {
+            err = "incompatible gate|up|down shapes or types";
+            gguf_free(gctx); return false;
+        }
+        size_t blob = 0;
+        for (int r = 0; r < 3; r++) {
+            const int64_t * ne = gguf_get_tensor_ne(gctx, tids[r]);
+            const size_t bytes = gguf_get_tensor_size(gctx, tids[r]);
+            if (ne[2] != n_expert || ne[3] != 1 || bytes == 0 ||
+                    bytes % (size_t) n_expert || bytes / (size_t) n_expert > 256 * 1024 * 1024) {
+                err = "invalid expert tensor dimensions or byte size";
+                gguf_free(gctx); return false;
+            }
+            blob += bytes / (size_t) n_expert;
+        }
+        if (blob > 256 * 1024 * 1024) {
+            err = "expert blob exceeds 256 MiB";
+            gguf_free(gctx); return false;
+        }
 
         for (int e = 0; e < n_expert; e++) {
             for (int r = 0; r < 3; r++) {
@@ -165,7 +192,7 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
                 // (a short O_DIRECT read would otherwise DMA stale staging).
                 const uint64_t fo = (uint64_t)(data_off + gguf_get_tensor_offset(gctx, tid)
                                         + (int64_t) e * (int64_t) per);
-                const uint64_t pre = (ALIGN - (fo % ALIGN)) % ALIGN;
+                const uint64_t pre = fo % ALIGN;
                 moe_expert_slice & sl = idx_[((size_t) il * n_expert + e) * 3 + r];
                 sl.off = fo - pre;
                 sl.len = (uint32_t)(((per + pre + ALIGN - 1) / ALIGN) * ALIGN);
@@ -203,64 +230,59 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
     return true;
 }
 
-bool moe_pager::use_pack(const char * experts_bin, const char * index_txt, std::string & err) {
+bool moe_pager::use_pack(const char * experts_bin, bool aligned, std::string & err) {
     if (n_layer_ <= 0 || n_expert_ <= 0) { err = "pager not indexed"; return false; }
     if (pack_mode_) { err = "pack already active"; return false; }
-    std::ifstream f(index_txt);
-    if (!f) { err = "cannot open pack index"; return false; }
-    if (fd_pack_ < 0) {
-        fd_pack_ = open(experts_bin, O_RDONLY | O_DIRECT);
-        if (fd_pack_ < 0) { err = "open experts.bin O_DIRECT failed"; return false; }
-        pack_path_ = experts_bin;
-    }
-    bsrc_.assign((size_t) n_layer_ * n_expert_ * 3, 0);
-    // build into temporaries: a rejected pack must leave the GGUF index intact
-    std::vector<moe_expert_slice> new_idx = idx_;
-    std::vector<uint32_t>         new_bsrc(n_layer_ * n_expert_ * 3, 0);
+    uint64_t total = 0;
     size_t max_blob = 0;
-    std::string line;
-    int rows = 0;
-    while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::istringstream is(line);
-        int il, gu, dt;
-        long long base = 0, blob = 0;
-        if (!(is >> il >> gu >> dt >> base >> blob)) { err = "bad pack index line"; return false; }
-        if (base < 0 || blob <= 0) { err = "bad pack index offsets"; return false; }
-        if (il < 0 || il >= n_layer_) { err = "pack index layer out of range"; return false; }
-        const size_t g = role_bytes_[(size_t) il * 3 + 0];
-        const size_t u = role_bytes_[(size_t) il * 3 + 1];
-        const size_t d = role_bytes_[(size_t) il * 3 + 2];
-        if (g + u + d != (size_t) blob) {
-            err = "pack blob_bytes do not match the GGUF gate|up|down sizes";
-            return false;
+    for (int il = 0; il < n_layer_; il++) {
+        const size_t blob = role_bytes_[(size_t) il * 3] + role_bytes_[(size_t) il * 3 + 1] + role_bytes_[(size_t) il * 3 + 2];
+        if (blob == 0 || blob > 256 * 1024 * 1024) {
+            err = "expert pack blobs must be nonzero and at most 256 MiB"; return false;
+        }
+        const size_t stride = aligned ? (blob + ALIGN - 1) / ALIGN * ALIGN : blob;
+        if ((uint64_t) n_expert_ > (UINT64_MAX - ALIGN + 1 - total) / stride) {
+            err = "expert pack size overflows"; return false;
         }
         for (int e = 0; e < n_expert_; e++) {
-            const uint64_t fbo  = (uint64_t) base + (uint64_t) e * (uint64_t) blob;
-            const uint64_t pre  = (ALIGN - (fbo % ALIGN)) % ALIGN;
-            const size_t   alen = (size_t) (((blob + pre + ALIGN - 1) / ALIGN) * ALIGN);
-            moe_expert_slice * s = &new_idx[((size_t) il * n_expert_ + e) * 3];
-            s[0].off = fbo - pre;
-            s[0].len = (uint32_t) alen;
-            s[0].pre = (uint32_t) pre;
-            s[1] = s[2] = moe_expert_slice{0, 0, 0};
-            uint32_t * b = &new_bsrc[((size_t) il * n_expert_ + e) * 3];
-            b[0] = (uint32_t) pre;
-            b[1] = (uint32_t) (pre + g);
-            b[2] = (uint32_t) (pre + g + u);
-            if (pre + blob > alen) { err = "pack blob read underruns"; return false; }
-            max_blob = std::max(max_blob, alen);
+            const size_t pre = (total + (uint64_t) e * stride) % ALIGN;
+            max_blob = std::max(max_blob, (pre + blob + ALIGN - 1) / ALIGN * ALIGN);
         }
-        rows++;
+        total += (uint64_t) n_expert_ * stride;
     }
-    if (rows != n_layer_) {
-        char m[128];
-        snprintf(m, sizeof m, "pack index has %d rows, expected %d", rows, n_layer_);
-        err = m;
-        return false;
+    total = (total + ALIGN - 1) / ALIGN * ALIGN;
+    const int fd = open(experts_bin, O_RDONLY | O_DIRECT);
+    if (fd < 0) { err = "cannot open experts.bin with O_DIRECT"; return false; }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t) st.st_size != total) {
+        close(fd);
+        err = "expert pack byte size does not match the GGUF layout"; return false;
     }
-    idx_.swap(new_idx);
-    bsrc_.swap(new_bsrc);
+    if (max_blob > stage_bytes_) {
+        close(fd);
+        err = "expert pack exceeds pager staging capacity"; return false;
+    }
+    bsrc_.assign((size_t) n_layer_ * n_expert_ * 3, 0);
+    uint64_t base = 0;
+    for (int il = 0; il < n_layer_; il++) {
+        const size_t g = role_bytes_[(size_t) il * 3];
+        const size_t u = role_bytes_[(size_t) il * 3 + 1];
+        const size_t blob = g + u + role_bytes_[(size_t) il * 3 + 2];
+        const size_t stride = aligned ? (blob + ALIGN - 1) / ALIGN * ALIGN : blob;
+        for (int e = 0; e < n_expert_; e++) {
+            const size_t key = ((size_t) il * n_expert_ + e) * 3;
+            const uint32_t pre = base % ALIGN;
+            const uint32_t len = (pre + blob + ALIGN - 1) / ALIGN * ALIGN;
+            idx_[key] = moe_expert_slice{base - pre, len, pre};
+            idx_[key + 1] = idx_[key + 2] = moe_expert_slice{0, 0, 0};
+            bsrc_[key] = pre;
+            bsrc_[key + 1] = pre + (uint32_t) g;
+            bsrc_[key + 2] = pre + (uint32_t) (g + u);
+            base += stride;
+        }
+    }
+    fd_pack_ = fd;
+    pack_path_ = experts_bin;
     pack_mode_ = true;
     stage_bytes_ = max_blob;
     return true;

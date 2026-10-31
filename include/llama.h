@@ -347,7 +347,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;
 
         // keep routed-expert weights out of the model buffers; they are streamed
-        // on demand from the GGUF file into a VRAM slot pool
+        // on demand from GGUF or an expert pack into a VRAM slot pool
         bool    moe_direct_io;
         int32_t moe_slots;
 
@@ -400,9 +400,9 @@ extern "C" {
         // stream routed-expert weights via O_DIRECT into a VRAM slot pool
         bool    moe_direct_io;  // enable sparse MoE direct-IO streaming
         int32_t moe_slots;     // total VRAM slots shared across all MoE layers
-        // GGUF to stream experts from; must outlive the context
+        // GGUF to stream experts from; null uses the loaded model path
         const char * moe_gguf_path;
-        // native expert pack dir (experts.bin + native_experts.txt); null = off
+        // experts.bin directory; required for stripped bundles, null = off otherwise
         const char * moe_pack_dir;
         int32_t moe_chunk_max;   // widest batch routed through the MoE pool
         // hot-expert profile for slot seeding; null = built-in table

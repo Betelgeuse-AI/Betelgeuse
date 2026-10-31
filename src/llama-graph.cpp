@@ -22,6 +22,7 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -2110,6 +2111,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * weights_in) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
+    // Empty output rows must not reference payload-free expert weights.
+    if (cparams.moe_stripped_experts && n_tokens == 0) {
+        return cur;
+    }
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     ggml_tensor * logits = nullptr;
@@ -2247,6 +2252,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             moe_use_pool = true;
             }
         }
+    }
+    if (!moe_use_pool && cparams.moe_stripped_experts && !hparams.no_alloc) {
+        throw std::runtime_error("stripped expert graph requires paging for every routed layer and batch");
     }
     if (moe_use_pool) {
         gate_up_exps = nullptr;

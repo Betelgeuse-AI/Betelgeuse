@@ -1,8 +1,8 @@
-# llama-server Development Documentation
+# bel-server Development Documentation
 
-This document provides an in-depth technical overview of `llama-server`, intended for maintainers and contributors.
+This document provides an in-depth technical overview of `bel-server`, intended for maintainers and contributors. Its CMake target remains `llama-server`; native output is `bel-server`, with the llama API unchanged.
 
-If you are an end user consuming `llama-server` as a product, please refer to the main [README](./README.md) instead.
+If you are an end user consuming `bel-server` as a product, please refer to the main [README](./README.md) instead. Betelgeuse's paged MoE path is experimental, Linux/CUDA `sm_86` specific and restricted to one model context and one server slot; general features below do not expand that envelope.
 
 ## Scope of features
 
@@ -174,9 +174,9 @@ The diagram shows the buffer touch points. The live wire (chunks streamed to the
 
 ### Testing
 
-`llama-server` includes an automated test suite based on `pytest`.
+`bel-server` includes an automated test suite based on `pytest`.
 
-The framework automatically starts a `llama-server` instance, sends requests, and validates responses.
+The framework automatically starts a `bel-server` instance, sends requests, and validates responses.
 
 For detailed instructions, see the [test documentation](./tests/README.md).
 
@@ -286,7 +286,7 @@ Instead of building everything from the ground up (like what most AI agents will
 
 The flow for downloading a new model:
 - POST request comes in --> `post_router_models` --> validation
-- A new `llama-server` subprocess will be spawned with special `SERVER_CHILD_MODE_DOWNLOAD`
+- A new `bel-server` subprocess will be spawned with special `SERVER_CHILD_MODE_DOWNLOAD`
 - Child process runs the download and report status back to router via stdin/out
 - If a stop request comes in, the router asks the child process to stop (same mechanism as running a model in child process)
 - Otherwise, upon completion, we call `load_models()` to refresh the list of models
@@ -342,7 +342,7 @@ Endpoints created with `create_response(true)` (`/health`, `/props`, `/models`, 
 
 ## Web UI
 
-The project includes a web-based user interface for interacting with `llama-server`. It supports both single-model (`MODEL` mode) and multi-model (`ROUTER` mode) operation.
+The project includes a web-based user interface for interacting with `bel-server`. It supports both single-model (`MODEL` mode) and multi-model (`ROUTER` mode) operation.
 
 The SvelteKit-based Web UI is introduced in this PR: https://github.com/ggml-org/llama.cpp/pull/14839
 
@@ -401,6 +401,6 @@ npm run test
 npm run build
 ```
 
-After `public/index.html` has been generated, rebuild `llama-server` as described in the [build](#build) section to include the updated UI.
+After `public/index.html` has been generated, rebuild the `llama-server` target as described in the [build](#build) section to include the updated UI in `bel-server`.
 
-**Note:** The Vite dev server automatically proxies API requests to `http://localhost:8080`. Make sure `llama-server` is running on that port during development.
+**Note:** The Vite dev server automatically proxies API requests to `http://localhost:8080`. Make sure `bel-server` is running on that port during development.

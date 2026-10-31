@@ -151,9 +151,9 @@ class ServerProcess:
         elif "LLAMA_SERVER_BIN_PATH" in os.environ:
             server_path = os.environ["LLAMA_SERVER_BIN_PATH"]
         elif os.name == "nt":
-            server_path = "../../../build/bin/Release/llama-server.exe"
+            server_path = "../../../build/bin/Release/bel-server.exe"
         else:
-            server_path = "../../../build/bin/llama-server"
+            server_path = "../../../build/bin/bel-server"
         server_args = [
             "--port",
             self.server_port,

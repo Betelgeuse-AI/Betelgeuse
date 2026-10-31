@@ -33,7 +33,7 @@ The server must answer OAI Chat completion requests on `http://localhost:8080/v1
 
 Example:
 ```shell
-llama-server --host localhost --port 8080 \
+bel-server --host localhost --port 8080 \
   --model ggml-model-q4_0.gguf \
   --cont-batching \
   --metrics \
@@ -98,7 +98,7 @@ The `bench.py` script does several steps:
 It aims to be used in the CI, but you can run it manually:
 
 ```shell
-LLAMA_SERVER_BIN_PATH=../../../cmake-build-release/bin/llama-server python bench.py \
+LLAMA_SERVER_BIN_PATH=../../../cmake-build-release/bin/bel-server python bench.py \
               --runner-label local \
               --name local \
               --branch `git rev-parse --abbrev-ref HEAD` \

@@ -595,6 +595,27 @@ llama_model_loader::llama_model_loader(
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
+        get_key("betelgeuse.stripped_experts", stripped_experts, false);
+        if (stripped_experts) {
+            uint32_t alignment = 4096;
+            get_key("betelgeuse.expert_alignment", alignment, false);
+            if (alignment != 4096) {
+                throw std::runtime_error("unsupported stripped expert pack alignment");
+            }
+            std::string companion;
+            get_key("betelgeuse.ple_file", companion);
+            if (companion.empty() || companion == "." || companion == ".." ||
+                    companion.find_first_of("/\\:") != std::string::npos ||
+                    companion.find('\0') != std::string::npos || n_split != 2) {
+                throw std::runtime_error("invalid stripped bundle PLE companion metadata");
+            }
+            const size_t slash = fname.find_last_of("/\\");
+            const std::string path = (slash == std::string::npos ? "" : fname.substr(0, slash + 1)) + companion;
+            if (!splits.empty() && (splits.size() != 2 || splits[0] != fname || splits[1] != path)) {
+                throw std::runtime_error("stripped bundle split list conflicts with its PLE companion");
+            }
+            splits = { fname, path };
+        }
         // Load additional GGML contexts
         if (n_split > 1) {
             // make sure the main file is loaded first
@@ -635,13 +656,18 @@ llama_model_loader::llama_model_loader(
                 // check idx
                 {
                     const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
-                    if (kid < 0) {
-                        throw std::runtime_error(format("missing key %s in GGUF split %s", kv_split_no.c_str(), fname_split));
+                    if (kid < 0 || gguf_get_kv_type(ctx_gguf.get(), kid) != GGUF_TYPE_UINT16) {
+                        throw std::runtime_error(format("missing or invalid key %s in GGUF split %s", kv_split_no.c_str(), fname_split));
                     }
                     int idx_gguf = gguf_get_val_u16(ctx_gguf.get(), kid);
                     if (idx_gguf != idx) {
                         throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d", idx_gguf, fname_split, idx));
                     }
+                }
+
+                if (stripped_experts && (gguf_get_n_tensors(ctx_gguf.get()) != 1 ||
+                        gguf_find_tensor(ctx_gguf.get(), "per_layer_token_embd.weight") < 0)) {
+                    throw std::runtime_error("stripped bundle companion must contain only the PLE tensor");
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
@@ -715,6 +741,13 @@ llama_model_loader::llama_model_loader(
     }
 
     n_kv      = gguf_get_n_kv(metadata);
+    get_key("betelgeuse.stripped_experts", stripped_experts, false);
+    if (stripped_experts && fname.empty()) {
+        throw std::runtime_error("stripped expert model requires a filename to locate its PLE companion");
+    }
+    for (const auto & entry : weights_map) {
+        stripped_experts = stripped_experts || entry.second.external;
+    }
     n_tensors = weights_map.size();
 
     fver = (enum llama_fver) gguf_get_version(metadata);
@@ -1118,9 +1151,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool is_external = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_external };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1339,6 +1373,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
+    is_external = require_weight(tn.str().c_str()).external;
+
     if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
@@ -1442,7 +1478,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
     // compute the total size of all tensors for progress reporting
     for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+        if (!it.second.external) {
+            size_data += ggml_nbytes(it.second.tensor);
+        }
     }
 }
 
@@ -1455,7 +1493,7 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     *addr = mapping->addr();
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (!weight || weight->external || weight->idx != idx) {
             continue;
         }
         *first = std::min(*first, weight->offs);
@@ -1464,11 +1502,14 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 }
 
 void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
-    if (!use_mmap) { return; }
+    if (!use_mmap || w.external) { return; }
     mappings.at(w.idx)->unmap_fragment(w.offs, w.offs + ggml_nbytes(w.tensor));
 }
 
 const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const {
+    if (w.external) {
+        throw std::runtime_error(format("tensor '%s' requires the external expert pack", ggml_get_name(w.tensor)));
+    }
     GGML_ASSERT(offs + size <= ggml_nbytes(w.tensor));
 
     const void * data = buf;
@@ -1623,7 +1664,7 @@ bool llama_model_loader::load_all_data(
 
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
-        if (weight == nullptr) {
+        if (weight == nullptr || weight->external) {
             // this can happen with split experts models
             continue;
         }

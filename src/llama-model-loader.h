@@ -29,11 +29,30 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+// Only separate routed weight tensors can have their payload in experts.bin.
+inline bool llama_is_routed_expert(const ggml_tensor * tensor) {
+    const char * name = ggml_get_name(tensor);
+    if (strncmp(name, "blk.", 4) != 0 || tensor->ne[2] <= 1 || tensor->ne[3] != 1) {
+        return false;
+    }
+    const char * role = name + 4;
+    if (*role < '0' || *role > '9') {
+        return false;
+    }
+    while (*role >= '0' && *role <= '9') {
+        role++;
+    }
+    return strcmp(role, ".ffn_gate_exps.weight") == 0 ||
+           strcmp(role, ".ffn_up_exps.weight") == 0 ||
+           strcmp(role, ".ffn_down_exps.weight") == 0;
+}
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
         size_t   offs; // tensor data offset in the original file
+        bool external = false;
 
         ggml_tensor * tensor;
 
@@ -43,8 +62,17 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
-            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            const size_t data_offset = gguf_get_data_offset(gguf_ctx);
+            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+            if (tensor_offset > SIZE_MAX - data_offset) {
+                throw std::runtime_error(format("tensor '%s' offset overflows", ggml_get_name(tensor)));
+            }
+            offs = data_offset + tensor_offset;
+            if (ggml_nbytes(tensor) > SIZE_MAX - offs) {
+                throw std::runtime_error(format("tensor '%s' range overflows", ggml_get_name(tensor)));
+            }
+            external = idx == 0 && llama_is_routed_expert(tensor) && offs >= file->size();
+            if (!external && (offs > file->size() || ggml_nbytes(tensor) > file->size() - offs)) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
@@ -83,6 +111,7 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    bool stripped_experts = false;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -151,10 +180,14 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool external;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            if (lhs.external != rhs.external) {
+                return lhs.external < rhs.external;
+            }
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }

@@ -368,14 +368,14 @@ def save_output(path: str, args: argparse.Namespace, samples: list[Sample], resu
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run SPEED-Bench against an OpenAI-compatible llama-server.")
+    parser = argparse.ArgumentParser(description="Run SPEED-Bench against an OpenAI-compatible bel-server.")
     parser.add_argument("--url", default="localhost:8080", help="Server URL, for example localhost:8080 or http://localhost:8080/v1")
     parser.add_argument("--model", default=None, help="Optional model name to send in OpenAI requests")
     parser.add_argument("--bench", default="qualitative", help="SPEED-Bench config to run, for example qualitative or throughput_1k")
     parser.add_argument("--category", default="all", help="Category to run within the selected bench; use all for no category filter")
     parser.add_argument("--osl", type=int, default=4096, help="Output sequence length, mapped to max_tokens")
     parser.add_argument("--extra-inputs", default='{"temperature":0}', help="Extra request fields as a JSON object")
-    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent client requests; usually match llama-server --np")
+    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent client requests; usually match bel-server --np")
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit per category for smoke tests")
     parser.add_argument("--timeout", type=float, default=600, help="Per-request timeout in seconds")
     parser.add_argument("--output", default=None, help="Optional path to save raw results JSON")

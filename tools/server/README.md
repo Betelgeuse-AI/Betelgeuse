@@ -1,8 +1,10 @@
-# LLaMA.cpp HTTP Server
+# bel-server: Betelgeuse HTTP server
 
 Fast, lightweight, pure C/C++ HTTP server based on [httplib](https://github.com/yhirose/cpp-httplib), [nlohmann::json](https://github.com/nlohmann/json) and **llama.cpp**.
 
-Set of LLM REST APIs and a web UI to interact with llama.cpp.
+Set of LLM REST APIs and a web UI, with Betelgeuse's native demand-paged MoE path. The engine remains a llama.cpp fork; API names and `LLAMA_ARG_*` environment variables are unchanged.
+
+**Experimental and partly broken.** `bel-server` is recommended over the CLI for the tested RTX 3060 12 GB / 16 GB RAM / NVMe configuration. Paging supports one context per process and one slot (`-np 1`), CUDA `sm_86`, and no certified MTP. The general features below are inherited server capabilities, not a certification that each works with paged MoE. Start with the [four-file bundle guide](../../README.md) and [historical limits and measurements](../../docs/fluxaeros.md).
 
 **Features:**
  * LLM inference of F16 and quantized models on GPU and CPU
@@ -22,6 +24,10 @@ Set of LLM REST APIs and a web UI to interact with llama.cpp.
 For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 ## Usage
+
+For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, `Qwen3.8-Flash-Next-PLE.gguf` and `profile-qwen4exp.bin` in one directory. The stripped model needs `--moe-direct-io` and `--moe-pack-dir`; no text index is required. Use the [paged quick start](#quick-start), not generic multi-model or parallel examples below.
+
+`--moe-direct-io` is a historical flag name: the optimized demand worker uses buffered `io_uring` reads. `--moe-slots 5000` sizes the shared VRAM expert pool. `--moe-profile PATH` seeds hot-expert choices but does not guarantee 22 tok/s. These are distinct from generated cache warmup: `--auto-warm` opts into up to 256 generated tokens plus one replay (about 42 seconds in the historical test), while `--cache-warmup N` sets the budget and `0` disables it. `--no-warmup` disables only the ordinary empty graph warmup. None of these settings makes the whole expert store resident.
 
 <!-- HELP_START -->
 
@@ -318,7 +324,7 @@ For boolean options like `--kv-offload`:
 - `LLAMA_ARG_KV_OFFLOAD=true` means enabled, other accepted values are: `1`, `on`, `enabled`
 - `LLAMA_ARG_KV_OFFLOAD=false` means disabled, other accepted values are: `0`, `off`, `disabled`
 
-Example usage of docker compose with environment variables:
+Upstream-only reference for docker compose environment variables: the following upstream image does **not** provide Betelgeuse paging or load the stripped bundle. Build this fork for that configuration.
 
 ```yml
 services:
@@ -355,7 +361,7 @@ To use this feature, start the server with `--tools all`. You can also enable on
 
 ### MCP servers
 
-Besides the built-in tools, the server can expose tools coming from MCP servers, added in [#26062](https://github.com/ggml-org/llama.cpp/pull/26062). Only the stdio transport is supported: such a server is a child process reading JSON-RPC messages on its stdin and writing replies on its stdout, so nothing has to be started or maintained outside `llama-server`.
+Besides the built-in tools, the server can expose tools coming from MCP servers, added in [#26062](https://github.com/ggml-org/llama.cpp/pull/26062). Only the stdio transport is supported: such a server is a child process reading JSON-RPC messages on its stdin and writing replies on its stdout, so nothing has to be started or maintained outside `bel-server`.
 
 Servers are declared in a Cursor-compatible JSON file:
 
@@ -368,7 +374,7 @@ Servers are declared in a Cursor-compatible JSON file:
 ```
 
 ```sh
-llama-server -m model.gguf --mcp-servers-config mcp.json
+bel-server -m model.gguf --mcp-servers-config mcp.json
 ```
 
 The same JSON can be passed inline with `--mcp-servers-json`. Each entry under `mcpServers` accepts:
@@ -407,55 +413,44 @@ Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-cre
 
 ## Build
 
-`llama-server` is built alongside everything else from the root of the project
+`bel-server` is built from the retained CMake target `llama-server`. For the paged configuration, use Linux with the CUDA toolkit and liburing development package:
 
 - Using `CMake`:
 
   ```bash
-  cmake -B build
+  cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
   cmake --build build --config Release -t llama-server
   ```
 
-  Binary is at `./build/bin/llama-server`
+  The native binary is `./build/bin/bel-server`; this is not a wrapper or a llama API rename.
 
 ## Build with SSL
 
-`llama-server` can also be built with SSL support using OpenSSL 3
+`bel-server` can also be built with SSL support using OpenSSL 3:
 
 - Using `CMake`:
 
   ```bash
-  cmake -B build -DLLAMA_OPENSSL=ON
+  cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_OPENSSL=ON
   cmake --build build --config Release -t llama-server
   ```
 
 ## Quick Start
 
-To get started right away, run the following command, making sure to use the correct path for the model you have:
-
-### Unix-based systems (Linux, macOS, etc.)
+Download the four runtime files from [Betelgeuse-AI/Alpha-Orionis-XS](https://huggingface.co/Betelgeuse-AI/Alpha-Orionis-XS) under their separate model licenses. The following Linux command keeps the historical memory envelope, one slot and a localhost-only listener. It does not enable generated cache warmup.
 
 ```bash
-./llama-server -m models/7B/ggml-model.gguf -c 2048
+export BUNDLE=/path/to/Alpha-Orionis-XS
+export MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0
+systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
+    build/bin/bel-server -m "$BUNDLE/Qwen3.8-Flash-Next-Dense.gguf" \
+    --moe-direct-io --moe-pack-dir "$BUNDLE" \
+    --moe-profile "$BUNDLE/profile-qwen4exp.bin" --moe-slots 5000 \
+    -ngl 99 -np 1 -c 512 -ub 64 -t 6 --cache-warmup 0 \
+    --host 127.0.0.1 --port 8080
 ```
 
-### Windows
-
-```powershell
-llama-server.exe -m models\7B\ggml-model.gguf -c 2048
-```
-
-The above command will start a server that by default listens on `127.0.0.1:8080`.
-You can consume the endpoints with Postman or NodeJS with axios library. You can visit the web front end at the same url.
-
-### Docker
-
-```bash
-docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:server -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080
-
-# or, with CUDA:
-docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
-```
+Open `http://127.0.0.1:8080` for the web UI or use the API below. Do not expose the service to an untrusted network without an authentication and deployment review. Other platforms, upstream container images, larger contexts and multi-model routing are not certified for this paged bundle. The general API reference is retained for ordinary models as well.
 
 ## Using with CURL
 
@@ -1842,12 +1837,12 @@ For further documentation about this endpoint, please refer to [server internal 
 
 ## Using multiple models
 
-`llama-server` can be launched in a **router mode** that exposes an API for dynamically loading and unloading models. The main process (the "router") automatically forwards each request to the appropriate model instance.
+`bel-server` can be launched in a **router mode** that exposes an API for dynamically loading and unloading models. The main process (the "router") automatically forwards each request to the appropriate model instance. This general mode is not a certified configuration for the single-context Betelgeuse paged bundle.
 
-To start in router mode, launch `llama-server` **without specifying any model**:
+To start in router mode, launch `bel-server` **without specifying any model**:
 
 ```sh
-llama-server
+bel-server
 ```
 
 ### Model sources
@@ -1860,7 +1855,7 @@ There are 3 possible sources for model files:
 By default, the router looks for models in the cache. You can add Hugging Face models to the cache with:
 
 ```sh
-llama-server -hf <user>/<model>:<tag>
+bel-server -hf <user>/<model>:<tag>
 ```
 
 *The server must be restarted after adding a new model.*
@@ -1868,7 +1863,7 @@ llama-server -hf <user>/<model>:<tag>
 Alternatively, you can point the router to a local directory containing your GGUF files using `--models-dir`. Example command:
 
 ```sh
-llama-server --models-dir ./models_directory
+bel-server --models-dir ./models_directory
 ```
 
 If the model contains multiple GGUF (for multimodal or multi-shard), files should be put into a subdirectory. The directory structure should look like this:
@@ -1896,7 +1891,7 @@ models_directory
 You may also specify default arguments that will be passed to every model instance:
 
 ```sh
-llama-server -ctx 8192 -n 1024 -np 2
+bel-server -ctx 8192 -n 1024 -np 2
 ```
 
 Note: model instances inherit both command line arguments and environment variables from the router server.
@@ -1908,7 +1903,7 @@ Alternatively, you can also add GGUF based preset (see next section)
 Model presets allow advanced users to define custom configurations using an `.ini` file:
 
 ```sh
-llama-server --models-preset ./my-models.ini
+bel-server --models-preset ./my-models.ini
 ```
 
 Each section in the file defines a new preset. Keys within a section correspond to command-line arguments (without leading dashes). For example, the argument `--n-gpu-layers 123` is written as `n-gpu-layers = 123`.
@@ -1953,7 +1948,7 @@ model = /Users/abc/my-awesome-model-Q4_K_M.gguf
 Note: some arguments are controlled by router (e.g., host, port, API key, HF repo, model alias). They will be removed or overwritten upon loading.
 
 The precedence rule for preset options is as follows:
-1. **Command-line arguments** passed to `llama-server` (highest priority)
+1. **Command-line arguments** passed to `bel-server` (highest priority)
 2. **Model-specific options** defined in the preset file (e.g. `[ggml-org/MY-MODEL...]`)
 3. **Global options** defined in the preset file (`[*]`)
 
@@ -1999,7 +1994,7 @@ Listing all models in cache. The model metadata will also include a field to ind
     "path": "/Users/REDACTED/Library/Caches/llama.cpp/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf",
     "status": {
       "value": "loaded",
-      "args": ["llama-server", "-ctx", "4096"]
+      "args": ["bel-server", "-ctx", "4096"]
     },
     "architecture": {
       "input_modalities": [
@@ -2063,14 +2058,14 @@ The `status` object can be:
 ```json
 "status": {
   "value": "loading",
-  "args": ["llama-server", "-ctx", "4096"]
+  "args": ["bel-server", "-ctx", "4096"]
 }
 ```
 
 ```json
 "status": {
   "value": "unloaded",
-  "args": ["llama-server", "-ctx", "4096"],
+  "args": ["bel-server", "-ctx", "4096"],
   "failed": true,
   "exit_code": 1
 }

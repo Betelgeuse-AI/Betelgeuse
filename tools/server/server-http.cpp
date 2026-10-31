@@ -177,7 +177,7 @@ bool server_http_context::init_listener(const common_params & params) {
     srv.reset(new httplib::Server());
 #endif
 
-    srv->set_default_headers({{"Server", "llama.cpp"}});
+    srv->set_default_headers({{"Server", "Betelgeuse/bel-server"}});
     // srv->set_logger(log_server_request); // TODO @ngxson : this is too spamy, no very useful; improve it in the future
     srv->set_exception_handler([](const httplib::Request &, httplib::Response & res, const std::exception_ptr & ep) {
         // this is fail-safe; exceptions should already handled by `ex_wrapper`
@@ -820,7 +820,7 @@ void server_http_context::register_gcp_compat() const {
     }
 
     if (handlers.count(gcp.path_predict)) {
-        SRV_ERR("AIP_PREDICT_ROUTE=%s conflicts with an existing llama-server route\n", gcp.path_predict.c_str());
+        SRV_ERR("AIP_PREDICT_ROUTE=%s conflicts with an existing bel-server route\n", gcp.path_predict.c_str());
         exit(1);
     }
 

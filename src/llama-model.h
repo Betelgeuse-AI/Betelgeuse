@@ -730,6 +730,8 @@ struct llama_model {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+    bool stripped_experts = false;
+    std::string source_path;
 
     // list of devices used in this model
     std::vector<llama_device> devices;

@@ -38,7 +38,7 @@ struct cli_context {
     cli_context(const common_params & params);
     ~cli_context();
 
-    // connect to --server-base or spawn a local llama-server child;
+    // connect to --server-base or spawn a local bel-server child;
     // argc/argv are needed to forward the server-relevant args to the child
     bool init();
 

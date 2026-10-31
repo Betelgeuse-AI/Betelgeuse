@@ -1,4 +1,27 @@
-# llama.cpp/tools/cli
+# bel-cli: Betelgeuse command-line client
+
+`bel-cli` is this fork's native CLI, built from the existing `llama-cli` CMake target. The llama C API and `LLAMA_ARG_*` environment variables are unchanged. The paged MoE path is experimental and partly broken; **prefer [`bel-server`](../server/README.md)** for the documented RTX 3060 configuration.
+
+## Betelgeuse bundle
+
+Follow the [build and download guide](../../README.md) first. The runtime directory contains exactly `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, `Qwen3.8-Flash-Next-PLE.gguf` and `profile-qwen4exp.bin`; no `native_experts.txt` is needed. Keep the companion files together.
+
+```bash
+export BUNDLE=/path/to/Alpha-Orionis-XS
+export MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0
+systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
+    build/bin/bel-cli -m "$BUNDLE/Qwen3.8-Flash-Next-Dense.gguf" \
+    --moe-direct-io --moe-pack-dir "$BUNDLE" \
+    --moe-profile "$BUNDLE/profile-qwen4exp.bin" --moe-slots 5000 \
+    -ngl 99 -np 1 -c 512 -ub 64 -t 6 --cache-warmup 0 \
+    -st -p "Explain why stars appear to twinkle." -n 128
+```
+
+`--moe-direct-io` uses the buffered demand worker and a bounded VRAM expert pool; it is required for stripped expert tensors. `--moe-profile` supplies seeding hints, not a 22 tok/s guarantee. The 5,000 slots are shared across layers and are separate from the host victim cache.
+
+Generated cache warmup is opt-in: `--auto-warm` generates up to 256 tokens and replays them once (about 42 seconds of extra startup work in the historical test); `--cache-warmup N` changes that budget and `0` disables it. `--no-warmup` disables only the ordinary empty graph warmup, not generated cache warmup. See [warmup details and historical measurements](../../docs/fluxaeros.md).
+
+The following general argument reference describes inherited capabilities, not certified paged-model configurations. Paging currently targets Linux/CUDA `sm_86`, one context, one server slot and no certified MTP.
 
 ## Usage
 

@@ -65,8 +65,9 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     bool         moe_direct_io = false;
+    bool         moe_stripped_experts = false;
     int32_t      moe_slots     = 4096;
-    const char * moe_pack_dir  = nullptr; // expert pack dir (experts.bin + native_experts.txt)
+    const char * moe_pack_dir  = nullptr; // experts.bin directory; required for stripped bundles
     const char * moe_gguf_path = nullptr;
     const char * moe_profile_path = nullptr; // optional hot profile (null = built-in)
     // prefill micro-chunk ceiling: pool engages only when a batch row carries

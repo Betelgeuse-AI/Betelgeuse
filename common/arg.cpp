@@ -1070,7 +1070,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-batched",
         "llama-batched-bench",
         "llama-bench",
-        "llama-cli",
+        "bel-cli",
         "llama-completion",
         "llama-convert-llama2c-to-ggml",
         "llama-cvector-generator",
@@ -1104,7 +1104,7 @@ static void common_params_print_completion(common_params_context & ctx_arg) {
         "llama-qwen2vl-cli",
         "llama-retrieval",
         "llama-save-load-state",
-        "llama-server",
+        "bel-server",
         "llama-simple",
         "llama-simple-chat",
         "llama-speculative",
@@ -1987,7 +1987,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-pack-dir"},
         "DIR",
-        "expert pack directory with experts.bin + native_experts.txt (one contiguous read per expert instead of three GGUF ranges)",
+        "expert pack directory with experts.bin (layout derived from GGUF descriptors; required for stripped bundles)",
         [](common_params & params, const std::string & value) {
             params.moe_pack_dir = value;
         }
@@ -2825,12 +2825,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-direct-io"},
         "keep routed-expert (MoE) weights off device buffers so they can be "
-        "streamed on demand from the GGUF into a VRAM slot pool",
+        "streamed on demand from the GGUF or expert pack into a VRAM slot pool",
         [](common_params & params) {
             params.moe_direct_io = true;
-            // Same mechanism as --cpu-moe: route the fused expert tensors to the
-            // CPU buffer so they are never offloaded to VRAM. They stay
-            // mmap-backed, so this costs no RAM and keeps tensor metadata valid.
+            // Intact GGUF experts stay mmap-backed on the CPU; stripped experts retain metadata only.
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_MOE_DIRECT_IO"));

@@ -1533,11 +1533,15 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.moe_direct_io = params.moe_direct_io;
+    cparams.moe_stripped_experts = model.stripped_experts;
     cparams.moe_slots     = params.moe_slots;
     cparams.moe_pack_dir  = params.moe_pack_dir;
     cparams.moe_chunk_max = params.moe_chunk_max;
-    cparams.moe_gguf_path = params.moe_gguf_path;
+    cparams.moe_gguf_path = params.moe_gguf_path ? params.moe_gguf_path : model.source_path.c_str();
     cparams.moe_profile_path = params.moe_profile_path;
+    if (model.stripped_experts && (!cparams.moe_direct_io || !cparams.moe_pack_dir || !cparams.moe_pack_dir[0])) {
+        throw std::runtime_error("stripped expert model requires --moe-direct-io and --moe-pack-dir");
+    }
     if (params.moe_direct_io) {
         if (params.moe_slots > 0 && params.moe_slots != 4096) {
             g_moe_slots_total = params.moe_slots;
@@ -1838,18 +1842,15 @@ llama_context::llama_context(
 
             std::string perr;
             if (!pager.init(cparams.moe_gguf_path, n_layer, n_exp, n_used, perr)) {
-                LLAMA_LOG_WARN("%s: moe_direct_io OFF: %s\n", __func__, perr.c_str());
+                throw std::runtime_error("failed to initialize expert pager: " + perr);
             } else {
-                // optional single-blob pack: one contiguous read per expert.
-                // verified byte-identical to the GGUF's gate|up|down, so this
-                // only changes IO, not the weights.
+                // Pack offsets are derived from the GGUF gate|up|down descriptors.
                 if (cparams.moe_pack_dir) {
                     std::string dir(cparams.moe_pack_dir);
                     std::string bin = dir + "/experts.bin";
-                    std::string idx = dir + "/native_experts.txt";
                     std::string e2;
-                    if (!pager.use_pack(bin.c_str(), idx.c_str(), e2)) {
-                        LLAMA_LOG_WARN("%s: moe pack OFF: %s\n", __func__, e2.c_str());
+                    if (!pager.use_pack(bin.c_str(), model.stripped_experts, e2)) {
+                        throw std::runtime_error("failed to load expert pack: " + e2);
                     } else {
                         LLAMA_LOG_INFO("%s: moe pack ON: one blob read per expert (%d layers x %d experts)\n",
                                        __func__, n_layer, n_exp);
@@ -2106,6 +2107,9 @@ llama_context::llama_context(
             } // pager init else
         } // moe_direct_io if
         } // moe_direct_io if
+        if (model.stripped_experts && (!moe_ready || !pager.pack_mode())) {
+            throw std::runtime_error("stripped expert model requires a working expert pack and paging pool");
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {

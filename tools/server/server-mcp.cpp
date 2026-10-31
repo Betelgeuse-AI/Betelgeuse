@@ -264,7 +264,7 @@ bool server_mcp_transport::ensure_init(const std::function<bool()> & should_stop
         {"params", {
             {"protocolVersion", MCP_PROTOCOL_VERSION},
             {"capabilities", json::object()},
-            {"clientInfo", {{"name", "llama.cpp"}, {"version", "1.0"}}},
+            {"clientInfo", {{"name", "Betelgeuse/bel-server"}, {"version", "1.0"}}},
         }},
     };
     json resp = send_rpc(init_req, should_stop);

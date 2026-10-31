@@ -319,6 +319,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
+        if (ml.stripped_experts && !params.moe_direct_io && !params.vocab_only) {
+            throw std::runtime_error("stripped expert model requires --moe-direct-io and --moe-pack-dir");
+        }
+
         ml.lazy.mode = params.lazy_mode;
 
         ml.print_info();
@@ -333,6 +337,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (model == nullptr) {
             GGML_ABORT("fatal error: model does not implement llama_model_base");
         }
+
+        model->stripped_experts = ml.stripped_experts;
+        model->source_path = fname;
 
         // loading time will be recalculated after the first eval, so
         // we take page faults deferred by mmap() into consideration

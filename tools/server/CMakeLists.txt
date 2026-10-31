@@ -1,6 +1,6 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
-# server-context containing the core server logic, used by llama-server and CLI
+# server-context containing the core server logic, used by bel-server and CLI
 
 set(TARGET server-context)
 
@@ -58,11 +58,12 @@ if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()
 
-# llama-server executable
+# bel-server executable (retain the target name for build dependencies)
 
 set(TARGET llama-server)
 
 add_executable(${TARGET} main.cpp)
+set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME bel-server)
 install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)

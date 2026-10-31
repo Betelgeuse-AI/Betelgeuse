@@ -111,7 +111,7 @@ bool cli_context::init() {
             ui::show_error(
                 "no model specified",
                 "use -m <file.gguf> or -hf <user/repo> to run a local model,\n"
-                "or --server-base <url> to connect to a running llama-server"
+                "or --server-base <url> to connect to a running bel-server"
             );
             return false;
         }
@@ -426,7 +426,7 @@ int cli_context::run() {
 
     std::string banner;
     banner += "\n";
-    banner += LLAMA_ASCII_LOGO;
+    banner += "Betelgeuse (Alpha-Orionis) | bel-cli\n";
     banner += "\n";
     banner += "build      : " + build_info + "\n";
     banner += "model      : " + model_name + "\n";

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 768 240" role="img" aria-labelledby="title desc" style="color: var(--error, #981e32)">
+  <title id="title">Betelgeuse - Alpha-Orionis</title>
+  <desc id="desc">An original block-cut red star with an amber core beside the Betelgeuse wordmark.</desc>
+  <style>
+    .star { fill: currentColor; }
+    .core { fill: var(--warning, #edaa43); }
+    .name { fill: var(--error, currentColor); }
+    .label { fill: var(--muted, #aa6330); }
+  </style>
+  <g shape-rendering="crispEdges">
+    <path class="star" d="M104 16h32v48h24v24h48v32h-48v24h-24v48h-32v-48H80v-24H32V88h48V64h24z"/>
+    <path class="core" d="M104 72h32v16h16v32h-16v16h-32v-16H88V88h16z"/>
+    <path class="star" d="M48 32h16v16H48zm128 128h16v16h-16z"/>
+  </g>
+  <text class="name" x="240" y="118" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="58" font-weight="800" letter-spacing="-2">Betelgeuse</text>
+  <text class="label" x="244" y="154" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="20" font-weight="600" letter-spacing="4">ALPHA-ORIONIS</text>
+</svg>
