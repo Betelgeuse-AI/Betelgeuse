@@ -352,6 +352,7 @@ llama_test(${TEST_TARGET})
 
 if (UNIX)
     llama_build_and_test(test-mmap.cpp ../src/llama-mmap.cpp)
+    llama_build_and_test(test-cli-markdown.cpp)
 endif()
 
 if (NOT LLAMA_USE_SYSTEM_GGML)

@@ -17,12 +17,11 @@ systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
     --color on -n 256
 ```
 
-This opens an interactive `You >` prompt (`>` with `--simple-io`). Enter messages normally, use `/clear` to reset the conversation and `/exit` to quit. Add `-st -p "Your prompt"` for one noninteractive turn. No separate server command or URL is needed.
+This opens an interactive omp-style session rail and `╰─ ` input prompt (`>` with `--simple-io`). Enter messages normally, use `/clear` to reset the conversation and `/exit` to quit. Add `-st -p "Your prompt"` for one noninteractive turn. No separate server command or URL is needed.
 
 The startup banner embeds a true-color terminal rendering generated from the star in `assets/betelgeuse.svg`, with a native text wordmark. `--color on` shows it; `--color off` or `--simple-io` uses plain text, and `NO_COLOR` disables automatic color selection. Build dependencies are Python 3, `rsvg-convert` and ImageMagick; no image helper is launched at runtime.
 
-The compact header shows the model basename, local/remote mode, quantization and context. Speaker labels use Betelgeuse red/amber accents, reasoning is muted, and the footer shows decode rate, elapsed request time and prompt rate. Monochrome and simple-I/O modes keep readable labels without color sequences.
-
+The compact header shows model details, runtime mode, quantization, and context. The omp-inspired session rail shows current model, mode, and real-time context token usage `▶─[ 8.0% · 41/512 ]──`. Responses stream with native Markdown rendering (fenced code blocks with syntax borders, inline code, headings, lists, bold text) inside framed cards, thinking traces appear in dedicated muted boxes, and the footer shows decode rate, elapsed time, and prompt rate. Monochrome and simple-I/O modes keep clean plain-text fallback without escape sequences.
 Routine `[doorbell]`, cache/audit and pager traces do not print during ordinary chat. Use `--verbose`, `-verbose` or `-v` for diagnostics. `MOE_IO_DIAG=1` and `MOE_DIAG=1` select additional I/O and graph statistics, but these still require debug verbosity. Genuine I/O/CUDA failures remain visible.
 
 `--moe-direct-io` uses the buffered demand worker and a bounded VRAM expert pool; it is required for stripped expert tensors. `--moe-profile` supplies seeding hints, not a 22 tok/s guarantee. The 5,000 slots are shared across layers and are separate from the host victim cache.

@@ -374,6 +374,18 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
             const auto & t = chunk.at("timings");
             timings.prompt_per_second    = t.value("prompt_per_second",    0.0);
             timings.predicted_per_second = t.value("predicted_per_second", 0.0);
+            int64_t prompt_n = t.value("prompt_n", int64_t(0));
+            int64_t pred_n   = t.value("predicted_n", int64_t(0));
+            if (prompt_n + pred_n > 0) {
+                ui::update_context_usage(prompt_n + pred_n);
+            }
+        }
+        if (chunk.contains("usage") && chunk.at("usage").is_object()) {
+            const auto & u = chunk.at("usage");
+            int64_t total_tokens = u.value("total_tokens", int64_t(-1));
+            if (total_tokens >= 0) {
+                ui::update_context_usage(total_tokens);
+            }
         }
         if (!chunk.contains("choices") || !chunk.at("choices").is_array() || chunk.at("choices").empty()) {
             return;
@@ -398,6 +410,7 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
             }
         }
     });
+    a.finish();
 
     cli_context::interrupted().store(false);
 
@@ -434,53 +447,16 @@ int cli_context::run() {
         model_label = "unknown model";
     }
 
-    ui::reset_display();
-    if (ui::use_color) {
-        console::log("%s\n", betelgeuse_terminal_logo);
-        ui::reset_display();
-    } else if (!params.simple_io) {
-        console::log("\n       ##\n     ######\n   ##########\n     ######\n       ##\n");
-    }
-
-    console::log("\n");
-    ui::set_style(ui::color_accent);
-    console::log("Betelgeuse");
-    ui::reset_display();
-    console::log(" / bel-cli\n");
-    ui::set_style(ui::color_amber);
-    console::log("ready");
-    ui::reset_display();
-    console::log(" | %.*s | %s", int(model_label.size()), model_label.data(), server ? "local" : "remote");
-    if (server) {
-        if (impl->n_ctx > 0) {
-            console::log(" | ctx %lld", (long long) impl->n_ctx);
-        } else {
-            console::log(" | ctx unavailable");
-        }
-    }
-    console::log("\n");
-    ui::set_style(ui::color_muted);
-    console::log("  %s | %s | build %s\n",
-        model_ftype.empty() ? "quantization unavailable" : model_ftype.c_str(),
-        modalities.c_str(), build_info.empty() ? "unavailable" : build_info.c_str());
-    if (!params.system_prompt.empty()) {
-        console::log("  custom system prompt\n");
-    }
-    console::log("  /exit or Ctrl+C: stop/exit | /clear: reset | /regen: retry\n");
-    console::log("  /read <file> | /glob <pattern>");
-    if (has_vision) {
-        console::log(" | /image <file>");
-    }
-    if (has_audio) {
-        console::log(" | /audio <file>");
-    }
-    if (has_video) {
-        console::log(" | /video <file>");
-    }
-    console::log("\n");
-    ui::reset_display();
-    console::flush();
-
+    ui::set_session_info(std::string(model_label), server.has_value(), impl->n_ctx);
+    ui::show_hero_banner(
+        model_label,
+        server.has_value(),
+        impl->n_ctx,
+        model_ftype,
+        modalities,
+        build_info,
+        !params.system_prompt.empty()
+    );
     // interactive loop
     std::string cur_msg;
 
@@ -558,6 +534,7 @@ int cli_context::run() {
         } else if (string_starts_with(buffer, "/clear")) {
             impl->messages.clear();
             add_system_prompt();
+            ui::update_context_usage(0);
 
             impl->pending_media = json::array();
             ui::show_message("Chat history cleared.");
