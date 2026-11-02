@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <regex>
 #include <unordered_set>
@@ -626,7 +627,24 @@ llama_model_loader::llama_model_loader(
 
             // load other splits
             for (idx = 1; idx < n_split; idx++) {
-                const char * fname_split = splits[idx].c_str();
+                std::string fname_split_str = splits[idx];
+                const char * fname_split = fname_split_str.c_str();
+
+                // If split file does not exist, check for engram companion in the same directory
+                if (!std::filesystem::exists(fname_split_str)) {
+                    std::filesystem::path p(fname_split_str);
+                    std::filesystem::path dir = p.parent_path();
+                    std::error_code ec;
+                    for (const auto & entry : std::filesystem::directory_iterator(dir.empty() ? "." : dir, ec)) {
+                        std::string name = entry.path().filename().string();
+                        if (name.find("engram") != std::string::npos && name.rfind(".gguf") == name.size() - 5) {
+                            fname_split_str = entry.path().string();
+                            fname_split = fname_split_str.c_str();
+                            LLAMA_LOG_INFO("%s: resolved missing split %d to engram companion '%s'\\n", __func__, idx, fname_split);
+                            break;
+                        }
+                    }
+                }
 
                 struct gguf_init_params split_params = {
                     /*.no_alloc = */ true,
@@ -645,10 +663,11 @@ llama_model_loader::llama_model_loader(
                     }
                     int idx_gguf = gguf_get_val_u16(ctx_gguf.get(), kid);
                     if (idx_gguf != idx) {
-                        throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d", idx_gguf, fname_split, idx));
+                        if (!(idx_gguf == 0 && gguf_find_tensor(ctx_gguf.get(), "per_layer_token_embd.weight") >= 0)) {
+                            throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d", idx_gguf, fname_split, idx));
+                        }
                     }
                 }
-
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
                 contexts.emplace_back(ctx);
 

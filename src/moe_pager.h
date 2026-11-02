@@ -24,9 +24,10 @@ struct ggml_backend;
 // off is 4 KiB aligned-down; len covers the pre-pad plus the expert bytes,
 // aligned UP to 4 KiB so O_DIRECT reads always transfer in full.
 struct moe_expert_slice {
-    uint64_t off;   // 4 KiB aligned-down file offset (read starts here)
-    uint32_t len;   // read length, aligned UP to 4 KiB
-    uint32_t pre;   // leading pad bytes before the true expert data (off + pre = true offset)
+    int      fd  = -1; // shard file descriptor (or pack fd)
+    uint64_t off = 0;  // 4 KiB aligned-down file offset (read starts here)
+    uint32_t len = 0;  // read length, aligned UP to 4 KiB
+    uint32_t pre = 0;  // leading pad bytes before the true expert data
 };
 
 struct moe_lru {
@@ -156,6 +157,7 @@ private:
     std::string path_;
     int n_layer_ = 0, n_expert_ = 0, n_used_ = 0;
     int fd_ = -1;
+    std::vector<int> fds_;                 // open file descriptors for multi-shard GGUFs
     std::vector<moe_expert_slice> idx_;   // n_layer * n_expert * 3
     size_t bytes_per_expert_ = 0;
     // per-(layer,role) byte length taken from the GGUF index; the pack blob is

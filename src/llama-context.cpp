@@ -2054,7 +2054,7 @@ llama_context::llama_context(
                 moe.pool_gate_up.resize(n_layer);
                 moe.pool_down.resize(n_layer); moe.slot_table.resize(n_layer);
 
-                size_t expect = 0;
+                size_t expect = 0; (void) expect;
                 bool pool_ok = true;
                 moe.sentinel_slot = true;
                 for (int il = 0; il < n_layer; il++) {

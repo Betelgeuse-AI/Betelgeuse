@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,10 @@ moe_pager::~moe_pager() {
         }
         cache_ = nullptr;
     }
+        for (int sfd : fds_) {
+        if (sfd >= 0) close(sfd);
+    }
+    fds_.clear();
     if (fd_ >= 0) { close(fd_); fd_ = -1; }
     if (fd_pack_ >= 0) { close(fd_pack_); fd_pack_ = -1; }
     if (fd_pack_buf_ >= 0) { close(fd_pack_buf_); fd_pack_buf_ = -1; }
@@ -126,59 +131,98 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
     struct gguf_context * gctx = gguf_init_from_file(gguf_path, gp);
     if (!gctx) { err = "gguf_init_from_file failed"; return false; }
 
-    const int64_t data_off = gguf_get_data_offset(gctx);
-    idx_.assign((size_t) n_layer * n_expert * 3, moe_expert_slice{0, 0, 0});
+    idx_.assign((size_t) n_layer * n_expert * 3, moe_expert_slice{-1, 0, 0, 0});
     role_bytes_.assign((size_t) n_layer * 3, 0);
     size_t per_expert_bytes = 0;
 
-    // role 0 = gate, role 1 = up, role 2 = down. qwen4exp on this box ships
-    // SEPARATE gate/up tensors (no fused gate_up).
-    for (int il = 0; il < n_layer; il++) {
-        char n_g[128], n_u[128], n_dn[128];
-        snprintf(n_g,  sizeof n_g,  "blk.%d.ffn_gate_exps.weight", il);
-        snprintf(n_u,  sizeof n_u,  "blk.%d.ffn_up_exps.weight", il);
-        snprintf(n_dn, sizeof n_dn, "blk.%d.ffn_down_exps.weight", il);
+    struct shard_desc {
+        std::string path;
+        struct gguf_context * ctx;
+        int64_t data_off;
+        int fd;
+        bool owned;
+    };
+    std::vector<shard_desc> shards;
 
-        const int64_t t_g  = gguf_find_tensor(gctx, n_g);
-        const int64_t t_u  = gguf_find_tensor(gctx, n_u);
-        const int64_t t_dn = gguf_find_tensor(gctx, n_dn);
-        if (t_g < 0 || t_u < 0 || t_dn < 0) {
-            char m[128];
-            snprintf(m, sizeof m, "missing expert tensors for layer %d", il);
-            err = m; gguf_free(gctx); return false;
+    int n_split = 1;
+    const int kid_split = gguf_find_key(gctx, "split.count");
+    if (kid_split >= 0) {
+        n_split = gguf_get_val_u16(gctx, kid_split);
+    }
+
+    // Open first shard with O_DIRECT and Btrfs safe fallback
+    fd_ = open(gguf_path, O_RDONLY | O_DIRECT);
+    if (fd_ < 0) fd_ = open(gguf_path, O_RDONLY);
+    if (fd_ < 0) { err = "open gguf_path failed"; gguf_free(gctx); return false; }
+    fds_.push_back(fd_);
+    shards.push_back({gguf_path, gctx, (int64_t) gguf_get_data_offset(gctx), fd_, false});
+
+    if (n_split > 1) {
+        char path_buf[1024];
+        const char * split_prefix = strstr(gguf_path, "-00001-of-");
+        int prefix_len = split_prefix ? (int)(split_prefix - gguf_path) : (int)strlen(gguf_path);
+        for (int i = 1; i < n_split; ++i) {
+            snprintf(path_buf, sizeof(path_buf), "%.*s-%05d-of-%05d.gguf", prefix_len, gguf_path, i + 1, n_split);
+            std::string spath = path_buf;
+            if (!std::filesystem::exists(spath)) {
+                // If missing (e.g. 7th shard is engram companion), check directory or skip
+                continue;
+            }
+            struct gguf_context * sctx = gguf_init_from_file(spath.c_str(), gp);
+            if (!sctx) continue;
+            int sfd = open(spath.c_str(), O_RDONLY | O_DIRECT);
+            if (sfd < 0) sfd = open(spath.c_str(), O_RDONLY);
+            if (sfd >= 0) fds_.push_back(sfd);
+            shards.push_back({spath, sctx, (int64_t) gguf_get_data_offset(sctx), sfd, true});
         }
-        const int64_t tids[3] = { t_g, t_u, t_dn };
+    }
 
-        for (int e = 0; e < n_expert; e++) {
-            for (int r = 0; r < 3; r++) {
-                const int64_t tid = tids[r];
-                const size_t tbytes = (size_t) gguf_get_tensor_size(gctx, tid);
-                if (tbytes % (size_t) n_expert) {
-                    err = "expert tensor size not divisible by n_expert";
-                    gguf_free(gctx); return false;
+    for (int il = 0; il < n_layer; il++) {
+        char role_names[3][128];
+        snprintf(role_names[0], sizeof role_names[0], "blk.%d.ffn_gate_exps.weight", il);
+        snprintf(role_names[1], sizeof role_names[1], "blk.%d.ffn_up_exps.weight", il);
+        snprintf(role_names[2], sizeof role_names[2], "blk.%d.ffn_down_exps.weight", il);
+
+        for (int r = 0; r < 3; r++) {
+            bool found = false;
+            for (const auto & sh : shards) {
+                const int64_t tid = gguf_find_tensor(sh.ctx, role_names[r]);
+                if (tid >= 0) {
+                    const size_t tbytes = (size_t) gguf_get_tensor_size(sh.ctx, tid);
+                    if (tbytes % (size_t) n_expert) {
+                        err = "expert tensor size not divisible by n_expert";
+                        for (auto & shd : shards) if (shd.owned) gguf_free(shd.ctx);
+                        gguf_free(gctx); return false;
+                    }
+                    const size_t per = tbytes / (size_t) n_expert;
+                    role_bytes_[(size_t) il * 3 + (size_t) r] = per;
+                    for (int e = 0; e < n_expert; e++) {
+                        const uint64_t fo = (uint64_t)(sh.data_off + gguf_get_tensor_offset(sh.ctx, tid)
+                                                + (int64_t) e * (int64_t) per);
+                        const uint64_t pre = (ALIGN - (fo % ALIGN)) % ALIGN;
+                        moe_expert_slice & sl = idx_[((size_t) il * n_expert + e) * 3 + r];
+                        sl.fd  = sh.fd;
+                        sl.off = fo - pre;
+                        sl.len = (uint32_t)(((per + pre + ALIGN - 1) / ALIGN) * ALIGN);
+                        sl.pre = (uint32_t) pre;
+                        if (il == 0 && e == 0) { per_expert_bytes += per; }
+                    }
+                    found = true;
+                    break;
                 }
-                const size_t per = tbytes / (size_t) n_expert;
-                role_bytes_[(size_t) il * 3 + (size_t) r] = per;
-                // experts of a tensor are contiguous: slice e begins at
-                // base + e*per. Align DOWN for O_DIRECT and keep the pre-pad;
-                // align the LENGTH up so the read is a whole number of blocks
-                // (a short O_DIRECT read would otherwise DMA stale staging).
-                const uint64_t fo = (uint64_t)(data_off + gguf_get_tensor_offset(gctx, tid)
-                                        + (int64_t) e * (int64_t) per);
-                const uint64_t pre = (ALIGN - (fo % ALIGN)) % ALIGN;
-                moe_expert_slice & sl = idx_[((size_t) il * n_expert + e) * 3 + r];
-                sl.off = fo - pre;
-                sl.len = (uint32_t)(((per + pre + ALIGN - 1) / ALIGN) * ALIGN);
-                sl.pre = (uint32_t) pre;
-                if (il == 0 && e == 0) { per_expert_bytes += per; }
+            }
+            if (!found) {
+                char m[128];
+                snprintf(m, sizeof m, "missing expert tensor %s", role_names[r]);
+                err = m;
+                for (auto & shd : shards) if (shd.owned) gguf_free(shd.ctx);
+                gguf_free(gctx); return false;
             }
         }
     }
+    for (auto & shd : shards) if (shd.owned) gguf_free(shd.ctx);
     gguf_free(gctx);
     bytes_per_expert_ = per_expert_bytes;
-
-    fd_ = open(gguf_path, O_RDONLY | O_DIRECT);
-    if (fd_ < 0) { err = "open O_DIRECT failed"; return false; }
 
     // one staging slot must hold ALL THREE role reads of one expert: the
     // submit path lays them out back-to-back (boff), so sizing by the max
@@ -242,6 +286,7 @@ bool moe_pager::use_pack(const char * experts_bin, const char * index_txt, std::
             const uint64_t pre  = (ALIGN - (fbo % ALIGN)) % ALIGN;
             const size_t   alen = (size_t) (((blob + pre + ALIGN - 1) / ALIGN) * ALIGN);
             moe_expert_slice * s = &new_idx[((size_t) il * n_expert_ + e) * 3];
+            s[0].fd  = fd_pack_;
             s[0].off = fbo - pre;
             s[0].len = (uint32_t) alen;
             s[0].pre = (uint32_t) pre;
@@ -325,7 +370,7 @@ int moe_pager::submit_(int key, bool demand) {
             }
             sqe = io_uring_get_sqe((struct io_uring *) ring_);
         }
-        io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : fd_,
+        io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : (s[r].fd >= 0 ? s[r].fd : fd_),
                            stage_ + (size_t) st * stage_bytes_ + boff,
                            s[r].len, (off_t) s[r].off);
         sqe->user_data = (uint64_t)((ridx * 4) + r);
@@ -574,16 +619,30 @@ bool moe_pager::fetch_direct_io(int il, int e, void * dst_gate, size_t gate_byte
                                 void * dst_down, size_t down_bytes, void * stream, int slot_idx) {
     if (il < 0 || il >= n_layer_ || e < 0 || e >= n_expert_) return false;
     const moe_expert_slice * s = slices(il, e);
-    const int fd = pack_mode_ ? fd_pack_ : fd_;
-    if (fd < 0 || !stage_) return false;
-
     const int st = (slot_idx >= 0 ? slot_idx : 0) % (demand_stages_ > 0 ? demand_stages_ : 64);
     char * src = stage_ + (size_t) st * stage_bytes_;
 
-    ssize_t r = pread(fd, src, s[0].len, (off_t) s[0].off);
-    if (r != (ssize_t) s[0].len) {
-        n_io_fail_++;
-        return false;
+    if (pack_mode_) {
+        const int fd = fd_pack_;
+        if (fd < 0 || !stage_) return false;
+        ssize_t r = pread(fd, src, s[0].len, (off_t) s[0].off);
+        if (r != (ssize_t) s[0].len) {
+            n_io_fail_++;
+            return false;
+        }
+    } else {
+        if (!stage_) return false;
+        size_t boff = 0;
+        for (int k = 0; k < 3; k++) {
+            const int kfd = s[k].fd >= 0 ? s[k].fd : fd_;
+            if (kfd < 0) return false;
+            ssize_t r = pread(kfd, src + boff, s[k].len, (off_t) s[k].off);
+            if (r != (ssize_t) s[k].len) {
+                n_io_fail_++;
+                return false;
+            }
+            boff += s[k].len;
+        }
     }
 
     const uint32_t * bsrc = pack_mode_ ? &bsrc_[(size_t) (il * n_expert_ + e) * 3] : nullptr;
@@ -742,7 +801,7 @@ bool moe_pager::use_warm_pack(const char * path, const char * index_txt, std::st
         if (il < 0 || il >= n_layer_ || e < 0 || e >= n_expert_ || off < 0 || len <= 0) {
             err = "warm pack index out of range"; return false;
         }
-        widx[(size_t) il * n_expert_ + e] = moe_expert_slice{(uint64_t) off, (uint32_t) len, 0};
+        widx[(size_t) il * n_expert_ + e] = moe_expert_slice{-1, (uint64_t) off, (uint32_t) len, 0};
         whas[(size_t) il * n_expert_ + e] = 1;
         rows++;
     }
@@ -953,7 +1012,7 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
                 io_uring_submit((struct io_uring *) ring_);
                 sqe = io_uring_get_sqe((struct io_uring *) ring_);
             }
-            io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : fd_,
+            io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : (s[r].fd >= 0 ? s[r].fd : fd_),
                                stage_ + (size_t) st * stage_bytes_ + boff,
                                s[r].len, (off_t) s[r].off);
             sqe->user_data = (uint64_t)((ridx * 4) + r);
