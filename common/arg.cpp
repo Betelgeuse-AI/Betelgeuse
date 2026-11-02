@@ -2741,6 +2741,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.moe_direct_io = true;
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_MOE_DIRECT_IO"));
     add_opt(common_arg(
