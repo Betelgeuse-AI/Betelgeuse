@@ -1102,6 +1102,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "MOE_SLOT_RESOLVE",
+    "MOE_SLOT_RESOLVE_KICK",
+    "MOE_SLOT_RESOLVE_WAIT",
+    "MOE_SLOT_PREKICK",
 
     "UNARY",
 
@@ -1119,7 +1123,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1218,6 +1222,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "moe_slot_resolve(topk, table)",
+    "moe_slot_resolve_kick(topk, table)",
+    "moe_slot_resolve_wait(kick, dependency)",
+    "moe_slot_prekick(topk, table)",
 
     "unary(x)",
 
@@ -1235,7 +1243,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6710,6 +6718,71 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[3] = blocks;
     result->src[4] = extra;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_slot_resolve(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * topk,
+        struct ggml_tensor  * table,
+        struct ggml_tensor  * full,
+        struct ggml_tensor  * look,
+        int32_t               il,
+        int32_t               sentinel) {
+    GGML_ASSERT(topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(table->type == GGML_TYPE_I32);
+    GGML_ASSERT(look == NULL || look->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk->ne[0], topk->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, il);
+    ggml_set_op_params_i32(result, 1, sentinel);
+
+    result->op     = GGML_OP_MOE_SLOT_RESOLVE;
+    result->src[0] = topk;
+    result->src[1] = table;
+    result->src[2] = full;
+    result->src[3] = look;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_slot_resolve_kick(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * topk,
+        struct ggml_tensor  * table,
+        int32_t               il,
+        int32_t               sentinel) {
+    GGML_ASSERT(topk->ne[1] == 1);
+    struct ggml_tensor * result = ggml_moe_slot_resolve(ctx, topk, table, NULL, NULL, il, sentinel);
+    result->op = GGML_OP_MOE_SLOT_RESOLVE_KICK;
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_slot_resolve_wait(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kick,
+        struct ggml_tensor  * dependency) {
+    GGML_ASSERT(kick->op == GGML_OP_MOE_SLOT_RESOLVE_KICK);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, kick);
+    memcpy(result->op_params, kick->op_params, sizeof(result->op_params));
+    result->op = GGML_OP_MOE_SLOT_RESOLVE_WAIT;
+    result->src[0] = kick;
+    result->src[1] = kick->src[1];
+    result->src[2] = dependency;
+    result->src[3] = kick->src[0];
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_slot_prekick(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * topk,
+        struct ggml_tensor  * table,
+        int32_t               il,
+        int32_t               sentinel) {
+    GGML_ASSERT(topk->ne[1] == 1 && topk->ne[0] <= 8);
+    struct ggml_tensor * result = ggml_moe_slot_resolve(ctx, topk, table, NULL, NULL, il, sentinel);
+    result->op = GGML_OP_MOE_SLOT_PREKICK;
     return result;
 }
 

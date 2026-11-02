@@ -8,6 +8,14 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "moe_pager.h"
+#include "moe_doorbell.h"
+#include "moe_predictor.h"
+
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -261,6 +269,97 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    // ---- sparse MoE direct-IO slot pool ----
+    struct moe_pool {
+        ggml_context        * ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        size_t               buf_bytes = 0;
+        std::vector<ggml_tensor *> pool_gate, pool_up, pool_gate_up, pool_down, slot_table;
+        std::vector<int32_t> slot_of, slot_key;
+        std::vector<uint32_t> slot_freq;
+        std::vector<uint32_t> dec_freq;   // n_layer*n_expert: decode-only routing counts
+        moe_lru lru;
+        std::vector<uint16_t> pred16;     // n_layer*16: predictor candidates for the next step
+        long pred_hit = 0, pred_fresh = 0;
+        int n_layer = 0, n_expert = 0, n_used = 0, s_per_layer = 0;
+        int n_slots = 0;   // s_per_layer plus the sentinel slot when armed
+        long n_hit = 0, n_miss = 0, n_page_fail = 0;
+        long n_warm_hit = 0, n_pack_hit = 0;
+        bool count_freq = true;
+        std::atomic<long> ra_done{0};
+        std::vector<uint16_t> exp_rank;  // n_layer*n_expert: LFU rank within layer
+        long prefill_resident = 0, prefill_miss = 0;
+        char * host_pool = nullptr;
+        size_t host_slot_bytes = 0;
+        bool host_odirect = false;
+        int    host_nslots = 0;
+        int    host_rr = 0;
+        int    host_ring = 0;
+        std::vector<void *> host_ev;
+        std::vector<size_t> host_gate, host_up, host_down;
+        std::vector<int32_t> step_sel;
+        std::vector<ggml_tensor *> step_topk;
+        uint32_t last_ntok = 0;
+        bool     sentinel_slot = false;
+        std::vector<float>   adapt_decay;
+        std::vector<int32_t> adapt_last;
+        std::vector<int32_t> adapt_pend_e;
+        long adapt_pass  = 0;
+        long adapt_swaps = 0, adapt_bytes = 0, adapt_cold = 0;
+    };
+    moe_pool moe;
+    moe_pager pager;
+    std::vector<std::thread> or_thr;
+    std::atomic<bool> or_run{false};
+    std::mutex or_mtx;
+    std::vector<uint32_t> or_q;
+    std::vector<int32_t> look_pred;
+    std::vector<long> look_fresh;
+    long look_hit = 0, look_need = 0, look_push = 0;
+    std::vector<uint16_t> coact;
+    std::vector<uint16_t> coact_cnt;
+    std::vector<uint32_t> co_hint;
+    uint32_t co_tok = 0;
+    long co_push = 0, co_need = 0, co_cover = 0;
+    int  hot_k = 0;
+    int  hot_pos = 0;
+    bool hot_cycles = false;
+    struct moe_io_job { int32_t e; int vslot; int rslot; int fd; uint64_t off; uint32_t len; uint32_t pre; bool warm; };
+    std::mutex io_mtx;
+    std::condition_variable io_cv, io_done_cv;
+    std::vector<moe_io_job> io_jobs, io_jobs_scratch;
+    int  io_pfd = -1, io_il = 0;
+    size_t io_stride = 0, io_per = 0, io_nth = 0;
+    std::atomic<size_t> io_next{0};
+    std::atomic<long> io_fail{0};
+    std::atomic<long> io_warm_us{0}, io_warm_n{0}, io_cold_us{0}, io_cold_n{0};
+    std::atomic<long> io_finished{0};
+    long io_thr_active = 0;
+    unsigned long long io_gen = 0;
+    std::atomic<unsigned long long> io_gen_done{0};
+    std::atomic<bool> io_run{false};
+    std::vector<std::thread> io_thr;
+    bool      moe_ready = false;
+    bool moe_enabled() const { return moe_ready; }
+    int  moe_page(int il, int e);
+    int  moe_page_pinned(int il, int e, const bool * pinned);
+    void moe_page_batch(int il, const int32_t * sel, int n);
+    void moe_page_batch_sorted(int il, const int32_t * sel, int n);
+    bool moe_page_host_batch(int il, const int32_t * uniq, size_t nunq,
+        std::vector<char> & pinned, int base, int s_pl, void * stream);
+    void moe_prefetch_ahead(int il, const int32_t * sel, int n);
+    void moe_publish(int il, int e, int slot);
+    bool moe_adapt_on() const;
+    void moe_adapt_note(int il, int e);
+    void moe_adapt_run();
+    void moe_post_refresh();
+    void moe_predict_and_prefetch();
+    const ggml_tensor * moe_pool_tensor(const char * which, int il) const;
+    void moe_seed_hot();
+    void moe_hot_save();
+    void moe_hot_cycle(int fd);
+    void moe_reseed_decode();
+
 
 private:
     llm_graph_result * get_gf_res_prev();

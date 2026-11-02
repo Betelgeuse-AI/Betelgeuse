@@ -1744,6 +1744,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    mparams.moe_direct_io               = params.moe_direct_io;
+    mparams.moe_slots                   = params.moe_slots;
     return mparams;
 }
 
@@ -1784,6 +1786,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_direct_io     = params.moe_direct_io;
+    cparams.moe_slots         = params.moe_slots;
+    cparams.moe_gguf_path     = params.model.path.c_str();
+    cparams.moe_pack_dir      = params.moe_pack_dir.empty() ? nullptr : params.moe_pack_dir.c_str();
+    cparams.moe_chunk_max     = params.moe_chunk_max;
+    cparams.moe_profile_path  = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
 
     return cparams;
 }

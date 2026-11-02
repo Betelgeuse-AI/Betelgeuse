@@ -2735,6 +2735,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-direct-io"},
+        "keep routed-expert (MoE) weights off device buffers so they can be "
+        "streamed on demand from the GGUF into a VRAM slot pool",
+        [](common_params & params) {
+            params.moe_direct_io = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_DIRECT_IO"));
+    add_opt(common_arg(
+        {"--moe-slots"}, "N",
+        string_format("total number of VRAM expert slots shared across layers (default: %d)", params.moe_slots),
+        [](common_params & params, int value) {
+            params.moe_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOTS"));
+    add_opt(common_arg(
+        {"--moe-pack-dir"}, "DIR",
+        "expert pack directory containing experts.bin and native_experts.txt",
+        [](common_params & params, const std::string & value) {
+            params.moe_pack_dir = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PACK_DIR"));
+    add_opt(common_arg(
+        {"--moe-profile"}, "FILE",
+        "hot-expert profile for initial slot seeding",
+        [](common_params & params, const std::string & value) {
+            params.moe_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-chunk-max"}, "N",
+        string_format("widest batch row routed through the MoE pool (default: %d)", params.moe_chunk_max),
+        [](common_params & params, int value) {
+            params.moe_chunk_max = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CHUNK_MAX"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

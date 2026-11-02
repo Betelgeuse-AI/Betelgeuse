@@ -35,6 +35,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-recurrent.cpp
     llama-mmap.cpp
     llama-model-loader.cpp
+    moe_pager.cpp
     llama-model-saver.cpp
     llama-model.cpp
     llama-quant.cpp
@@ -68,6 +69,16 @@ configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @O
 target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+
+if (GGML_CUDA)
+    enable_language(CUDA)
+    target_sources(llama PRIVATE moe_predictor.cu moe_doorbell.cu)
+    set_target_properties(llama PROPERTIES CUDA_ARCHITECTURES 86)
+    set_source_files_properties(moe_predictor.cu moe_doorbell.cu PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    target_include_directories(llama PRIVATE ${_cmake_CUDAToolkit_include_directories})
+    target_link_directories(llama PRIVATE ${_cmake_CUDAToolkit_library_directories})
+    target_link_libraries(llama PRIVATE uring)
+endif()
 
 target_link_libraries(llama PUBLIC ggml)
 

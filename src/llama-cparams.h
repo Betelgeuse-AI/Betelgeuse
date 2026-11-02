@@ -67,6 +67,13 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+    bool         moe_direct_io = false;
+    int32_t      moe_slots     = 4096;
+    const char * moe_pack_dir  = nullptr;
+    const char * moe_gguf_path = nullptr;
+    const char * moe_profile_path = nullptr;
+    int32_t      moe_chunk_max = 64;
+
 
     llama_context * ctx_other;
 };

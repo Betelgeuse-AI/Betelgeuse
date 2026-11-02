@@ -833,6 +833,12 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    const ggml_tensor * const * moe_gate    = nullptr;
+    const ggml_tensor * const * moe_gate_up = nullptr;
+    const ggml_tensor * const * moe_up      = nullptr;
+    const ggml_tensor * const * moe_down    = nullptr;
+    const ggml_tensor * const * moe_table   = nullptr;
+    int32_t moe_n_layer = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1077,6 +1083,12 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+    const ggml_tensor * const * moe_gate    = nullptr;
+    const ggml_tensor * const * moe_gate_up = nullptr;
+    const ggml_tensor * const * moe_up      = nullptr;
+    const ggml_tensor * const * moe_down    = nullptr;
+    const ggml_tensor * const * moe_table   = nullptr;
+    int32_t moe_n_layer = 0;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

@@ -741,6 +741,12 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+static ggml_cuda_moe_slot_resolve_fn_t ggml_cuda_moe_slot_resolve_fn = nullptr;
+
+void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn) {
+    ggml_cuda_moe_slot_resolve_fn = fn;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -2686,6 +2692,27 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_MOE_SLOT_RESOLVE:
+        case GGML_OP_MOE_SLOT_RESOLVE_KICK:
+        case GGML_OP_MOE_SLOT_RESOLVE_WAIT:
+        case GGML_OP_MOE_SLOT_PREKICK:
+            {
+                GGML_ASSERT(ggml_cuda_moe_slot_resolve_fn != nullptr);
+                const ggml_tensor * topk  = dst->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT ? dst->src[3] : dst->src[0];
+                const ggml_tensor * table = dst->src[1];
+                const ggml_tensor * full  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[2] : nullptr;
+                const ggml_tensor * look  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[3] : nullptr;
+                ggml_cuda_moe_slot_resolve_fn(ctx.stream(),
+                    (const int32_t *) topk->data, (const int32_t *) table->data, (int32_t *) dst->data,
+                    topk->ne[0], topk->ne[1], topk->nb[0], topk->nb[1], table->nb[0], dst->nb[0], dst->nb[1],
+                    full ? (const int32_t *) full->data : nullptr,
+                    full ? full->ne[0] : 0, full ? full->ne[1] : 0,
+                    full ? full->nb[1] : 0,
+                    look ? (const int32_t *) look->data : nullptr,
+                    look ? look->ne[0] * look->ne[1] : 0,
+                    ggml_get_op_params_i32(dst, 0), (int32_t) (table->ne[0] * table->ne[1]),
+                    ggml_get_op_params_i32(dst, 1), dst->op);
+            } break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -2881,6 +2908,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                     GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
                 }
             }
+        }
+        if (node->op == GGML_OP_MOE_SLOT_RESOLVE) {
+            use_cuda_graph = false;
+        }
+        if ((node->op == GGML_OP_MOE_SLOT_RESOLVE_KICK || node->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT ||
+             node->op == GGML_OP_MOE_SLOT_PREKICK) && node->src[0]->ne[1] != 1) {
+            use_cuda_graph = false;
         }
 
         if (!use_cuda_graph) {
@@ -6212,6 +6246,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_SLOT_RESOLVE:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_I32;
+        case GGML_OP_MOE_SLOT_RESOLVE_KICK:
+        case GGML_OP_MOE_SLOT_RESOLVE_WAIT:
+        case GGML_OP_MOE_SLOT_PREKICK:
+            return ggml_cuda_moe_slot_resolve_fn != nullptr &&
+                op->src[0]->type == GGML_TYPE_I32 && op->src[0]->ne[1] == 1 &&
+                op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
 
         default:
             return false;

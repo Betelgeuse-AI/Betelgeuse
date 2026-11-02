@@ -599,6 +599,15 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
+    int32_t cache_warmup    = 0;
+    std::string cache_warmup_prompt = "Explain a practical topic in detail, with examples and a short summary.";
+    // ---- sparse MoE direct-IO engine (FluxAeros) -------------------------
+    bool    moe_direct_io   = false; // stream routed-expert weights via O_DIRECT into a VRAM slot pool
+    int32_t moe_slots       = 4096;  // total VRAM slots shared across all MoE layers
+    std::string moe_profile = "";    // hot-expert profile for slot seeding (empty = built-in table)
+    std::string moe_pack_dir = "";   // native expert pack dir (experts.bin + native_experts.txt)
+    int32_t moe_chunk_max   = 64;    // widest batch routed through the MoE pool
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

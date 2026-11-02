@@ -1507,6 +1507,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    moe_gate         (params.moe_gate),
+    moe_up           (params.moe_up),
+    moe_gate_up      (params.moe_gate_up),
+    moe_down         (params.moe_down),
+    moe_table        (params.moe_table),
+    moe_n_layer      (params.moe_n_layer),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
@@ -2302,6 +2308,55 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
+    const int64_t moe_chunk_max = cparams.moe_chunk_max;
+    bool moe_use_pool = false;
+    static int moe_slicing_on = -1;
+    if (moe_slicing_on < 0) {
+        const char * e = getenv("MOE_SLICING");
+        moe_slicing_on = (!e || atoi(e) != 0) ? 1 : 0;
+    }
+    const int64_t pool_max = (moe_slicing_on == 1) ? 64 : moe_chunk_max;
+    if (cparams.moe_direct_io && moe_n_layer > il && il >= 0 &&
+        moe_gate && moe_up && moe_down && moe_table &&
+        moe_gate[il] && moe_up[il] && moe_down[il] && moe_table[il] &&
+        (gate_up_exps == nullptr || gate_up_exps->ne[1] != 2 * ((ggml_tensor *) moe_up[il])->ne[1])) {
+        if (n_tokens == 1) {
+            moe_use_pool = true;
+        } else if (n_tokens > 1 && n_tokens <= pool_max) {
+            if (moe_slicing_on == 1 && n_tokens <= 64) {
+                selected_experts = ggml_cont(ctx0, selected_experts);
+                moe_use_pool = true;
+            } else if (ggml_is_contiguous(selected_experts)) {
+                moe_use_pool = true;
+            }
+        }
+    }
+    ggml_tensor * slot_ids = selected_experts;
+    if (moe_use_pool) {
+        gate_up_exps = nullptr;
+        gate_exps = (ggml_tensor *) moe_gate[il];
+        up_exps   = (ggml_tensor *) moe_up[il];
+        down_exps = (ggml_tensor *) moe_down[il];
+        static int doorbell = -1;
+        if (doorbell < 0) {
+            const char * e = getenv("MOE_DOORBELL");
+            doorbell = (!e || atoi(e) != 0) ? 1 : 0;
+        }
+        if (doorbell == 1 && n_tokens >= 1) {
+            const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
+            ggml_tensor * sel_c = ggml_cont(ctx0, selected_experts);
+            slot_ids = ggml_moe_slot_resolve(ctx0, sel_c,
+                (ggml_tensor *) moe_table[il], sel_c, nullptr, (int32_t) il, sentinel);
+            cb(slot_ids, "ffn_moe_slot_ids", il);
+        } else {
+            ggml_tensor * ids_flat  = ggml_reshape_1d(ctx0, selected_experts, n_expert_used * n_tokens);
+            ggml_tensor * slot_flat = ggml_get_rows(ctx0, (ggml_tensor *) moe_table[il], ids_flat);
+            slot_ids = ggml_reshape_2d(ctx0, slot_flat, n_expert_used, n_tokens);
+            cb(slot_ids, "ffn_moe_slot_ids", il);
+        }
+    }
+
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2335,7 +2390,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, moe_use_pool ? slot_ids : selected_experts, up_exps_s, moe_use_pool ? nullptr : slots); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2348,7 +2403,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, moe_use_pool ? slot_ids : selected_experts, gate_exps_s, moe_use_pool ? nullptr : slots); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2461,7 +2516,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+        experts = build_lora_mm_id(down_exps, cur, moe_use_pool ? slot_ids : selected_experts, down_exps_s, moe_use_pool ? nullptr : slots); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
