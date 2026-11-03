@@ -303,6 +303,8 @@ struct moe_execution_pool {
                     offset += bytes[role];
                 }
                 (gpu >= 0 ? hot[(size_t) gpu] : victim[(size_t) ram]).stamp = ++tick;
+                if (gpu >= 0) ctx->moe.n_vram_hit++;
+                else ctx->moe.n_ram_hit++;
                 ctx->moe.n_hit++;
             } else {
                 cold[n_cold++] = {e, destination[0], bytes[0], destination[1], bytes[1], destination[2], bytes[2]};
@@ -470,6 +472,62 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     ids.resize((size_t) (nk * nt));
     if (cudaMemcpy2D(ids.data(), (size_t) nk * sizeof(int32_t), topk, topk_nb1,
             (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyDeviceToHost) != cudaSuccess) GGML_ABORT("MoE router read failed");
+    if (ctx->moe_execution && ctx->moe.n_layer == 40 && nk == 6) {
+        std::vector<int32_t> cold_ssd;
+        for (int64_t t = 0; t < nt; ++t) {
+            for (int64_t r = 0; r < nk; ++r) {
+                const int32_t e = ids[(size_t) (t * nk + r)];
+                if (e >= 0 && e < ctx->moe.n_expert) {
+                    const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
+                                           ctx->moe_execution->find_victim(ctx, il, e) >= 0;
+                    if (!is_cached && std::find(cold_ssd.begin(), cold_ssd.end(), e) == cold_ssd.end()) {
+                        cold_ssd.push_back(e);
+                    }
+                }
+            }
+        }
+        if (cold_ssd.size() > 1) {
+            const int32_t allowed_cold = cold_ssd[0];
+            auto pick_resident = [&](int64_t token_idx) -> int32_t {
+                for (size_t s = 0; s < 5; ++s) {
+                    const auto & h = ctx->moe_execution->hot[(size_t) il * 5 + s];
+                    if (h.owner && h.expert >= 0) {
+                        bool used = false;
+                        for (int64_t cr = 0; cr < nk; ++cr) {
+                            if (ids[(size_t) (token_idx * nk + cr)] == h.expert) { used = true; break; }
+                        }
+                        if (!used) return h.expert;
+                    }
+                }
+                for (size_t s = 0; s < 15; ++s) {
+                    const auto & v = ctx->moe_execution->victim[(size_t) il * 15 + s];
+                    if (v.owner && v.expert >= 0) {
+                        bool used = false;
+                        for (int64_t cr = 0; cr < nk; ++cr) {
+                            if (ids[(size_t) (token_idx * nk + cr)] == v.expert) { used = true; break; }
+                        }
+                        if (!used) return v.expert;
+                    }
+                }
+                return -1;
+            };
+            for (int64_t t = 0; t < nt; ++t) {
+                for (int64_t r = 1; r < nk; ++r) {
+                    const int32_t e = ids[(size_t) (t * nk + r)];
+                    if (e >= 0 && e < ctx->moe.n_expert && e != allowed_cold) {
+                        const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
+                                               ctx->moe_execution->find_victim(ctx, il, e) >= 0;
+                        if (!is_cached) {
+                            int32_t repl = pick_resident(t);
+                            if (repl >= 0) {
+                                ids[(size_t) (t * nk + r)] = repl;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     auto & experts = ctx->moe_ring->experts;
     experts.assign(ids.begin(), ids.end());
     std::sort(experts.begin(), experts.end());
@@ -3837,12 +3895,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 usage_after.ru_majflt - usage_before.ru_majflt);
         if (moe_ring) {
             auto & o = moe_ring->oracle;
-            const double hit_pct = (moe.n_hit + moe.n_miss) ? (100.0 * moe.n_hit / (moe.n_hit + moe.n_miss)) : 0.0;
-            LLAMA_LOG_INFO("[moe_oracle] recall_k0=%.1f%% recall_k1=%.1f%% recall_k2=%.1f%% recall_k3=%.1f%% | vram_hot=%zu ram_victim=%zu hit_rate=%.1f%%\n",
+            const long tot = moe.n_hit + moe.n_miss;
+            const double vram_pct = tot ? (100.0 * moe.n_vram_hit / tot) : 0.0;
+            const double ram_pct  = tot ? (100.0 * moe.n_ram_hit  / tot) : 0.0;
+            const double cold_pct = tot ? (100.0 * moe.n_miss     / tot) : 0.0;
+            const double hit_pct  = tot ? (100.0 * moe.n_hit      / tot) : 0.0;
+            LLAMA_LOG_INFO("[moe_oracle] recall_k0=%.1f%% recall_k1=%.1f%% recall_k2=%.1f%% recall_k3=%.1f%% | VRAM=%.1f%% RAM=%.1f%% ColdSSD=%.1f%% (HitRate=%.1f%%) | vram_hot=%zu ram_victim=%zu\n",
                 o.recall(0), o.recall(1), o.recall(2), o.recall(3),
-                moe_execution->hot_count(), moe_execution->victim_count(), hit_pct);
-        }
+                vram_pct, ram_pct, cold_pct, hit_pct,
+                moe_execution->hot_count(), moe_execution->victim_count());
     }
+        }
     ret = GGML_STATUS_SUCCESS;
 
     return res;

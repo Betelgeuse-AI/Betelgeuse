@@ -285,7 +285,7 @@ public:
         long pred_hit = 0, pred_fresh = 0;
         int n_layer = 0, n_expert = 0, n_used = 0, s_per_layer = 0;
         int n_slots = 0;   // s_per_layer plus the sentinel slot when armed
-        long n_hit = 0, n_miss = 0, n_page_fail = 0;
+        long n_hit = 0, n_miss = 0, n_page_fail = 0, n_vram_hit = 0, n_ram_hit = 0;
         long n_warm_hit = 0, n_pack_hit = 0;
         bool count_freq = true;
         std::atomic<long> ra_done{0};
