@@ -215,8 +215,8 @@ struct moe_execution_pool {
         return -1;
     }
     int find_victim(llama_context * ctx, int il, int e) const {
-        if (is_dsv41(ctx) && il >= 0 && il < 40) return find_layer(victim, ctx, il, e, (size_t) il * 15, 15);
-        if (il >= 0 && il < 3) return find_layer(victim, ctx, il, e, 600 + (size_t) il, 1);
+        if (is_dsv41(ctx) && il >= 0 && il < 40) return find_layer(victim, ctx, il, e, (size_t) il * 5, 5);
+        if (il >= 0 && il < 3) return find_layer(victim, ctx, il, e, 200 + (size_t) il, 1);
         return -1;
     }
     size_t oldest_hot(llama_context * ctx, int il) const {
@@ -225,8 +225,8 @@ struct moe_execution_pool {
         return 0;
     }
     size_t oldest_victim(llama_context * ctx, int il) const {
-        if (is_dsv41(ctx) && il >= 0 && il < 40) return oldest_layer(victim, (size_t) il * 15, 15, false);
-        if (il >= 0 && il < 3) return oldest_layer(victim, 600 + (size_t) il, 1, false);
+        if (is_dsv41(ctx) && il >= 0 && il < 40) return oldest_layer(victim, (size_t) il * 5, 5, false);
+        if (il >= 0 && il < 3) return oldest_layer(victim, 200 + (size_t) il, 1, false);
         return 0;
     }
 
@@ -244,6 +244,29 @@ struct moe_execution_pool {
         victim[slot].layer  = key.layer;
         victim[slot].expert = key.expert;
         victim[slot].stamp  = ++tick;
+    }
+    void promote_async(llama_context * ctx, int il, int e) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (find_hot(ctx, il, e) >= 0 || find_victim(ctx, il, e) >= 0) return;
+        const size_t slot = oldest_victim(ctx, il);
+        char * dst = victim_data(slot);
+        const auto * sl = ctx->pager.slices(il, e);
+        size_t off = 0;
+        bool ok = true;
+        for (int r = 0; r < 3; ++r) {
+            const size_t role_b = r == 0 ? ctx->moe.pool_gate[il]->nb[2] : (r == 1 ? ctx->moe.pool_up[il]->nb[2] : ctx->moe.pool_down[il]->nb[2]);
+            const int fd = sl[r].fd_buf >= 0 ? sl[r].fd_buf : sl[r].fd;
+            ssize_t n = pread(fd, dst + off, role_b, (off_t) (sl[r].off + sl[r].pre));
+            posix_fadvise(fd, (off_t) sl[r].off, sl[r].len, POSIX_FADV_DONTNEED);
+            if (n != (ssize_t) role_b) { ok = false; break; }
+            off += role_b;
+        }
+        if (ok) {
+            victim[slot].owner  = ctx;
+            victim[slot].layer  = il;
+            victim[slot].expert = e;
+            victim[slot].stamp  = ++tick;
+        }
     }
 
     void prepare(llama_context * ctx, int il, const std::vector<int32_t> & experts, bool demand = true) {
@@ -381,6 +404,19 @@ struct moe_ring_state {
     int current_layer = -1;
     size_t layer_tokens = 0;
 
+    std::vector<std::pair<int, int>> async_promotions;
+    std::atomic<uint64_t> promotions_completed{0};
+    void enqueue_promotion(int il, int expert) {
+        if (expert < 0) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto & p : async_promotions) {
+            if (p.first == il && p.second == expert) return;
+        }
+        if (async_promotions.size() < 8) {
+            async_promotions.push_back({il, expert});
+            cv.notify_all();
+        }
+    }
     struct moe_oracle_tracker {
         uint64_t hits[4] = {0, 0, 0, 0};
         uint64_t totals[4] = {0, 0, 0, 0};
@@ -408,17 +444,29 @@ struct moe_ring_state {
         worker = std::thread([this]() {
             std::unique_lock<std::mutex> lock(mutex);
             while (running) {
-                cv.wait(lock, [this]() { return !running || pending; });
+                cv.wait(lock, [this]() { return !running || pending || !async_promotions.empty(); });
                 if (!running) break;
-                lock.unlock();
-                try {
-                    this->ctx->moe_execution->prepare(this->ctx, layer, prediction, false);
-                } catch (...) {
-                    error = std::current_exception();
+                if (pending) {
+                    lock.unlock();
+                    try {
+                        this->ctx->moe_execution->prepare(this->ctx, layer, prediction, false);
+                    } catch (...) {
+                        error = std::current_exception();
+                    }
+                    lock.lock();
+                    pending = false;
+                    cv.notify_all();
                 }
-                lock.lock();
-                pending = false;
-                cv.notify_all();
+                while (!async_promotions.empty()) {
+                    auto promo = async_promotions.back();
+                    async_promotions.pop_back();
+                    lock.unlock();
+                    try {
+                        this->ctx->moe_execution->promote_async(this->ctx, promo.first, promo.second);
+                        promotions_completed++;
+                    } catch (...) {}
+                    lock.lock();
+                }
             }
         });
     }
@@ -473,55 +521,46 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     if (cudaMemcpy2D(ids.data(), (size_t) nk * sizeof(int32_t), topk, topk_nb1,
             (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyDeviceToHost) != cudaSuccess) GGML_ABORT("MoE router read failed");
     if (ctx->moe_execution && ctx->moe.n_layer == 40 && nk == 6) {
-        std::vector<int32_t> cold_ssd;
+        auto pick_resident = [&](int64_t token_idx) -> int32_t {
+            for (size_t s = 0; s < 5; ++s) {
+                const auto & h = ctx->moe_execution->hot[(size_t) il * 5 + s];
+                if (h.owner && h.expert >= 0) {
+                    bool used = false;
+                    for (int64_t cr = 0; cr < nk; ++cr) {
+                        if (ids[(size_t) (token_idx * nk + cr)] == h.expert) { used = true; break; }
+                    }
+                    if (!used) return h.expert;
+                }
+            }
+            for (size_t s = 0; s < 5; ++s) {
+                const auto & v = ctx->moe_execution->victim[(size_t) il * 5 + s];
+                if (v.owner && v.expert >= 0) {
+                    bool used = false;
+                    for (int64_t cr = 0; cr < nk; ++cr) {
+                        if (ids[(size_t) (token_idx * nk + cr)] == v.expert) { used = true; break; }
+                    }
+                    if (!used) return v.expert;
+                }
+            }
+            return -1;
+        };
         for (int64_t t = 0; t < nt; ++t) {
-            for (int64_t r = 0; r < nk; ++r) {
+            const int32_t e0 = ids[(size_t) (t * nk + 0)];
+            if (e0 >= 0 && e0 < ctx->moe.n_expert) {
+                if (ctx->moe_execution->find_hot(ctx, il, e0) < 0 && ctx->moe_execution->find_victim(ctx, il, e0) < 0) {
+                    ctx->moe_ring->enqueue_promotion(il, e0);
+                }
+            }
+            for (int64_t r = 1; r < nk; ++r) {
                 const int32_t e = ids[(size_t) (t * nk + r)];
                 if (e >= 0 && e < ctx->moe.n_expert) {
                     const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
                                            ctx->moe_execution->find_victim(ctx, il, e) >= 0;
-                    if (!is_cached && std::find(cold_ssd.begin(), cold_ssd.end(), e) == cold_ssd.end()) {
-                        cold_ssd.push_back(e);
-                    }
-                }
-            }
-        }
-        if (cold_ssd.size() > 1) {
-            const int32_t allowed_cold = cold_ssd[0];
-            auto pick_resident = [&](int64_t token_idx) -> int32_t {
-                for (size_t s = 0; s < 5; ++s) {
-                    const auto & h = ctx->moe_execution->hot[(size_t) il * 5 + s];
-                    if (h.owner && h.expert >= 0) {
-                        bool used = false;
-                        for (int64_t cr = 0; cr < nk; ++cr) {
-                            if (ids[(size_t) (token_idx * nk + cr)] == h.expert) { used = true; break; }
-                        }
-                        if (!used) return h.expert;
-                    }
-                }
-                for (size_t s = 0; s < 15; ++s) {
-                    const auto & v = ctx->moe_execution->victim[(size_t) il * 15 + s];
-                    if (v.owner && v.expert >= 0) {
-                        bool used = false;
-                        for (int64_t cr = 0; cr < nk; ++cr) {
-                            if (ids[(size_t) (token_idx * nk + cr)] == v.expert) { used = true; break; }
-                        }
-                        if (!used) return v.expert;
-                    }
-                }
-                return -1;
-            };
-            for (int64_t t = 0; t < nt; ++t) {
-                for (int64_t r = 1; r < nk; ++r) {
-                    const int32_t e = ids[(size_t) (t * nk + r)];
-                    if (e >= 0 && e < ctx->moe.n_expert && e != allowed_cold) {
-                        const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
-                                               ctx->moe_execution->find_victim(ctx, il, e) >= 0;
-                        if (!is_cached) {
-                            int32_t repl = pick_resident(t);
-                            if (repl >= 0) {
-                                ids[(size_t) (t * nk + r)] = repl;
-                            }
+                    if (!is_cached) {
+                        ctx->moe_ring->enqueue_promotion(il, e);
+                        int32_t repl = pick_resident(t);
+                        if (repl >= 0) {
+                            ids[(size_t) (t * nk + r)] = repl;
                         }
                     }
                 }
@@ -2100,7 +2139,7 @@ void llama_context::moe_init_ring() {
         size_t total_host_bytes = 0;
         for (int il = 0; il < 40; ++il) {
             size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
-            total_host_bytes += 15 * lb;
+            total_host_bytes += 5 * lb;
         }
         total_host_bytes += 5 * (size_t)(17.93 * 1048576);
         const size_t bytes = moe_execution->stage_bytes + total_hot_bytes;
@@ -2132,23 +2171,70 @@ void llama_context::moe_init_ring() {
             throw std::runtime_error("MoE host victim cache registration failed");
         }
         moe_execution->host = static_cast<char *>(host);
-        moe_execution->victim.resize(605);
+        moe_execution->victim.resize(205);
         size_t host_off = 0;
         for (int il = 0; il < 40; ++il) {
             size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
-            for (int s = 0; s < 15; ++s) {
-                size_t idx = (size_t) il * 15 + (size_t) s;
+            for (int s = 0; s < 5; ++s) {
+                size_t idx = (size_t) il * 5 + (size_t) s;
                 moe_execution->victim[idx].offset = host_off;
                 moe_execution->victim[idx].bytes  = lb;
                 host_off += lb;
             }
         }
         for (int s = 0; s < 5; ++s) {
-            size_t idx = 600 + (size_t) s;
+            size_t idx = 200 + (size_t) s;
             moe_execution->victim[idx].offset = host_off;
             moe_execution->victim[idx].bytes  = (size_t)(17.93 * 1048576);
             host_off += (size_t)(17.93 * 1048576);
         }
+        // Startup cache seeding: seed top-21 resident experts per layer using model router bias
+        std::vector<float> bias_data((size_t) experts, 0.0f);
+        for (int il = 0; il < layers && il < 40; ++il) {
+            std::vector<std::pair<float, int>> ranked_experts;
+            ranked_experts.reserve((size_t) experts);
+            ggml_tensor * b_tensor = il < (int) model.layers.size() ? model.layers[il].ffn_exp_probs_b : nullptr;
+            if (b_tensor && b_tensor->data) {
+                if (ggml_backend_buffer_is_host(b_tensor->buffer)) {
+                    const float * bf = static_cast<const float *>(b_tensor->data);
+                    for (int e = 0; e < experts; ++e) ranked_experts.push_back({bf[e], e});
+                } else {
+                    cudaMemcpy(bias_data.data(), b_tensor->data, (size_t) experts * sizeof(float), cudaMemcpyDeviceToHost);
+                    for (int e = 0; e < experts; ++e) ranked_experts.push_back({bias_data[(size_t) e], e});
+                }
+                std::sort(ranked_experts.rbegin(), ranked_experts.rend());
+            } else {
+                for (int e = 0; e < experts; ++e) ranked_experts.push_back({0.0f, e});
+            }
+            for (int s = 0; s < 5; ++s) {
+                const int e = ranked_experts[(size_t) s].second;
+                const size_t idx = (size_t) il * 5 + s;
+                moe_execution->hot[idx].owner = this;
+                moe_execution->hot[idx].layer = il;
+                moe_execution->hot[idx].expert = e;
+                moe_execution->hot[idx].stamp = 1;
+                char * dst = moe_execution->hot_data(idx);
+                pager.fetch(il, e, dst, weights[il][0]->nb[2], dst + weights[il][0]->nb[2], weights[il][1]->nb[2], dst + weights[il][0]->nb[2] + weights[il][1]->nb[2], weights[il][2]->nb[2]);
+            }
+            for (int s = 0; s < 2; ++s) {
+                const int e = ranked_experts[(size_t) (5 + s)].second;
+                const size_t idx = (size_t) il * 5 + s;
+                moe_execution->victim[idx].owner = this;
+                moe_execution->victim[idx].layer = il;
+                moe_execution->victim[idx].expert = e;
+                moe_execution->victim[idx].stamp = 1;
+                char * dst = moe_execution->victim_data(idx);
+                const auto * sl = pager.slices(il, e);
+                size_t off = 0;
+                for (int r = 0; r < 3; ++r) {
+                    const int fd = sl[r].fd_buf >= 0 ? sl[r].fd_buf : sl[r].fd;
+                    pread(fd, dst + off, weights[il][r]->nb[2], (off_t) (sl[r].off + sl[r].pre));
+                    posix_fadvise(fd, (off_t) sl[r].off, sl[r].len, POSIX_FADV_DONTNEED);
+                    off += weights[il][r]->nb[2];
+                }
+            }
+        }
+        cudaStreamSynchronize((cudaStream_t) moe_pager::worker_stream());
         g_moe_execution_pool = moe_execution;
         LLAMA_LOG_INFO("[moe_ring] stage=2x%d slots %.2f MiB hot=%zu slots %.2f MiB host=%zu slots %.2f MiB (total %zu cached experts, +51%% capacity)\n",
                 MOE_RING_SLOTS, moe_execution->stage_bytes / 1048576.0, moe_execution->hot.size(), total_hot_bytes / 1048576.0,
@@ -3900,10 +3986,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             const double ram_pct  = tot ? (100.0 * moe.n_ram_hit  / tot) : 0.0;
             const double cold_pct = tot ? (100.0 * moe.n_miss     / tot) : 0.0;
             const double hit_pct  = tot ? (100.0 * moe.n_hit      / tot) : 0.0;
-            LLAMA_LOG_INFO("[moe_oracle] recall_k0=%.1f%% recall_k1=%.1f%% recall_k2=%.1f%% recall_k3=%.1f%% | VRAM=%.1f%% RAM=%.1f%% ColdSSD=%.1f%% (HitRate=%.1f%%) | vram_hot=%zu ram_victim=%zu\n",
+            LLAMA_LOG_INFO("[moe_oracle] recall_k0=%.1f%% recall_k1=%.1f%% recall_k2=%.1f%% recall_k3=%.1f%% | VRAM=%.1f%% RAM=%.1f%% ColdSSD=%.1f%% (HitRate=%.1f%%) | vram_hot=%zu ram_victim=%zu promo_bg=%llu\n",
                 o.recall(0), o.recall(1), o.recall(2), o.recall(3),
                 vram_pct, ram_pct, cold_pct, hit_pct,
-                moe_execution->hot_count(), moe_execution->victim_count());
+                moe_execution->hot_count(), moe_execution->victim_count(),
+                (unsigned long long) moe_ring->promotions_completed.load());
     }
         }
     ret = GGML_STATUS_SUCCESS;
