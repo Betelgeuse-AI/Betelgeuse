@@ -2365,7 +2365,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             doorbell = (!e || atoi(e) != 0) ? 1 : 0;
         }
         if (doorbell == 1 && n_tokens >= 1) {
-            const int32_t sentinel = (int32_t) (moe_up[il]->ne[2] - (moe_shared ? 0 : 1));
+            const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
             ggml_tensor * sel_c = ggml_cont(ctx0, selected_experts);
             slot_ids = ggml_moe_slot_resolve(ctx0, sel_c,
                 (ggml_tensor *) moe_table[il], sel_c, nullptr, (int32_t) il, sentinel);
