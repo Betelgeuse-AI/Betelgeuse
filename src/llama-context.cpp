@@ -352,17 +352,9 @@ struct moe_execution_pool {
         for (size_t slot = 0; slot < slots.size(); ++slot) {
             const entry & key = slots[slot];
             if (!pinned[slot] || find_hot(ctx, il, key.expert) >= 0 || hot.empty()) continue;
-            if (ctx->moe.last_ntok > 6 && ctx->moe.dec_freq[(size_t) il * ctx->moe.n_expert + key.expert] < 2) continue;
             const size_t target = oldest_hot(ctx, il);
             const entry old = hot[target];
             if (old.owner) {
-                const uint32_t candidate = ctx->moe.dec_freq[(size_t) il * ctx->moe.n_expert + key.expert];
-                const uint32_t resident = old.owner->moe.dec_freq[(size_t) old.layer * old.owner->moe.n_expert + old.expert];
-                if (candidate < resident) {
-                    const char * source[3] = {static_cast<char *>(tensors[0]->data) + slot * bytes[0], static_cast<char *>(tensors[1]->data) + slot * bytes[1], static_cast<char *>(tensors[2]->data) + slot * bytes[2]};
-                    retain(key, source, bytes, stream);
-                    continue;
-                }
                 ggml_tensor * old_tensors[3] = {old.owner->moe.pool_gate[old.layer], old.owner->moe.pool_up[old.layer], old.owner->moe.pool_down[old.layer]};
                 const size_t lengths[3] = {old_tensors[0]->nb[2], old_tensors[1]->nb[2], old_tensors[2]->nb[2]};
                 const char * source[3] = {hot_data(target), hot_data(target) + lengths[0], hot_data(target) + lengths[0] + lengths[1]};
@@ -524,10 +516,16 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     ids.resize((size_t) (nk * nt));
     if (cudaMemcpy2D(ids.data(), (size_t) nk * sizeof(int32_t), topk, topk_nb1,
             (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyDeviceToHost) != cudaSuccess) GGML_ABORT("MoE router read failed");
-    if (ctx->moe_execution && ctx->moe.n_layer == 40 && nk == 6) {
+    if (ctx->moe_execution && ctx->moe.is_decode) {
+        const bool is_ds = (ctx->moe.n_layer == 40);
+        const size_t hot_start = is_ds ? (size_t) il * 5 : (200 + (size_t) il * 3);
+        const size_t hot_count = is_ds ? 5 : 3;
+        const size_t vic_start = is_ds ? (size_t) il * 15 : (600 + (size_t) il);
+        const size_t vic_count = is_ds ? 15 : 1;
+
         auto pick_resident = [&](int64_t token_idx) -> int32_t {
-            for (size_t s = 0; s < 5; ++s) {
-                const auto & h = ctx->moe_execution->hot[(size_t) il * 5 + s];
+            for (size_t s = 0; s < hot_count; ++s) {
+                const auto & h = ctx->moe_execution->hot[hot_start + s];
                 if (h.owner && h.expert >= 0) {
                     bool used = false;
                     for (int64_t cr = 0; cr < nk; ++cr) {
@@ -536,8 +534,8 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
                     if (!used) return h.expert;
                 }
             }
-            for (size_t s = 0; s < 15; ++s) {
-                const auto & v = ctx->moe_execution->victim[(size_t) il * 15 + s];
+            for (size_t s = 0; s < vic_count; ++s) {
+                const auto & v = ctx->moe_execution->victim[vic_start + s];
                 if (v.owner && v.expert >= 0) {
                     bool used = false;
                     for (int64_t cr = 0; cr < nk; ++cr) {
@@ -546,20 +544,15 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
                     if (!used) return v.expert;
                 }
             }
+            for (size_t s = 0; s < hot_count; ++s) {
+                const auto & h = ctx->moe_execution->hot[hot_start + s];
+                if (h.owner && h.expert >= 0) return h.expert;
+            }
             return -1;
         };
-        int sweep_promos = 0;
+
         for (int64_t t = 0; t < nt; ++t) {
-            const int32_t e0 = ids[(size_t) (t * nk + 0)];
-            if (e0 >= 0 && e0 < ctx->moe.n_expert) {
-                const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e0) >= 0 ||
-                                       ctx->moe_execution->find_victim(ctx, il, e0) >= 0;
-                if (!is_cached && sweep_promos < 2 && ctx->moe_ring->can_enqueue_promotion()) {
-                    ctx->moe_ring->enqueue_promotion(il, e0);
-                    sweep_promos++;
-                }
-            }
-            for (int64_t r = 1; r < nk; ++r) {
+            for (int64_t r = 0; r < nk; ++r) {
                 const int32_t e = ids[(size_t) (t * nk + r)];
                 if (e >= 0 && e < ctx->moe.n_expert) {
                     const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
@@ -4379,7 +4372,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
         }
-
+        moe.is_decode = (n_outputs == (int32_t) ubatch.n_tokens);
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);

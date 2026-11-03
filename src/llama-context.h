@@ -302,6 +302,7 @@ public:
         std::vector<int32_t> step_sel;
         std::vector<ggml_tensor *> step_topk;
         uint32_t last_ntok = 0;
+        bool     is_decode = false;
         bool     sentinel_slot = false;
         std::vector<float>   adapt_decay;
         std::vector<int32_t> adapt_last;
