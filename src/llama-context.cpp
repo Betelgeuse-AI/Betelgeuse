@@ -516,12 +516,25 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     ids.resize((size_t) (nk * nt));
     if (cudaMemcpy2D(ids.data(), (size_t) nk * sizeof(int32_t), topk, topk_nb1,
             (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyDeviceToHost) != cudaSuccess) GGML_ABORT("MoE router read failed");
-    if (ctx->moe_execution && ctx->moe.is_decode) {
+    if (ctx->moe_execution) {
         const bool is_ds = (ctx->moe.n_layer == 40);
         const size_t hot_start = is_ds ? (size_t) il * 5 : (200 + (size_t) il * 3);
         const size_t hot_count = is_ds ? 5 : 3;
         const size_t vic_start = is_ds ? (size_t) il * 15 : (600 + (size_t) il);
         const size_t vic_count = is_ds ? 15 : 1;
+
+        auto is_overwhelming_outlier = [&](int64_t token_idx) -> bool {
+            for (int64_t cr = 0; cr < std::min<int64_t>(nk, 2); ++cr) {
+                const int32_t ce = ids[(size_t) (token_idx * nk + cr)];
+                if (ce >= 0 && ce < ctx->moe.n_expert) {
+                    if (ctx->moe_execution->find_hot(ctx, il, ce) >= 0 ||
+                        ctx->moe_execution->find_victim(ctx, il, ce) >= 0) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
 
         auto pick_resident = [&](int64_t token_idx) -> int32_t {
             for (size_t s = 0; s < hot_count; ++s) {
@@ -558,6 +571,9 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
                     const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
                                            ctx->moe_execution->find_victim(ctx, il, e) >= 0;
                     if (!is_cached) {
+                        if (r == 0 && is_overwhelming_outlier(t)) {
+                            continue;
+                        }
                         int32_t repl = pick_resident(t);
                         if (repl >= 0) {
                             ids[(size_t) (t * nk + r)] = repl;
