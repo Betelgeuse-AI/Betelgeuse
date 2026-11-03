@@ -340,6 +340,14 @@ services:
       LLAMA_ARG_PORT: 8080
 ```
 
+### Experimental DeepSeek expert paging
+
+For DeepSeek41 and DSpark/DFlash, `--moe-direct-io` replaces host routed expert weights with a shared CUDA execution ring. Use `-b 64 -ub 16 -c 512 -np 1 -fit off`; MoE execution tiles at six tokens without splitting non-causal draft attention blocks.
+Target and draft share two 36-expert buffers, an LFU GPU hot cache and an 8192 MiB host victim-cache budget (`MOE_CACHE_MIB`). Native MXFP4 draft experts require about 1291 MiB for the execution buffers. GPU cache sizing reserves room for draft weights and scratch; host cache and staging must fit alongside other processes, especially on 16 GiB systems.
+Next-layer lookahead stages previously selected cached experts. Untrained predictions do not issue speculative SSD reads; exact cold demand unions use batched multi-shard GGUF I/O. Model loading does not prefetch or lock routed expert pages. Incomplete reads or unsupported GPU expert operations fail instead of running MoE on CPU.
+`MOE_PLE_STAGING=1` stages only active Engram rows from the companion file: 48 rows of 144 bytes per token across layers 1 and 14. The staged graph never gathers from the full CPU table.
+`MOE_PROFILE=1` reports synchronized per-ubatch GPU/CPU MoE counts and wall-time components, with separate Engram read/dequantization/upload timings. Disable profiling for throughput measurements. GPU execution alone does not establish 32 TG tok/s or 1000 PP tok/s; cold I/O and draft acceptance remain workload-dependent limits.
+
 ### Multimodal support
 
 Multimodal support was added in [#12898](https://github.com/ggml-org/llama.cpp/pull/12898) and is currently an experimental feature.

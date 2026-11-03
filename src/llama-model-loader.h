@@ -78,6 +78,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool moe_direct_io = false;
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;

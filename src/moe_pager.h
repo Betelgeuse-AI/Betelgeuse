@@ -24,8 +24,9 @@ struct ggml_backend;
 // off is 4 KiB aligned-down; len covers the pre-pad plus the expert bytes,
 // aligned UP to 4 KiB so O_DIRECT reads always transfer in full.
 struct moe_expert_slice {
-    int      fd  = -1; // shard file descriptor (or pack fd)
-    uint64_t off = 0;  // 4 KiB aligned-down file offset (read starts here)
+    int      fd     = -1; // primary direct/buffered fd
+    int      fd_buf = -1; // persistent buffered fd for Btrfs safe eviction
+    uint64_t off    = 0;  // 4 KiB aligned-down file offset (read starts here)
     uint32_t len = 0;  // read length, aligned UP to 4 KiB
     uint32_t pre = 0;  // leading pad bytes before the true expert data
 };
@@ -66,6 +67,7 @@ public:
     int  n_expert() const { return n_expert_; }
     int  n_used()   const { return n_used_; }
     size_t bytes_per_expert() const { return bytes_per_expert_; }
+    size_t expert_role_bytes(int il, int role) const { return role_bytes_[(size_t) il * 3 + (size_t) role]; }
 
     // Fetch expert `e` of layer `il` into pinned staging and DMA it into the
     // supplied device pointers (gate, then up, then down). Blocking.
@@ -73,9 +75,8 @@ public:
     bool fetch(int il, int e, void * dst_gate, size_t gate_bytes,
                                   void * dst_up,     size_t up_bytes,
                                   void * dst_down,   size_t down_bytes);
-    // Batched fetch: submit all n_targets in one io_uring_submit (QD = n_targets).
-    // DMAs each expert as its CQE arrives and synchronizes stream once at the end.
-    bool fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream = nullptr, bool sync_gpu = true);
+    // Batched fetch of up to 36 experts, with one submission and one final DMA wait.
+    bool fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream = nullptr);
 
     bool fetch_direct_io(int il, int e, void * dst_gate, size_t gate_bytes,
                          void * dst_up, size_t up_bytes,

@@ -1611,6 +1611,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+    ml.moe_direct_io = params.moe_direct_io;
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {

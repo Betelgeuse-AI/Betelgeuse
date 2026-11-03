@@ -16,10 +16,27 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cuda_runtime.h>
+#include <cerrno>
 
 static const char * MODEL =
     "/mnt/windows/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS/IQ2_XS/"
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf";
+
+static bool read_reference(int fd, const moe_expert_slice & slice, void * destination, size_t bytes) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    const int buffered = open(path, O_RDONLY);
+    if (buffered < 0) return false;
+    size_t got = 0;
+    while (got < bytes) {
+        const ssize_t result = pread(buffered, static_cast<char *>(destination) + got, bytes - got, (off_t) (slice.off + slice.pre + got));
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) break;
+        got += (size_t) result;
+    }
+    close(buffered);
+    return got == bytes;
+}
 
 int main(int argc, char ** argv) {
     const char * model_path = argc > 1 ? argv[1] : MODEL;
@@ -40,14 +57,12 @@ int main(int argc, char ** argv) {
     int fd = open(model_path, O_RDONLY);
     if (fd < 0) { perror("open model"); return 1; }
 
-    // separate gate/up path: per-role want sizes come from the pager's own
-    // index (len minus pre-pad), which also tracks per-layer mixed quants
+    // Native expert sizes exclude direct-I/O alignment padding.
     const int probes[][2] = { {0,0}, {0,1}, {std::min(7, NL-1), std::min(123, NE-1)}, {std::min(23, NL-1), std::min(511, NE-1)}, {NL-1, NE-1} };
     int bad = 0;
     size_t biggest = 0;
     for (auto & pr : probes) {
-        const moe_expert_slice * sl = pager.slices(pr[0], pr[1]);
-        for (int r = 0; r < 3; r++) biggest = std::max(biggest, (size_t) sl[r].len - sl[r].pre);
+        for (int r = 0; r < 3; r++) biggest = std::max(biggest, pager.expert_role_bytes(pr[0], r));
     }
     char *h_ref = (char *) malloc(biggest);
     char *h_pag = (char *) malloc(biggest);
@@ -58,7 +73,7 @@ int main(int argc, char ** argv) {
         const int il = pr[0], e = pr[1];
         const moe_expert_slice * sl = pager.slices(il, e);
         size_t want[3];
-        for (int r = 0; r < 3; r++) want[r] = (size_t) sl[r].len - sl[r].pre;
+        for (int r = 0; r < 3; r++) want[r] = pager.expert_role_bytes(il, r);
         void *dg = d_dst, *du = d_dst + want[0], *dd = d_dst + want[0] + want[1];
         if (!pager.fetch(il, e, dg, want[0], du, want[1], dd, want[2])) {
             fprintf(stderr, "FAIL: fetch(%d,%d)\n", il, e); bad = 1; continue;
@@ -67,7 +82,7 @@ int main(int argc, char ** argv) {
         const void *dsts[3] = { dg, du, dd };
         const char *roles[3] = { "gate", "up", "down" };
         for (int r = 0; r < 3 && ok; r++) {
-            if (pread(sl[r].fd >= 0 ? sl[r].fd : fd, h_ref, want[r], (off_t)(sl[r].off + sl[r].pre)) != (ssize_t) want[r]) {
+            if (!read_reference(sl[r].fd >= 0 ? sl[r].fd : fd, sl[r], h_ref, want[r])) {
                 fprintf(stderr, "FAIL: reference pread L%d E%d %s\n", il, e, roles[r]); bad = 1; ok = false; break;
             }
             cudaMemcpy(h_pag, dsts[r], want[r], cudaMemcpyDeviceToHost);
@@ -92,10 +107,8 @@ int main(int argc, char ** argv) {
         for (auto & pr : aprobes) {
             const int il = pr[0], e = pr[1];
             const moe_expert_slice * sl = pager.slices(il, e);
-            // per-role want sizes from the slice lengths minus pre-pad
-            // (pool geometry matches the file's per-expert bytes here)
             size_t want[3];
-            for (int r = 0; r < 3; r++) want[r] = (size_t) sl[r].len - sl[r].pre;
+            for (int r = 0; r < 3; r++) want[r] = pager.expert_role_bytes(il, r);
             // destination sized generously; commit only writes want[] bytes
             static char *d_dst = nullptr;
             static size_t d_cap = 0;
@@ -113,7 +126,7 @@ int main(int argc, char ** argv) {
             const void *dsts[3] = { dg, du, dd };
             for (int r = 0; r < 3 && ok; r++) {
                 std::vector<char> ref(want[r]), got(want[r]);
-                if (pread(sl[r].fd >= 0 ? sl[r].fd : fd, ref.data(), want[r], (off_t)(sl[r].off + sl[r].pre)) != (ssize_t) want[r]) {
+                if (!read_reference(sl[r].fd >= 0 ? sl[r].fd : fd, sl[r], ref.data(), want[r])) {
                     fprintf(stderr, "FAIL: reference pread async L%d E%d r%d\n", il, e, r); bad = 1; ok = false; break;
                 }
                 cudaMemcpy(got.data(), dsts[r], want[r], cudaMemcpyDeviceToHost);
@@ -123,6 +136,44 @@ int main(int argc, char ** argv) {
                    il, e, need, ok ? "EXACT MATCH" : "*** MISMATCH ***", pager.stats_pf_hit());
             if (!ok) bad = 1;
         }
+    }
+    // Mix host-cache hits and pending prefetches, then reuse the staging arena.
+    if (!pager.init_cache(pager.bytes_per_expert() * 4)) bad = 1;
+    const int batch_layers[] = {0, NL / 2, NL - 1};
+    for (int il : batch_layers) {
+        const int count = std::min(36, NE);
+        size_t want[3];
+        for (int role = 0; role < 3; ++role) want[role] = pager.expert_role_bytes(il, role);
+        const size_t stride = want[0] + want[1] + want[2];
+        char * device = nullptr;
+        if (cudaMalloc(&device, stride * (size_t) count) != cudaSuccess) { bad = 1; break; }
+        if (!pager.commit(il, 0, device, want[0], device + want[0], want[1], device + want[0] + want[1], want[2])) bad = 1;
+        if (count > 1 && !pager.prefetch(il, count - 1)) bad = 1;
+        std::vector<moe_batch_target> targets((size_t) count);
+        for (int e = 0; e < count; ++e) {
+            char * destination = device + (size_t) e * stride;
+            targets[(size_t) e] = {e, destination, want[0], destination + want[0], want[1], destination + want[0] + want[1], want[2]};
+        }
+        for (int pass = 0; pass < (NE > count ? 2 : 1); ++pass) {
+            if (pass == 1) {
+                for (int e = 0; e < count; ++e) targets[(size_t) e].expert = (e + count) % NE;
+            }
+            if (!pager.fetch_batch(il, targets.data(), count)) { bad = 1; break; }
+            bool exact = true;
+            for (int e = 0; e < count; ++e) {
+                const moe_expert_slice * slices = pager.slices(il, targets[(size_t) e].expert);
+                size_t offset = 0;
+                for (int role = 0; role < 3; ++role) {
+                    std::vector<char> reference(want[role]), actual(want[role]);
+                    if (!read_reference(slices[role].fd, slices[role], reference.data(), want[role]) ||
+                            cudaMemcpy(actual.data(), device + (size_t) e * stride + offset, want[role], cudaMemcpyDeviceToHost) != cudaSuccess || reference != actual) exact = false;
+                    offset += want[role];
+                }
+            }
+            printf("  batch(L%2d,N%2d,pass%d): %s\n", il, count, pass, exact ? "EXACT MATCH" : "MISMATCH");
+            if (!exact) bad = 1;
+        }
+        cudaFree(device);
     }
     close(fd);
     free(h_ref); free(h_pag);

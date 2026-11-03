@@ -1439,6 +1439,12 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+static bool is_moe_expert_tensor(const std::string & name) {
+    return name.find("_exps.")   != std::string::npos ||
+           name.find("_chexps.") != std::string::npos ||
+           name.find("_exps")    != std::string::npos;
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
@@ -1460,8 +1466,17 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
+            llama_mmap::ranges file_no_prefetch = lazy.for_file(idx);
+            if (moe_direct_io) {
+                for (const auto & it : weights_map) {
+                    if (it.second.idx == idx && is_moe_expert_tensor(it.first)) {
+                        file_no_prefetch.emplace_back(it.second.offs, it.second.offs + ggml_nbytes(it.second.tensor));
+                    }
+                }
+            }
+
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    file_no_prefetch);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1745,7 +1760,9 @@ bool llama_model_loader::load_all_data(
                 }
             }
 
-            if (check_tensors) {
+            const bool is_expert = moe_direct_io && is_moe_expert_tensor(cur->name);
+
+            if (check_tensors && !is_expert) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
@@ -1755,8 +1772,8 @@ bool llama_model_loader::load_all_data(
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
-                // locking a lazy tensor would fault all of it in, which is what lazy avoids
-                if (lmlocks && !lazy.has(cur)) {
+                // locking a lazy or paged MoE expert tensor would fault all of it in, which is what we avoid
+                if (lmlocks && !lazy.has(cur) && !is_expert) {
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
                 }
@@ -1764,19 +1781,22 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-            } else {
+            } else if (!is_expert) {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
-                if (check_tensors) {
-                    validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
-                    }));
+                const bool is_expert = moe_direct_io && is_moe_expert_tensor(cur->name);
+                if (!is_expert) {
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                    if (check_tensors) {
+                        validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                            return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                        }));
+                    }
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.

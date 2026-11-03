@@ -1506,11 +1506,15 @@ struct llama_model_deepseek4 : public llama_model_base {
 };
 
 
+struct dsv41_engram_storage;
+
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
     llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+    ~llama_model_deepseek41() override;
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    std::shared_ptr<dsv41_engram_storage> engram_storage;
     // Engram: the hash constants are hparams.ple_* (one module per Engram layer), hashed on the host (ggml has no int64 mul/xor/mod)
     int engram_index(int il) const;
 

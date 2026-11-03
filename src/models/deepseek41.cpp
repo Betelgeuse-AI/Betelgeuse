@@ -5,11 +5,21 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 
+#if defined(__linux__)
+#include <liburing.h>
+#endif
 // ref: deepseek-ai/DeepSeek-V4.1-Flash-1017 inference/model.py, engram.py
 // LLAMA_DSV41_SPARSE=0 disables the sparse attention path (see build_attention41)
 
@@ -18,6 +28,33 @@ static constexpr int64_t DSV41_ENGRAM_DEAD = -1;
 static bool dsv41_env_on(const char * name) {
     const char * v = getenv(name);
     return !v || atoi(v) != 0;
+}
+struct dsv41_engram_storage {
+    int fd = -1;
+    uint64_t file_offset = 0;
+    size_t row_bytes = 0;
+    ggml_type type = GGML_TYPE_IQ4_NL;
+    int64_t n_rows = 0;
+    std::string path;
+
+    ~dsv41_engram_storage() {
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+};
+llama_model_deepseek41::~llama_model_deepseek41() = default;
+static bool moe_ple_staging_enabled(bool moe_direct_io) {
+    const char * env = getenv("MOE_PLE_STAGING");
+    if (env) {
+        return atoi(env) != 0;
+    }
+    const char * dir_env = getenv("MOE_DIRECT_IO");
+    if (dir_env && atoi(dir_env) != 0) {
+        return true;
+    }
+    return moe_direct_io;
 }
 
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
@@ -159,6 +196,33 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                                                 name.c_str(), w->tensor->ne[1], n_rows));
             }
             n_rows = w->tensor->ne[1];
+
+            auto storage = std::make_shared<dsv41_engram_storage>();
+            storage->file_offset = w->offs;
+            storage->row_bytes   = ggml_row_size(w->tensor->type, hparams.ple_head_dim);
+            storage->type        = w->tensor->type;
+            storage->n_rows      = n_rows;
+
+            if (w->idx < ml.files.size()) {
+                const int orig_fd = ml.files[w->idx]->file_id();
+                if (orig_fd >= 0) {
+                    storage->fd = dup(orig_fd);
+                    if (storage->fd >= 0) {
+#if defined(__linux__)
+                        posix_fadvise(storage->fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+                        char proc_path[64];
+                        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", orig_fd);
+                        char resolved[PATH_MAX];
+                        ssize_t len = readlink(proc_path, resolved, sizeof(resolved) - 1);
+                        if (len > 0) {
+                            resolved[len] = '\0';
+                            storage->path = resolved;
+                        }
+                    }
+                }
+            }
+            this->engram_storage = storage;
         }
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {(int64_t) hparams.ple_head_dim, n_rows}, TENSOR_READ_LAZY);
     }
@@ -280,19 +344,47 @@ void llama_model_deepseek41::engram_hash(int e, const llama_ubatch & ubatch, con
 // cand_pin: +1e30 on the block with the newest compressed row of each query, so a partly filled block is always kept; the reference uses +inf, but a finite pin keeps fully masked blocks at -inf instead of NaN
 class llm_graph_input_dsv41 : public llm_graph_input_i {
 public:
-    llm_graph_input_dsv41(const llama_model_deepseek41 & model, const llama_kv_cache_dsv4_context * mctx) :
-        model(model), mctx(mctx) {}
+    llm_graph_input_dsv41(
+            const llama_model_deepseek41 & model,
+            const llama_kv_cache_dsv4_context * mctx,
+            std::shared_ptr<dsv41_engram_storage> storage) :
+        model(model), mctx(mctx), storage(storage) {
+#if defined(__linux__)
+        if (io_uring_queue_init(512, &ring, 0) == 0) {
+            ring_ok = true;
+        }
+#endif
+    }
+
+    ~llm_graph_input_dsv41() override {
+#if defined(__linux__)
+        if (ring_ok) {
+            io_uring_queue_exit(&ring);
+            ring_ok = false;
+        }
+#endif
+    }
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
     std::vector<ggml_tensor *> engram_ids;
+    std::vector<ggml_tensor *> engram_staged_rows;
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
 
     const llama_model_deepseek41 & model;
     const llama_kv_cache_dsv4_context * mctx;
+    std::shared_ptr<dsv41_engram_storage> storage;
+
+#if defined(__linux__)
+    struct io_uring ring;
+    bool ring_ok = false;
+#endif
+
+    std::vector<char>  quant_buf;
+    std::vector<float> dequant_buf;
 
 private:
     const llama_kv_cache_dsv4_context::comp_plan & cand_plan(const llama_ubatch & ubatch) const {
@@ -301,11 +393,222 @@ private:
 };
 
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
-    if (!engram_ids.empty()) {
-        // a token shared by several sequences has the same history in each, so its first sequence resolves it
+    if (!engram_staged_rows.empty()) {
+        if (!storage || storage->fd < 0) {
+            throw std::runtime_error("MOE_PLE_STAGING requires active companion direct IO file descriptor, no mmap fallback allowed");
+        }
+        const int64_t t_start_us = ggml_time_us();
         std::vector<llama_token> prev;
         mctx->get_raw()->get_prev_tokens(*ubatch, model.hparams.ple_ngram_size - 1, prev);
-        // hash all Engram layers first so a lazily read table gets one batched readahead before the first gather
+
+        const size_t n_layers = engram_staged_rows.size();
+        std::vector<std::vector<int32_t>> ids(n_layers);
+        for (size_t e = 0; e < n_layers; ++e) {
+            model.engram_hash((int) e, *ubatch, prev, ids[e]);
+        }
+
+        const int64_t head_dim = model.hparams.ple_head_dim;
+        const int64_t n_heads  = model.hparams.ple_n_heads;
+        const size_t  n_tokens = ubatch->n_tokens;
+        const size_t  n_rows_per_layer = n_tokens * n_heads;
+
+        ggml_type tensor_type = storage ? storage->type : (model.per_layer_tok_embd ? model.per_layer_tok_embd->type : GGML_TYPE_IQ4_NL);
+        const size_t row_bytes = storage && storage->row_bytes ? storage->row_bytes : ggml_row_size(tensor_type, head_dim);
+        const struct ggml_type_traits * traits = ggml_get_type_traits(tensor_type);
+
+        quant_buf.resize(n_rows_per_layer * row_bytes);
+        dequant_buf.resize(n_rows_per_layer * head_dim);
+
+        int64_t total_read_us    = 0;
+        int64_t total_dequant_us = 0;
+        int64_t total_upload_us  = 0;
+        size_t  total_rows_read  = 0;
+        size_t  total_bytes_read = 0;
+
+        for (size_t e = 0; e < n_layers; ++e) {
+            const auto & cur_ids = ids[e];
+            GGML_ASSERT(cur_ids.size() == n_rows_per_layer);
+
+            // Validate all row IDs for this layer; throw on out-of-range, no zero/stale fallback
+            for (size_t i = 0; i < n_rows_per_layer; ++i) {
+                const int32_t row_id = cur_ids[i];
+                if (row_id < 0 || (storage->n_rows > 0 && row_id >= storage->n_rows)) {
+                    throw std::runtime_error(format("MOE_PLE_STAGING out-of-range row_id %d (table has %" PRId64 " rows)", row_id, storage->n_rows));
+                }
+            }
+
+            const int64_t t0 = ggml_time_us();
+            bool read_done = false;
+
+#if defined(__linux__)
+            if (ring_ok && storage && storage->fd >= 0) {
+                size_t n_submitted = 0;
+                for (size_t i = 0; i < n_rows_per_layer; ++i) {
+                    const int32_t row_id = cur_ids[i];
+                    const uint64_t file_off = storage->file_offset + (uint64_t) row_id * row_bytes;
+                    struct io_uring_sqe * sqe = io_uring_get_sqe(&ring);
+                    while (!sqe) {
+                        int sub = io_uring_submit(&ring);
+                        if (sub < 0) {
+                            break;
+                        }
+                        sqe = io_uring_get_sqe(&ring);
+                    }
+                    if (!sqe) {
+                        break;
+                    }
+                    io_uring_prep_read(sqe, storage->fd, quant_buf.data() + i * row_bytes, row_bytes, (off_t) file_off);
+                    sqe->user_data = i;
+                    n_submitted++;
+                }
+
+                if (n_submitted == n_rows_per_layer) {
+                    size_t reaped = 0;
+                    bool uring_err = false;
+                    std::string err_msg;
+
+                    while (reaped < n_submitted) {
+                        int ret = io_uring_submit_and_wait(&ring, (int) (n_submitted - reaped));
+                        if (ret < 0 && errno == EINTR) continue;
+
+                        struct io_uring_cqe * cqe = nullptr;
+                        unsigned head = 0;
+                        int count = 0;
+                        io_uring_for_each_cqe(&ring, head, cqe) {
+                            if (cqe->res != (int) row_bytes) {
+                                uring_err = true;
+                                if (err_msg.empty()) {
+                                    err_msg = format("io_uring short/failed read for row %" PRIu64 ": res=%d, expected=%zu",
+                                                     (uint64_t) cqe->user_data, cqe->res, row_bytes);
+                                }
+                            }
+                            count++;
+                        }
+                        io_uring_cq_advance(&ring, count);
+                        reaped += count;
+                        if (count == 0 && ret < 0) {
+                            uring_err = true;
+                            if (err_msg.empty()) {
+                                err_msg = format("io_uring_submit_and_wait error: %s", strerror(errno));
+                            }
+                            break;
+                        }
+                    }
+
+                    // Drain all remaining completions if any were still queued before proceeding or throwing
+                    while (reaped < n_submitted) {
+                        struct io_uring_cqe * cqe = nullptr;
+                        int ret = io_uring_wait_cqe(&ring, &cqe);
+                        if (ret < 0) break;
+                        if (cqe->res != (int) row_bytes) {
+                            uring_err = true;
+                        }
+                        io_uring_cqe_seen(&ring, cqe);
+                        reaped++;
+                    }
+
+                    if (uring_err) {
+                        throw std::runtime_error("MOE_PLE_STAGING io_uring error: " + err_msg);
+                    }
+                    read_done = true;
+                } else if (n_submitted > 0) {
+                    // Partial submission failed: drain what was submitted and throw
+                    size_t reaped = 0;
+                    while (reaped < n_submitted) {
+                        io_uring_submit_and_wait(&ring, (int) (n_submitted - reaped));
+                        struct io_uring_cqe * cqe = nullptr;
+                        unsigned head = 0;
+                        int count = 0;
+                        io_uring_for_each_cqe(&ring, head, cqe) {
+                            count++;
+                        }
+                        io_uring_cq_advance(&ring, count);
+                        reaped += count;
+                        if (count == 0) break;
+                    }
+                    throw std::runtime_error("MOE_PLE_STAGING io_uring SQE allocation exhausted");
+                }
+            }
+#endif
+
+            if (!read_done) {
+                for (size_t i = 0; i < n_rows_per_layer; ++i) {
+                    const int32_t row_id = cur_ids[i];
+                    const uint64_t file_off = storage->file_offset + (uint64_t) row_id * row_bytes;
+                    size_t got = 0;
+                    char * dst = quant_buf.data() + i * row_bytes;
+                    while (got < row_bytes) {
+                        ssize_t n = pread(storage->fd, dst + got, row_bytes - got, (off_t) (file_off + got));
+                        if (n < 0 && errno == EINTR) continue;
+                        if (n <= 0) {
+                            throw std::runtime_error(format("MOE_PLE_STAGING short/failed pread at offset %" PRIu64 " (got %zu/%zu bytes, errno=%s)",
+                                                            file_off + got, got, row_bytes, strerror(errno)));
+                        }
+                        got += (size_t) n;
+                    }
+                    if (got != row_bytes) {
+                        throw std::runtime_error(format("MOE_PLE_STAGING incomplete row read for row %zu: got %zu/%zu bytes", i, got, row_bytes));
+                    }
+                }
+            }
+
+            const int64_t t1 = ggml_time_us();
+            total_read_us += (t1 - t0);
+            total_rows_read += n_rows_per_layer;
+            total_bytes_read += n_rows_per_layer * row_bytes;
+
+            // dequantize
+            if (traits && traits->to_float) {
+                for (size_t i = 0; i < n_rows_per_layer; ++i) {
+                    traits->to_float(
+                        quant_buf.data() + i * row_bytes,
+                        dequant_buf.data() + i * head_dim,
+                        head_dim);
+                }
+            } else if (tensor_type == GGML_TYPE_F32) {
+                memcpy(dequant_buf.data(), quant_buf.data(), n_rows_per_layer * head_dim * sizeof(float));
+            } else if (tensor_type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row(
+                    (const ggml_fp16_t *) quant_buf.data(),
+                    dequant_buf.data(),
+                    n_rows_per_layer * head_dim);
+            }
+
+            // Zero out embedding/image tokens in mixed batches
+            if (ubatch->is_mixed() && ubatch->type) {
+                for (size_t t = 0; t < n_tokens; ++t) {
+                    if (ubatch->type[t]) {
+                        memset(dequant_buf.data() + t * n_heads * head_dim, 0, n_heads * head_dim * sizeof(float));
+                    }
+                }
+            }
+
+            const int64_t t2 = ggml_time_us();
+            total_dequant_us += (t2 - t1);
+
+            // upload to GPU input tensor
+            if (engram_staged_rows[e]->buffer) {
+                ggml_backend_tensor_set(
+                    engram_staged_rows[e],
+                    dequant_buf.data(),
+                    0,
+                    dequant_buf.size() * sizeof(float));
+            }
+            const int64_t t3 = ggml_time_us();
+            total_upload_us += (t3 - t2);
+        }
+
+        const int64_t t_total_us = ggml_time_us() - t_start_us;
+        const char * prof_env = getenv("MOE_PROFILE");
+        if (prof_env && atoi(prof_env) != 0) {
+            LLAMA_LOG_INFO("[moe_engram_staging] nt=%zu layers=%zu rows=%zu quant_bytes=%zu read_ms=%.3f dequant_ms=%.3f upload_ms=%.3f total_ms=%.3f\n",
+                n_tokens, n_layers, total_rows_read, total_bytes_read,
+                total_read_us / 1000.0, total_dequant_us / 1000.0, total_upload_us / 1000.0, t_total_us / 1000.0);
+        }
+    } else if (!engram_ids.empty()) {
+        // Non-paged mode (legacy get_rows path)
+        std::vector<llama_token> prev;
+        mctx->get_raw()->get_prev_tokens(*ubatch, model.hparams.ple_ngram_size - 1, prev);
         std::vector<std::vector<int32_t>> ids(engram_ids.size());
         std::vector<int32_t> all;
         for (size_t e = 0; e < engram_ids.size(); ++e) {
@@ -356,7 +659,12 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
     for (auto * t : engram_ids) {
         res &= t->ne[0] == (int64_t) model.hparams.ple_n_heads*params.ubatch.n_tokens;
     }
-    res &= (engram_keep != nullptr) == (!engram_ids.empty() && params.ubatch.embd != nullptr);
+    for (auto * t : engram_staged_rows) {
+        res &= t->ne[0] == (int64_t) model.hparams.ple_head_dim*model.hparams.ple_n_heads;
+        res &= t->ne[1] == (int64_t) params.ubatch.n_tokens;
+    }
+    const bool has_engram = !engram_ids.empty() || !engram_staged_rows.empty();
+    res &= (engram_keep != nullptr) == (has_engram && params.ubatch.embd != nullptr);
     if (engram_keep) {
         res &= engram_keep->ne[2] == (int64_t) params.ubatch.n_tokens;
     }
@@ -783,24 +1091,36 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_kq_mask);
 
-    auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
+    auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx, model.engram_storage);
+    const bool ple_staging = moe_ple_staging_enabled(cparams.moe_direct_io);
+
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
-    // the gathers go right after the token embeddings, so they share the first graph split (the table stays on the host)
+    // in staged mode, active dequantized rows are uploaded as a tiny CUDA tensor, eliminating the host table and CPU split
     std::vector<ggml_tensor *> engram_rows;
     for (int il = 0; ubatch.token && hparams.ple_n_heads > 0 && il < n_layer; ++il) {
         if (!hparams.is_ple(il)) {
             continue;
         }
-        ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) hparams.ple_n_heads*n_tokens);
-        ggml_set_name(ids, ("engram_ids-" + std::to_string(il)).c_str());
-        ggml_set_input(ids);
-        inp41->engram_ids.push_back(ids);
+        if (ple_staging) {
+            ggml_tensor * rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int64_t) hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
+            ggml_set_name(rows, ("engram_staged_rows-" + std::to_string(il)).c_str());
+            ggml_set_input(rows);
+            cb(rows, "engram_rows", il);
+            ggml_build_forward_expand(gf, rows);
+            engram_rows.push_back(rows);
+            inp41->engram_staged_rows.push_back(rows);
+        } else {
+            ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) hparams.ple_n_heads*n_tokens);
+            ggml_set_name(ids, ("engram_ids-" + std::to_string(il)).c_str());
+            ggml_set_input(ids);
+            inp41->engram_ids.push_back(ids);
 
-        ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
-        rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
-        cb(rows, "engram_rows", il);
-        ggml_build_forward_expand(gf, rows);
-        engram_rows.push_back(rows);
+            ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
+            rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
+            cb(rows, "engram_rows", il);
+            ggml_build_forward_expand(gf, rows);
+            engram_rows.push_back(rows);
+        }
     }
     ggml_tensor * engram_keep = nullptr;
     if (hparams.ple_n_heads > 0 && ubatch.token && ubatch.embd) {

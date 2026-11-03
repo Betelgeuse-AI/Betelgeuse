@@ -140,6 +140,7 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
         struct gguf_context * ctx;
         int64_t data_off;
         int fd;
+        int fd_buf;
         bool owned;
     };
     std::vector<shard_desc> shards;
@@ -150,12 +151,15 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
         n_split = gguf_get_val_u16(gctx, kid_split);
     }
 
-    // Open first shard with O_DIRECT and Btrfs safe fallback
+    // Open first shard with buffered descriptor + POSIX_FADV_DONTNEED for Btrfs safe zero-bloat
+    int fd_buf = open(gguf_path, O_RDONLY);
+    if (fd_buf >= 0) posix_fadvise(fd_buf, 0, 0, POSIX_FADV_RANDOM);
     fd_ = open(gguf_path, O_RDONLY | O_DIRECT);
-    if (fd_ < 0) fd_ = open(gguf_path, O_RDONLY);
-    if (fd_ < 0) { err = "open gguf_path failed"; gguf_free(gctx); return false; }
-    fds_.push_back(fd_);
-    shards.push_back({gguf_path, gctx, (int64_t) gguf_get_data_offset(gctx), fd_, false});
+    if (fd_ < 0) fd_ = fd_buf;
+    if (fd_ < 0 && fd_buf < 0) { err = "open gguf_path failed"; gguf_free(gctx); return false; }
+    if (fd_ >= 0) fds_.push_back(fd_);
+    if (fd_buf >= 0 && fd_buf != fd_) fds_.push_back(fd_buf);
+    shards.push_back({gguf_path, gctx, (int64_t) gguf_get_data_offset(gctx), fd_buf >= 0 ? fd_buf : fd_, fd_buf, false});
 
     if (n_split > 1) {
         char path_buf[1024];
@@ -170,10 +174,13 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
             }
             struct gguf_context * sctx = gguf_init_from_file(spath.c_str(), gp);
             if (!sctx) continue;
+            int sfd_buf = open(spath.c_str(), O_RDONLY);
+            if (sfd_buf >= 0) posix_fadvise(sfd_buf, 0, 0, POSIX_FADV_RANDOM);
             int sfd = open(spath.c_str(), O_RDONLY | O_DIRECT);
-            if (sfd < 0) sfd = open(spath.c_str(), O_RDONLY);
+            if (sfd < 0) sfd = sfd_buf;
             if (sfd >= 0) fds_.push_back(sfd);
-            shards.push_back({spath, sctx, (int64_t) gguf_get_data_offset(sctx), sfd, true});
+            if (sfd_buf >= 0 && sfd_buf != sfd) fds_.push_back(sfd_buf);
+            shards.push_back({spath, sctx, (int64_t) gguf_get_data_offset(sctx), sfd_buf >= 0 ? sfd_buf : sfd, sfd_buf, true});
         }
     }
 
@@ -201,7 +208,8 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
                                                 + (int64_t) e * (int64_t) per);
                         const uint64_t pre = (ALIGN - (fo % ALIGN)) % ALIGN;
                         moe_expert_slice & sl = idx_[((size_t) il * n_expert + e) * 3 + r];
-                        sl.fd  = sh.fd;
+                        sl.fd     = sh.fd;
+                        sl.fd_buf = sh.fd_buf;
                         sl.off = fo - pre;
                         sl.len = (uint32_t)(((per + pre + ALIGN - 1) / ALIGN) * ALIGN);
                         sl.pre = (uint32_t) pre;
@@ -238,6 +246,7 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
     if (cudaHostAlloc(&stage_, stage_bytes_ * NSTAGE, cudaHostAllocDefault) != cudaSuccess) {
         err = "cudaHostAlloc staging failed"; return false;
     }
+    reqs_.reserve(NSTAGE);
     demand_stages_ = NSTAGE / 2;
     for (int i = NSTAGE - 1; i >= (int) demand_stages_; i--) free_stage_.push_back(i);
     for (int i = (int) demand_stages_ - 1; i >= 0; i--) free_demand_.push_back(i);
@@ -491,15 +500,10 @@ bool moe_pager::init_cache(size_t bytes) {
     // the arena must hold a WHOLE expert (gate+up+down), not one role: sizing
     // it by the largest role makes every fill overrun its slot into the next
     size_t per = 0;
-    if (pack_mode_) {
-        for (int il = 0; il < n_layer_; il++) {
-            per = std::max(per, role_bytes_[(size_t) il * 3 + 0]
-                              + role_bytes_[(size_t) il * 3 + 1]
-                              + role_bytes_[(size_t) il * 3 + 2]);
-        }
-    } else {
-        const moe_expert_slice * s = slices(0, 0);
-        per = s[0].len + s[1].len + s[2].len;
+    for (int il = 0; il < n_layer_; il++) {
+        per = std::max(per, role_bytes_[(size_t) il * 3 + 0]
+                          + role_bytes_[(size_t) il * 3 + 1]
+                          + role_bytes_[(size_t) il * 3 + 2]);
     }
     if (per == 0) return false;
     const size_t slots = bytes / per;
@@ -682,7 +686,6 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
     if (cache_ && cache_slots_ > 0) {
         const int cslot = cache_idx_[(size_t) key];
         if (cslot >= 0) {
-            const moe_expert_slice * cs = slices(il, e);
             const char * csrc = cache_ + (size_t) cslot * cache_bytes_;
             // the cache holds the expert COMPACT (gate|up|down, no O_DIRECT
             // pre-pad), so the offsets are the role sizes, not bsrc_[], which
@@ -691,9 +694,7 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
             void * cdst[3] = { dst_gate, dst_up, dst_down };
             size_t cwant[3] = { gate_bytes, up_bytes, down_bytes };
             for (int k = 0; k < 3; k++) {
-                const size_t cav = pack_mode_
-                    ? role_bytes_[(size_t) il * 3 + (size_t) k]
-                    : ((size_t) cs[k].len - cs[k].pre);
+                const size_t cav = role_bytes_[(size_t) il * 3 + (size_t) k];
                 cudaMemcpy(cdst[k], csrc + coff, std::min(cwant[k], cav), cudaMemcpyHostToDevice);
                 coff += cav;
             }
@@ -748,8 +749,6 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
             for (int i = 0; i < cache_slots_; i++) {
                 if (cache_stamp_[(size_t) i] < oldest) { oldest = cache_stamp_[(size_t) i]; cslot = i; }
             }
-            const int old_key = (int) (cache_stamp_.size() ? -1 : -1);
-            (void) old_key;
             for (size_t k = 0; k < cache_idx_.size(); k++) {
                 if (cache_idx_[k] == cslot) { cache_idx_[k] = -1; break; }
             }
@@ -767,10 +766,12 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
             }
         } else {
             const moe_expert_slice * cs = slices(il, e);
+            size_t offset = 0;
             for (int k = 0; k < 3; k++) {
-                const size_t nb = (size_t) cs[k].len - cs[k].pre;
-                memcpy(cdst + at, csrc + cs[k].pre, nb);
+                const size_t nb = role_bytes_[(size_t) il * 3 + (size_t) k];
+                memcpy(cdst + at, csrc + offset + cs[k].pre, nb);
                 at += nb;
+                offset += cs[k].len;
             }
         }
         cache_used_[(size_t) cslot] = 1;
@@ -801,7 +802,7 @@ bool moe_pager::use_warm_pack(const char * path, const char * index_txt, std::st
         if (il < 0 || il >= n_layer_ || e < 0 || e >= n_expert_ || off < 0 || len <= 0) {
             err = "warm pack index out of range"; return false;
         }
-        widx[(size_t) il * n_expert_ + e] = moe_expert_slice{-1, (uint64_t) off, (uint32_t) len, 0};
+        widx[(size_t) il * n_expert_ + e] = moe_expert_slice{-1, -1, (uint64_t) off, (uint32_t) len, 0};
         whas[(size_t) il * n_expert_ + e] = 1;
         rows++;
     }
@@ -880,232 +881,137 @@ bool moe_pager::fetch(int il, int e, void * dst_gate, size_t gate_bytes,
     return commit_locked(il, e, dst_gate, gate_bytes, dst_up, up_bytes, dst_down, down_bytes);
 }
 
-bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream, bool sync_gpu) {
+bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream) {
     if (n_targets <= 0) return true;
-    fprintf(stderr, "[fetch_batch] START il=%d n_targets=%d\n", il, n_targets);
-    for (int i = 0; i < n_targets; ++i) {
-        fprintf(stderr, "[fetch_batch]   target i=%d exp=%d\n", i, targets[i].expert);
-    }
+    if (!targets || il < 0 || il >= n_layer_ || n_targets > 36) return false;
     std::lock_guard<std::mutex> lock(mtx_);
-    fprintf(stderr, "[fetch_batch] free_demand=%zu free_stage=%zu reqs=%zu\n",
-            free_demand_.size(), free_stage_.size(), reqs_.size());
-    cudaStream_t ws = stream ? (cudaStream_t) stream : (cudaStream_t) worker_stream();
-    if (!ws) {
-        n_io_fail_ += n_targets;
-        return false;
-    }
-
-    struct TargetItem {
-        int expert;
-        int req_idx;
-        int n_need;
-        bool cache_hit;
-        bool completed;
+    auto * ring = static_cast<io_uring *>(ring_);
+    if (io_uring_sq_space_left(ring) < (unsigned) n_targets * (pack_mode_ ? 1u : 3u)) return false;
+    cudaStream_t ws = stream ? static_cast<cudaStream_t>(stream) : static_cast<cudaStream_t>(worker_stream());
+    if (!ws) return false;
+    int requests[36];
+    std::fill_n(requests, 36, -1);
+    bool copied[36] = {};
+    bool ok = true;
+    auto copy = [&](int i, const char * source, const size_t offsets[3]) {
+        void * destination[3] = {targets[i].dst_gate, targets[i].dst_up, targets[i].dst_down};
+        const size_t bytes[3] = {targets[i].gate_bytes, targets[i].up_bytes, targets[i].down_bytes};
+        for (int role = 0; role < 3; ++role) {
+            if (bytes[role] != role_bytes_[(size_t) il * 3 + role] || !destination[role] ||
+                    cudaMemcpyAsync(destination[role], source + offsets[role], bytes[role], cudaMemcpyHostToDevice, ws) != cudaSuccess) ok = false;
+        }
     };
-
-    std::vector<TargetItem> items(n_targets);
-    std::vector<int> pending_indices;
-    pending_indices.reserve(n_targets);
-
-    // 1. Check Tier 1 host cache or completed prefetches
+    auto copy_ready = [&](int i) {
+        const int request = requests[(size_t) i];
+        if (request < 0 || copied[(size_t) i]) return;
+        const Req & data = reqs_[(size_t) request];
+        const moe_expert_slice * slices = this->slices(il, targets[i].expert);
+        size_t offsets[3] = {}, position = 0;
+        bool complete = data.done == (pack_mode_ ? 1 : 3);
+        for (int role = 0; role < 3; ++role) {
+            offsets[role] = pack_mode_ ? bsrc_[(size_t) (il * n_expert_ + targets[i].expert) * 3 + role] : position + slices[role].pre;
+            const size_t needed = (pack_mode_ ? offsets[role] : slices[role].pre) + role_bytes_[(size_t) il * 3 + role];
+            const long got = data.got[pack_mode_ ? 0 : role];
+            if (got < 0 || (size_t) got < needed) complete = false;
+            if (!pack_mode_) position += slices[role].len;
+        }
+        if (complete) copy(i, stage_ + (size_t) data.stage * stage_bytes_, offsets);
+        else ok = false;
+        copied[(size_t) i] = true;
+    };
     for (int i = 0; i < n_targets; ++i) {
-        const int e = targets[i].expert;
-        const int key = il * n_expert_ + e;
-        items[i].expert = e;
-        items[i].req_idx = -1;
-        items[i].n_need = pack_mode_ ? 1 : 3;
-        items[i].cache_hit = false;
-        items[i].completed = false;
-
-        if (cache_ && cache_slots_ > 0) {
-            const int cslot = cache_idx_[(size_t) key];
-            if (cslot >= 0) {
-                const moe_expert_slice * cs = slices(il, e);
-                const char * csrc = cache_ + (size_t) cslot * cache_bytes_;
-                size_t coff = 0;
-                void * cdst[3] = { targets[i].dst_gate, targets[i].dst_up, targets[i].dst_down };
-                size_t cwant[3] = { targets[i].gate_bytes, targets[i].up_bytes, targets[i].down_bytes };
-                for (int k = 0; k < 3; k++) {
-                    const size_t cav = pack_mode_
-                        ? role_bytes_[(size_t) il * 3 + (size_t) k]
-                        : ((size_t) cs[k].len - cs[k].pre);
-                    cudaMemcpyAsync(cdst[k], csrc + coff, std::min(cwant[k], cav),
-                                    cudaMemcpyHostToDevice, ws);
-                    coff += cav;
-                }
-                cache_stamp_[(size_t) cslot] = ++cache_tick_;
-                n_cache_hit_++;
-                items[i].cache_hit = true;
-                items[i].completed = true;
-                continue;
-            }
-            n_cache_miss_++;
-        }
-
-        int r = find_(key);
-        if (r >= 0) {
-            const int need = pack_mode_ ? 1 : 3;
-            if (reqs_[r].done >= need) {
-                items[i].completed = true;
-                const moe_expert_slice * s = slices(il, targets[i].expert);
-                bool ok = true;
-                for (int k = 0; k < need; k++) {
-                    if (reqs_[r].got[k] != (long) s[k].len) { ok = false; break; }
-                }
-                if (ok) {
-                    const uint32_t * bsrc = pack_mode_ ? &bsrc_[(size_t) (il * n_expert_ + targets[i].expert) * 3] : nullptr;
-                    char * src = stage_ + (size_t) reqs_[r].stage * stage_bytes_;
-                    size_t off = 0;
-                    void * dst[3] = { targets[i].dst_gate, targets[i].dst_up, targets[i].dst_down };
-                    size_t want[3] = { targets[i].gate_bytes, targets[i].up_bytes, targets[i].down_bytes };
-                    for (int k = 0; k < 3; k++) {
-                        const size_t skip = pack_mode_ ? bsrc[k] : s[k].pre;
-                        const size_t avail = pack_mode_ ? role_bytes_[(size_t) il * 3 + (size_t) k] : ((size_t) s[k].len - skip);
-                        cudaMemcpyAsync(dst[k], src + (pack_mode_ ? 0 : off) + skip,
-                                       std::min(want[k], avail), cudaMemcpyHostToDevice, ws);
-                        if (!pack_mode_) off += s[k].len;
-                    }
-                } else {
-                    n_io_fail_++;
-                }
-                (reqs_[r].demand ? free_demand_ : free_stage_).push_back(reqs_[r].stage);
-                reqs_[r].used = false;
-                continue;
-            }
-            items[i].req_idx = r;
-            pending_indices.push_back(i);
-        }
-    }
-
-    // 2. Prepare SQEs for all targets needing read (QD = N)
-    // DO NOT submit inside the loop!
-    for (int i = 0; i < n_targets; ++i) {
-        if (items[i].cache_hit || items[i].req_idx >= 0) continue;
-
-        std::vector<int> & pool = free_demand_.empty() ? free_stage_ : free_demand_;
-        if (pool.empty()) {
-            const int need_ok = pack_mode_ ? 1 : 3;
-            for (size_t q = 0; q < reqs_.size(); q++) {
-                if (reqs_[q].used && reqs_[q].done >= need_ok) {
-                    pool.push_back(reqs_[q].stage);
-                    reqs_[q].used = false;
-                    break;
-                }
-            }
-        }
-        if (pool.empty()) {
-            fprintf(stderr, "fetch_batch: no staging slots free for expert %d\n", targets[i].expert);
-            n_io_fail_++;
+        const int expert = targets[i].expert;
+        if (expert < 0 || expert >= n_expert_) { ok = false; continue; }
+        const int key = il * n_expert_ + expert;
+        const int cached = cache_ ? cache_idx_[(size_t) key] : -1;
+        if (cached >= 0) {
+            const size_t offsets[3] = {0, role_bytes_[(size_t) il * 3], role_bytes_[(size_t) il * 3] + role_bytes_[(size_t) il * 3 + 1]};
+            copy(i, cache_ + (size_t) cached * cache_bytes_, offsets);
+            cache_stamp_[(size_t) cached] = ++cache_tick_;
+            n_cache_hit_++;
             continue;
         }
-
-        const int st = pool.back(); pool.pop_back();
-        const int ridx = (int) reqs_.size();
-        const int e = targets[i].expert;
-        const moe_expert_slice * s = slices(il, e);
-
-        size_t boff = 0;
-        const int nread = pack_mode_ ? 1 : 3;
-        for (int r = 0; r < nread; r++) {
-            struct io_uring_sqe * sqe = io_uring_get_sqe((struct io_uring *) ring_);
-            while (!sqe) {
-                io_uring_submit((struct io_uring *) ring_);
-                sqe = io_uring_get_sqe((struct io_uring *) ring_);
-            }
-            io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : (s[r].fd >= 0 ? s[r].fd : fd_),
-                               stage_ + (size_t) st * stage_bytes_ + boff,
-                               s[r].len, (off_t) s[r].off);
-            sqe->user_data = (uint64_t)((ridx * 4) + r);
-            boff += s[r].len;
+        int request = find_(key);
+        if (request >= 0) {
+            requests[(size_t) i] = request;
+            n_pf_hit_++;
+            continue;
         }
-
-        Req q{};
-        q.il = il; q.e = e; q.stage = st; q.done = 0; q.used = true; q.demand = true;
-        q.got[0] = q.got[1] = q.got[2] = -1;
-        reqs_.push_back(q);
-        fprintf(stderr, "[fetch_batch] PREP sqe i=%d exp=%d ridx=%d st=%d\n", i, e, ridx, st);
-        items[i].req_idx = ridx;
-        pending_indices.push_back(i);
-        if (pack_mode_) { io_ops_ += 1; io_bytes_ += (long) boff; n_pack_reads_ += 1; }
-        else            { io_ops_ += 3; io_bytes_ += (long) boff; n_gguf_reads_ += 3; }
+        std::vector<int> & pool = free_demand_.empty() ? free_stage_ : free_demand_;
+        if (pool.empty()) { ok = false; continue; }
+        const int stage = pool.back(); pool.pop_back();
+        Req request_data = {};
+        request_data.il = il; request_data.e = expert; request_data.stage = stage;
+        request_data.used = true; request_data.demand = &pool == &free_demand_;
+        request_data.got[0] = request_data.got[1] = request_data.got[2] = -1;
+        request = (int) reqs_.size();
+        for (size_t q = 0; q < reqs_.size(); ++q) {
+            if (!reqs_[q].used) { request = (int) q; break; }
+        }
+        if ((size_t) request == reqs_.size()) reqs_.push_back(request_data);
+        else reqs_[(size_t) request] = request_data;
+        requests[(size_t) i] = request;
+        const moe_expert_slice * slices = this->slices(il, expert);
+        size_t offset = 0;
+        for (int role = 0; role < (pack_mode_ ? 1 : 3); ++role) {
+            io_uring_sqe * sqe = io_uring_get_sqe(ring);
+            if (!sqe) GGML_ABORT("MoE batch SQ capacity changed unexpectedly");
+            io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : slices[role].fd,
+                    stage_ + (size_t) stage * stage_bytes_ + offset, slices[role].len, (off_t) slices[role].off);
+            sqe->user_data = (uint64_t) request * 4 + (uint64_t) role;
+            offset += slices[role].len;
+            io_ops_++; io_bytes_ += slices[role].len;
+        }
     }
-
-    // 3. Submit ALL queued SQEs in ONE io_uring_submit call!
-    int n_sub = io_uring_submit((struct io_uring *) ring_);
-    fprintf(stderr, "[fetch_batch] SUBMITTED %d sqes, pending=%zu\n", n_sub, pending_indices.size());
-    // 4. Reap completions: as each expert's reads complete, immediately enqueue cudaMemcpyAsync
-    size_t pending_done = 0;
-    while (pending_done < pending_indices.size()) {
-        struct io_uring_cqe * cqe = nullptr;
-        if (io_uring_wait_cqe((struct io_uring *) ring_, &cqe) < 0) {
-            fprintf(stderr, "[fetch_batch] io_uring_wait_cqe failed!\n");
-            break;
+    while (io_uring_sq_ready(ring) > 0) {
+        const int submitted = io_uring_submit(ring);
+        if (submitted <= 0) GGML_ABORT("MoE batch submission failed: %d", submitted);
+    }
+    for (;;) {
+        bool pending = false;
+        for (int request : requests) {
+            if (request >= 0 && reqs_[(size_t) request].done < (pack_mode_ ? 1 : 3)) pending = true;
         }
-        const uint64_t ud = cqe->user_data;
-        const int res = cqe->res;
-        io_uring_cqe_seen((struct io_uring *) ring_, cqe);
-
-        const int rr = (int)(ud / 4);
-        const int role = (int)(ud % 4);
-        fprintf(stderr, "[fetch_batch] cqe res=%d ud=%lu rr=%d role=%d\n", res, (unsigned long)ud, rr, role);
-
-        if (rr >= 0 && rr < (int) reqs_.size() && reqs_[rr].used) {
-            reqs_[rr].done++;
-            if (role >= 0 && role < 3) {
-                reqs_[rr].got[role] = res;
-            }
-
-            const int need = pack_mode_ ? 1 : 3;
-            if (reqs_[rr].done >= need) {
-                for (size_t p = 0; p < pending_indices.size(); ++p) {
-                    int it_idx = pending_indices[p];
-                    if (items[it_idx].req_idx == rr && !items[it_idx].completed) {
-                        const int e = reqs_[rr].e;
-                        const moe_expert_slice * s = slices(il, e);
-                        bool ok = true;
-                        for (int k = 0; k < need; k++) {
-                            if (reqs_[rr].got[k] != (long) s[k].len) {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        if (ok) {
-                            items[it_idx].completed = true;
-                            const uint32_t * bsrc = pack_mode_ ? &bsrc_[(size_t) (il * n_expert_ + e) * 3] : nullptr;
-                            char * src = stage_ + (size_t) reqs_[rr].stage * stage_bytes_;
-                            size_t off = 0;
-                            void * dst[3] = { targets[it_idx].dst_gate, targets[it_idx].dst_up, targets[it_idx].dst_down };
-                            size_t want[3] = { targets[it_idx].gate_bytes, targets[it_idx].up_bytes, targets[it_idx].down_bytes };
-                            for (int k = 0; k < 3; k++) {
-                                const size_t skip = pack_mode_ ? bsrc[k] : s[k].pre;
-                                const size_t avail = pack_mode_
-                                    ? role_bytes_[(size_t) il * 3 + (size_t) k]
-                                    : ((size_t) s[k].len - skip);
-                                cudaMemcpyAsync(dst[k], src + (pack_mode_ ? 0 : off) + skip,
-                                               std::min(want[k], avail), cudaMemcpyHostToDevice, ws);
-                                if (!pack_mode_) off += s[k].len;
-                            }
-                        } else {
-                            n_io_fail_++;
-                        }
-                        (reqs_[rr].demand ? free_demand_ : free_stage_).push_back(reqs_[rr].stage);
-                        reqs_[rr].used = false;
-                        pending_done++;
-                        break;
-                    }
-                }
+        if (!pending) break;
+        io_uring_cqe * cqe = nullptr;
+        const int status = io_uring_wait_cqe(ring, &cqe);
+        if (status == -EINTR) continue;
+        if (status < 0) GGML_ABORT("MoE completion wait failed: %d", status);
+        const size_t request = (size_t) (cqe->user_data / 4);
+        const int role = (int) (cqe->user_data % 4);
+        int result = cqe->res;
+        io_uring_cqe_seen(ring, cqe);
+        if (request >= reqs_.size() || role >= 3 || !reqs_[request].used) GGML_ABORT("invalid MoE completion tag");
+        Req & data = reqs_[request];
+        const moe_expert_slice * slices = this->slices(data.il, data.e);
+        if (result == -EINVAL && slices[role].fd_buf >= 0) {
+            size_t offset = 0;
+            if (!pack_mode_) for (int r = 0; r < role; ++r) offset += slices[r].len;
+            char * destination = stage_ + (size_t) data.stage * stage_bytes_ + offset;
+            result = (int) pread(slices[role].fd_buf, destination, slices[role].len, (off_t) slices[role].off);
+            posix_fadvise(slices[role].fd_buf, (off_t) slices[role].off, slices[role].len, POSIX_FADV_DONTNEED);
+        }
+        if (result > 0) {
+            const int fadv_fd = slices[role].fd_buf >= 0 ? slices[role].fd_buf : (pack_mode_ ? fd_pack_ : slices[role].fd);
+            posix_fadvise(fadv_fd, (off_t) slices[role].off, slices[role].len, POSIX_FADV_DONTNEED);
+        }
+        data.got[role] = result;
+        data.done++;
+        if (data.done == (pack_mode_ ? 1 : 3)) {
+            for (int i = 0; i < n_targets; ++i) {
+                if (requests[(size_t) i] == (int) request) copy_ready(i);
             }
         }
     }
-
-    // 5. Synchronize the stream if requested
-    if (sync_gpu) {
-        cudaError_t se = cudaStreamSynchronize(ws);
-        if (se != cudaSuccess) {
-            fprintf(stderr, "fetch_batch cudaStreamSynchronize failed: %d\n", (int) se);
-            return false;
-        }
+    for (int i = 0; i < n_targets; ++i) copy_ready(i);
+    // Staging stays owned until all DMAs using its bytes have completed.
+    if (cudaStreamSynchronize(ws) != cudaSuccess) ok = false;
+    for (int request : requests) {
+        if (request < 0 || !reqs_[(size_t) request].used) continue;
+        Req & data = reqs_[(size_t) request];
+        (data.demand ? free_demand_ : free_stage_).push_back(data.stage);
+        data.used = false;
     }
-    fprintf(stderr, "[fetch_batch] FINISHED il=%d pending_done=%zu\n", il, pending_done);
-    return true;
+    if (!ok) n_io_fail_++;
+    return ok;
 }

@@ -28,6 +28,8 @@ struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
 
+struct moe_execution_pool;
+struct moe_ring_state;
 class llama_io_read_i;
 class llama_io_write_i;
 
@@ -309,6 +311,14 @@ public:
     };
     moe_pool moe;
     moe_pager pager;
+    std::shared_ptr<moe_execution_pool> moe_execution;
+    std::unique_ptr<moe_ring_state> moe_ring;
+    void moe_init_ring();
+    struct moe_step_profile {
+        int64_t node_start_us = 0;
+        int64_t moe_us = 0, io_us = 0, gpu_us = 0, engram_us = 0;
+        int gpu_layers = 0, cpu_layers = 0;
+    } moe_profile;
     std::vector<std::thread> or_thr;
     std::atomic<bool> or_run{false};
     std::mutex or_mtx;

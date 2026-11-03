@@ -839,6 +839,7 @@ struct llm_graph_params {
     const ggml_tensor * const * moe_down    = nullptr;
     const ggml_tensor * const * moe_table   = nullptr;
     int32_t moe_n_layer = 0;
+    bool moe_shared = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1089,6 +1090,7 @@ struct llm_graph_context {
     const ggml_tensor * const * moe_down    = nullptr;
     const ggml_tensor * const * moe_table   = nullptr;
     int32_t moe_n_layer = 0;
+    bool moe_shared = false;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1131,7 +1133,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+              ggml_tensor * expert_ids = nullptr) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range

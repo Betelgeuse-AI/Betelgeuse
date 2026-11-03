@@ -2658,6 +2658,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
         }
+        result.moe_direct_io         = params.moe_direct_io;
+        result.moe_slots             = params.moe_slots;
+        result.moe_pack_dir          = params.moe_pack_dir;
+        result.moe_chunk_max         = params.moe_chunk_max;
+        result.moe_profile           = params.moe_profile;
     }
 
     result.cache_type_k  = params_spec.cache_type_k;
@@ -2728,8 +2733,18 @@ common_speculative_init_result::common_speculative_init_result(
 
     std::string model_path;
     if (has_draft) {
-        model_path = params.speculative.draft.mparams.path;
+        model_path = params.speculative.draft.mparams.path.empty() ? params.model.path : params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        mparams.moe_direct_io    = params.moe_direct_io;
+        mparams.moe_slots        = params.moe_slots;
+
+        cparams.moe_direct_io    = params.moe_direct_io;
+        cparams.moe_slots        = params.moe_slots;
+        cparams.moe_gguf_path    = model_path.c_str();
+        cparams.moe_pack_dir     = params.moe_pack_dir.empty() ? nullptr : params.moe_pack_dir.c_str();
+        cparams.moe_chunk_max    = params.moe_chunk_max;
+        cparams.moe_profile_path = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
 
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
