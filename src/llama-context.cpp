@@ -349,37 +349,6 @@ struct moe_execution_pool {
             throw std::runtime_error("MoE expert batch read failed; CPU fallback is disabled");
         }
         if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("MoE transfer failed");
-        for (size_t slot = 0; slot < slots.size(); ++slot) {
-            const entry & key = slots[slot];
-            if (!pinned[slot] || find_hot(ctx, il, key.expert) >= 0 || hot.empty()) continue;
-            const size_t target = oldest_hot(ctx, il);
-            const entry old = hot[target];
-            if (old.owner) {
-                ggml_tensor * old_tensors[3] = {old.owner->moe.pool_gate[old.layer], old.owner->moe.pool_up[old.layer], old.owner->moe.pool_down[old.layer]};
-                const size_t lengths[3] = {old_tensors[0]->nb[2], old_tensors[1]->nb[2], old_tensors[2]->nb[2]};
-                const char * source[3] = {hot_data(target), hot_data(target) + lengths[0], hot_data(target) + lengths[0] + lengths[1]};
-                retain(old, source, lengths, stream);
-            }
-            size_t offset = 0;
-            for (int role = 0; role < 3; ++role) {
-                const char * source = static_cast<char *>(tensors[role]->data) + slot * bytes[role];
-                const cudaError_t error = cudaMemcpyAsync(hot_data(target) + offset, source, bytes[role], cudaMemcpyDeviceToDevice, stream);
-                if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-                offset += bytes[role];
-            }
-            hot[target].owner  = ctx;
-            hot[target].layer  = il;
-            hot[target].expert = key.expert;
-            hot[target].stamp  = ++tick;
-            const int duplicate = find_victim(ctx, il, key.expert);
-            if (duplicate >= 0) {
-                victim[(size_t) duplicate].owner  = nullptr;
-                victim[(size_t) duplicate].layer  = -1;
-                victim[(size_t) duplicate].expert = -1;
-                victim[(size_t) duplicate].stamp  = 0;
-            }
-        }
-        if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("MoE cache transfer failed");
     }
 };
 
@@ -571,7 +540,7 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
                     const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
                                            ctx->moe_execution->find_victim(ctx, il, e) >= 0;
                     if (!is_cached) {
-                        if (r == 0 && is_overwhelming_outlier(t)) {
+                        if (r == 0 && (!ctx->moe.is_decode || is_overwhelming_outlier(t))) {
                             continue;
                         }
                         int32_t repl = pick_resident(t);
@@ -2204,6 +2173,36 @@ void llama_context::moe_init_ring() {
             moe_execution->victim[idx].bytes  = (size_t)(17.93 * 1048576);
             host_off += (size_t)(17.93 * 1048576);
         }
+        // Permanently pin top-5 hottest experts per layer in VRAM hot pool
+        std::vector<float> bias_data((size_t) experts, 0.0f);
+        for (int il = 0; il < layers && il < 40; ++il) {
+            std::vector<std::pair<float, int>> ranked_experts;
+            ranked_experts.reserve((size_t) experts);
+            ggml_tensor * b_tensor = il < (int) model.layers.size() ? model.layers[il].ffn_exp_probs_b : nullptr;
+            if (b_tensor && b_tensor->data) {
+                if (ggml_backend_buffer_is_host(b_tensor->buffer)) {
+                    const float * bf = static_cast<const float *>(b_tensor->data);
+                    for (int e = 0; e < experts; ++e) ranked_experts.push_back({bf[e], e});
+                } else {
+                    cudaMemcpy(bias_data.data(), b_tensor->data, (size_t) experts * sizeof(float), cudaMemcpyDeviceToHost);
+                    for (int e = 0; e < experts; ++e) ranked_experts.push_back({bias_data[(size_t) e], e});
+                }
+                std::sort(ranked_experts.rbegin(), ranked_experts.rend());
+            } else {
+                for (int e = 0; e < experts; ++e) ranked_experts.push_back({0.0f, e});
+            }
+            for (int s = 0; s < 5; ++s) {
+                const int e = ranked_experts[(size_t) s].second;
+                const size_t idx = (size_t) il * 5 + s;
+                moe_execution->hot[idx].owner = this;
+                moe_execution->hot[idx].layer = il;
+                moe_execution->hot[idx].expert = e;
+                moe_execution->hot[idx].stamp = 1;
+                char * dst = moe_execution->hot_data(idx);
+                pager.fetch(il, e, dst, weights[il][0]->nb[2], dst + weights[il][0]->nb[2], weights[il][1]->nb[2], dst + weights[il][0]->nb[2] + weights[il][1]->nb[2], weights[il][2]->nb[2]);
+            }
+        }
+        cudaStreamSynchronize((cudaStream_t) moe_pager::worker_stream());
         g_moe_execution_pool = moe_execution;
         LLAMA_LOG_INFO("[moe_ring] stage=2x%d slots %.2f MiB hot=%zu slots %.2f MiB host=%zu slots %.2f MiB (total %zu cached experts, +51%% capacity)\n",
                 MOE_RING_SLOTS, moe_execution->stage_bytes / 1048576.0, moe_execution->hot.size(), total_hot_bytes / 1048576.0,
