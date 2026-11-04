@@ -211,22 +211,22 @@ struct moe_execution_pool {
     }
     int find_hot(llama_context * ctx, int il, int e) const {
         if (is_dsv41(ctx) && il >= 0 && il < 40) return find_layer(hot, ctx, il, e, (size_t) il * 5, 5);
-        if (il >= 0 && il < 3) return find_layer(hot, ctx, il, e, 200 + (size_t) il * 3, 3);
+        if (il >= 0 && il < 3) return find_layer(hot, ctx, il, e, 200 + (size_t) il * 12, 12);
         return -1;
     }
     int find_victim(llama_context * ctx, int il, int e) const {
         if (is_dsv41(ctx) && il >= 0 && il < 40) return find_layer(victim, ctx, il, e, (size_t) il * 15, 15);
-        if (il >= 0 && il < 3) return find_layer(victim, ctx, il, e, 600 + (size_t) il, 1);
+        if (il >= 0 && il < 3) return find_layer(victim, ctx, il, e, 600 + (size_t) il * 10, 10);
         return -1;
     }
     size_t oldest_hot(llama_context * ctx, int il) const {
         if (is_dsv41(ctx) && il >= 0 && il < 40) return oldest_layer(hot, (size_t) il * 5, 5, true);
-        if (il >= 0 && il < 3) return oldest_layer(hot, 200 + (size_t) il * 3, 3, true);
+        if (il >= 0 && il < 3) return oldest_layer(hot, 200 + (size_t) il * 12, 12, true);
         return 0;
     }
     size_t oldest_victim(llama_context * ctx, int il) const {
         if (is_dsv41(ctx) && il >= 0 && il < 40) return oldest_layer(victim, (size_t) il * 15, 15, false);
-        if (il >= 0 && il < 3) return oldest_layer(victim, 600 + (size_t) il, 1, false);
+        if (il >= 0 && il < 3) return oldest_layer(victim, 600 + (size_t) il * 10, 10, false);
         return 0;
     }
 
@@ -317,17 +317,35 @@ struct moe_execution_pool {
                 pinned[slot] = false;
                 continue;
             }
-            if (gpu >= 0 || ram >= 0) {
-                const char * source = gpu >= 0 ? hot_data((size_t) gpu) : victim_data((size_t) ram);
+            if (gpu >= 0) {
+                const char * source = hot_data((size_t) gpu);
                 size_t offset = 0;
                 for (int role = 0; role < 3; ++role) {
-                    const cudaError_t error = cudaMemcpyAsync(destination[role], source + offset, bytes[role], gpu >= 0 ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, stream);
+                    const cudaError_t error = cudaMemcpyAsync(destination[role], source + offset, bytes[role], cudaMemcpyDeviceToDevice, stream);
                     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
                     offset += bytes[role];
                 }
-                (gpu >= 0 ? hot[(size_t) gpu] : victim[(size_t) ram]).stamp = ++tick;
-                if (gpu >= 0) ctx->moe.n_vram_hit++;
-                else ctx->moe.n_ram_hit++;
+                hot[(size_t) gpu].stamp = ++tick;
+                ctx->moe.n_vram_hit++;
+                ctx->moe.n_hit++;
+            } else if (ram >= 0) {
+                const size_t target_hot = oldest_hot(ctx, il);
+                char * hot_dst = hot_data(target_hot);
+                const char * source = victim_data((size_t) ram);
+                size_t offset = 0;
+                for (int role = 0; role < 3; ++role) {
+                    const cudaError_t err1 = cudaMemcpyAsync(hot_dst + offset, source + offset, bytes[role], cudaMemcpyHostToDevice, stream);
+                    if (err1 != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err1));
+                    const cudaError_t err2 = cudaMemcpyAsync(destination[role], hot_dst + offset, bytes[role], cudaMemcpyDeviceToDevice, stream);
+                    if (err2 != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err2));
+                    offset += bytes[role];
+                }
+                hot[target_hot].owner = ctx;
+                hot[target_hot].layer = il;
+                hot[target_hot].expert = e;
+                hot[target_hot].stamp = ++tick;
+                victim[(size_t) ram].stamp = ++tick;
+                ctx->moe.n_ram_hit++;
                 ctx->moe.n_hit++;
             } else {
                 cold[n_cold++] = {e, destination[0], bytes[0], destination[1], bytes[1], destination[2], bytes[2]};
@@ -487,10 +505,10 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
             (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyDeviceToHost) != cudaSuccess) GGML_ABORT("MoE router read failed");
     if (ctx->moe_execution) {
         const bool is_ds = (ctx->moe.n_layer == 40);
-        const size_t hot_start = is_ds ? (size_t) il * 5 : (200 + (size_t) il * 3);
-        const size_t hot_count = is_ds ? 5 : 3;
-        const size_t vic_start = is_ds ? (size_t) il * 15 : (600 + (size_t) il);
-        const size_t vic_count = is_ds ? 15 : 1;
+        const size_t hot_start = is_ds ? (size_t) il * 5 : (200 + (size_t) il * 12);
+        const size_t hot_count = is_ds ? 5 : 12;
+        const size_t vic_start = is_ds ? (size_t) il * 15 : (600 + (size_t) il * 10);
+        const size_t vic_count = is_ds ? 15 : 10;
 
         auto is_overwhelming_outlier = [&](int64_t token_idx) -> bool {
             for (int64_t cr = 0; cr < std::min<int64_t>(nk, 2); ++cr) {
@@ -550,6 +568,9 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
                     }
                 }
             }
+        }
+        for (int32_t & id : ids) {
+            if (id < 0 || id >= ctx->moe.n_expert) id = 0;
         }
     }
     auto & experts = ctx->moe_ring->experts;
@@ -2092,8 +2113,8 @@ void llama_context::moe_init_ring() {
             const ggml_tensor * tensor = model.get_tensor(format("blk.%d.ffn_%s_exps.weight", il, roles[role]).c_str());
             if (!tensor || tensor->ne[2] != experts) throw std::runtime_error("paged MoE requires separate gate, up and down tensors");
             weights[(size_t) il][(size_t) role] = tensor;
-            const size_t draft_bytes = 6266880ull; // Exact max role bytes for DFlash MXFP4 [5120, 2304]
-            geometry[role] = std::max(geometry[role], std::max(tensor->nb[2], draft_bytes));
+            const size_t draft_role_bytes[3] = {3870720ull, 3870720ull, 6266880ull};
+            geometry[role] = std::max(geometry[role], std::max(tensor->nb[2], draft_role_bytes[role]));
         }
     }
     std::lock_guard<std::mutex> registration(g_moe_ring_mutex);
@@ -2120,18 +2141,19 @@ void llama_context::moe_init_ring() {
             size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
             total_hot_bytes += 5 * lb;
         }
-        total_hot_bytes += 10 * (size_t)(17.93 * 1048576);
+        const size_t dflash_exp_bytes = 14008320ull;
+        total_hot_bytes += 36 * dflash_exp_bytes;
         size_t total_host_bytes = 0;
         for (int il = 0; il < 40; ++il) {
             size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
             total_host_bytes += 15 * lb;
         }
-        total_host_bytes += 5 * (size_t)(17.93 * 1048576);
+        total_host_bytes += 30 * dflash_exp_bytes;
         const size_t bytes = moe_execution->stage_bytes + total_hot_bytes;
         moe_execution->buffer.reset(ggml_backend_alloc_buffer(backend, bytes));
         if (!moe_execution->buffer) throw std::runtime_error("shared MoE GPU allocation failed");
         ggml_backend_buffer_set_usage(moe_execution->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        moe_execution->hot.resize(210);
+        moe_execution->hot.resize(236);
         size_t hot_off = moe_execution->stage_bytes;
         for (int il = 0; il < 40; ++il) {
             size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
@@ -2142,11 +2164,11 @@ void llama_context::moe_init_ring() {
                 hot_off += lb;
             }
         }
-        for (int s = 0; s < 10; ++s) {
+        for (int s = 0; s < 36; ++s) {
             size_t idx = 200 + (size_t) s;
             moe_execution->hot[idx].offset = hot_off;
-            moe_execution->hot[idx].bytes  = (size_t)(17.93 * 1048576);
-            hot_off += (size_t)(17.93 * 1048576);
+            moe_execution->hot[idx].bytes  = dflash_exp_bytes;
+            hot_off += dflash_exp_bytes;
         }
         moe_execution->host_bytes = total_host_bytes;
         void * host = mmap(nullptr, moe_execution->host_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -2156,7 +2178,7 @@ void llama_context::moe_init_ring() {
             throw std::runtime_error("MoE host victim cache registration failed");
         }
         moe_execution->host = static_cast<char *>(host);
-        moe_execution->victim.resize(605);
+        moe_execution->victim.resize(630);
         size_t host_off = 0;
         for (int il = 0; il < 40; ++il) {
             size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
@@ -2167,11 +2189,11 @@ void llama_context::moe_init_ring() {
                 host_off += lb;
             }
         }
-        for (int s = 0; s < 5; ++s) {
+        for (int s = 0; s < 30; ++s) {
             size_t idx = 600 + (size_t) s;
             moe_execution->victim[idx].offset = host_off;
-            moe_execution->victim[idx].bytes  = (size_t)(17.93 * 1048576);
-            host_off += (size_t)(17.93 * 1048576);
+            moe_execution->victim[idx].bytes  = dflash_exp_bytes;
+            host_off += dflash_exp_bytes;
         }
         // Permanently pin top-5 hottest experts per layer in VRAM hot pool
         std::vector<float> bias_data((size_t) experts, 0.0f);
@@ -4387,7 +4409,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
         }
-        moe.is_decode = (n_outputs == (int32_t) ubatch.n_tokens);
+        moe.is_decode = (ubatch.n_tokens <= 6 || n_outputs == (int32_t) ubatch.n_tokens);
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);

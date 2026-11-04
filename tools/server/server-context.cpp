@@ -645,6 +645,16 @@ struct server_slot {
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
             }
+
+            // Fixed-size verification batching (nt = 6): pad tail with anchor token with output=false
+            const size_t target_ubatch_tokens = 6;
+            const size_t current_tokens = 1 + spec_draft.size();
+            if (current_tokens < target_ubatch_tokens) {
+                const size_t n_pad = target_ubatch_tokens - current_tokens;
+                for (size_t p = 0; p < n_pad; ++p) {
+                    add_ok &= batch.add(this->id, sampled, pos0++, false, false);
+                }
+            }
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");

@@ -1001,6 +1001,47 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
             for (int i = 0; i < n_targets; ++i) {
                 if (requests[(size_t) i] == (int) request) copy_ready(i);
             }
+            const int key = data.il * n_expert_ + data.e;
+            if (cache_ && cache_slots_ > 0 && cache_idx_[(size_t) key] < 0) {
+                int cslot = -1;
+                for (int i = 0; i < cache_slots_; i++) {
+                    if (!cache_used_[(size_t) i]) { cslot = i; break; }
+                }
+                if (cslot < 0) {
+                    long oldest = std::numeric_limits<long>::max();
+                    for (int i = 0; i < cache_slots_; i++) {
+                        if (cache_stamp_[(size_t) i] < oldest) { oldest = cache_stamp_[(size_t) i]; cslot = i; }
+                    }
+                    for (size_t k = 0; k < cache_idx_.size(); k++) {
+                        if (cache_idx_[k] == cslot) { cache_idx_[k] = -1; break; }
+                    }
+                    n_cache_evict_++;
+                }
+                char * csrc = stage_ + (size_t) data.stage * stage_bytes_;
+                char * cdst = cache_ + (size_t) cslot * cache_bytes_;
+                size_t at = 0;
+                if (pack_mode_) {
+                    const uint32_t * cbs = &bsrc_[(size_t) key * 3];
+                    for (int k = 0; k < 3; k++) {
+                        const size_t nb = role_bytes_[(size_t) data.il * 3 + (size_t) k];
+                        memcpy(cdst + at, csrc + cbs[k], nb);
+                        at += nb;
+                    }
+                } else {
+                    const moe_expert_slice * cs = this->slices(data.il, data.e);
+                    size_t offset = 0;
+                    for (int k = 0; k < 3; k++) {
+                        const size_t nb = role_bytes_[(size_t) data.il * 3 + (size_t) k];
+                        memcpy(cdst + at, csrc + offset + cs[k].pre, nb);
+                        at += nb;
+                        offset += cs[k].len;
+                    }
+                }
+                cache_used_[(size_t) cslot] = 1;
+                cache_stamp_[(size_t) cslot] = ++cache_tick_;
+                cache_idx_[(size_t) key] = cslot;
+                n_cache_fill_++;
+            }
         }
     }
     for (int i = 0; i < n_targets; ++i) copy_ready(i);

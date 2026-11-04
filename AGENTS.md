@@ -1,5 +1,29 @@
 # Instructions for llama.cpp
 
+## Betelgeuse DeepSeek-V4.1-Flash (`betelgeuse-ds41`) Active Engineering State
+
+- **Active Branch**: `betelgeuse-ds41` (Local only. NEVER push or open PR to GitHub; leave `fluxaeros-mtp` untouched).
+- **Model Paths**:
+  - Main Model: `/home/zyxciss/Models/BIG-MOE/DeepSeek-V4.1-Flash-1017/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf`
+  - Draft Model: `/home/zyxciss/Models/BIG-MOE/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-FLE-Q2K-Q8.gguf`
+- **Verified Baseline**:
+  - Draft Acceptance: `90.2%` (`37/41` accepted on `binary_search` 48 tokens).
+  - Geometry: `126.92 MiB` VRAM saved via exact `draft_role_bytes` (`{3870720, 3870720, 6266880}`), stage reduced to `554.41 MiB`.
+  - Emitted Code: Exact Python syntax `mid = (low + high) // 2`.
+- **Active Mandatory Tasks**:
+  1. **Fixed-Size `nt = 6` Verification Batching & Single-Graph VRAM Eviction Guard**:
+     - Pad verification ubatch to fixed `nt = 6` (`1 anchor + 5 draft`) so only 1 CUDA Graph instance is created in VRAM.
+     - In `ggml-cuda`, evict existing graph executables before instantiating if free VRAM < 600 MiB.
+     - Keep CUDA Graphs ENABLED (`GGML_CUDA_DISABLE_GRAPHS` unset).
+  2. **Inclusive Host-RAM Cache + 1-Way Persistent VRAM Promotion**:
+     - Make 600-slot Host-RAM cache inclusive.
+     - On Host-RAM hit, copy 1-way H2D into persistent VRAM LRU slot (0-byte D2H eviction).
+     - Promote DFlash active experts to persistent VRAM slots (36 slots) for 100% VRAM residency.
+  3. **Zero ColdSSD Reads on Warm Passes**:
+     - Write-allocate cold reads from Pass 1 into Host-RAM + VRAM.
+     - Ensure ColdSSD = 0.0% and 0.0 ms disk wait on Pass 2 & 3.
+
+
 > [!IMPORTANT]
 >
 > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.

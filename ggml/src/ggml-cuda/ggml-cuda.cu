@@ -3017,6 +3017,16 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
         ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph);
     } else {
         GGML_ASSERT(idx == graph->instances.size());
+        size_t free_mem = 0, total_mem = 0;
+        if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess && free_mem < 600ull * 1024 * 1024) {
+            for (auto it = cuda_ctx->cuda_graphs.begin(); it != cuda_ctx->cuda_graphs.end(); ) {
+                if (it->second.get() != graph) {
+                    it = cuda_ctx->cuda_graphs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         graph->instances.emplace_back(nullptr);
         CUDA_CHECK(cudaGraphInstantiate(&graph->instances[idx], cuda_graph, nullptr, nullptr, 0));
     }
