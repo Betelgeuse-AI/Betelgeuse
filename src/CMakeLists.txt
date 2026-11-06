@@ -35,6 +35,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-recurrent.cpp
     llama-mmap.cpp
     llama-model-loader.cpp
+    moe-cpu.cpp
     moe_pager.cpp
     llama-model-saver.cpp
     llama-model.cpp

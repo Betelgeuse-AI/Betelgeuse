@@ -1206,6 +1206,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -1217,16 +1224,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il, logits);
+                il, logits, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1e-5f, ffn_shexp);
         cb(moe_out, "ffn_moe_out", il);
-
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
 

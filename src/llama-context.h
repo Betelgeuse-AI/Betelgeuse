@@ -278,6 +278,7 @@ public:
         size_t               buf_bytes = 0;
         std::vector<ggml_tensor *> pool_gate, pool_up, pool_gate_up, pool_down, slot_table;
         std::vector<int32_t> slot_of, slot_key;
+        std::vector<int32_t> host_slot_of;
         std::vector<uint32_t> slot_freq;
         std::vector<uint32_t> dec_freq;   // n_layer*n_expert: decode-only routing counts
         moe_lru lru;

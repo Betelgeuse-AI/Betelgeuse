@@ -2326,6 +2326,7 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
         }
+        if (t.padding) llama_batch_ext_set_padding(res, idx, true);
     }
 
     return res;

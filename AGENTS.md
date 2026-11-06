@@ -23,6 +23,7 @@
      - Write-allocate cold reads from Pass 1 into Host-RAM + VRAM.
      - Ensure ColdSSD = 0.0% and 0.0 ms disk wait on Pass 2 & 3.
 
+Read TASK.md 
 
 > [!IMPORTANT]
 >

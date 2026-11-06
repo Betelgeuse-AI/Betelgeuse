@@ -2786,13 +2786,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * topk,
             struct ggml_tensor  * table,
+            struct ggml_tensor  * scores,
+            struct ggml_tensor  * input,
             int32_t               il,
             int32_t               sentinel);
 
     GGML_API struct ggml_tensor * ggml_moe_slot_resolve_wait(
             struct ggml_context * ctx,
             struct ggml_tensor  * kick,
-            struct ggml_tensor  * dependency);
+            struct ggml_tensor  * dependency,
+            bool                  hot_only);
 
     GGML_API struct ggml_tensor * ggml_moe_slot_prekick(
             struct ggml_context * ctx,

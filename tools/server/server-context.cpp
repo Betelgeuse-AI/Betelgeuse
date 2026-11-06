@@ -159,6 +159,7 @@ struct server_batch {
         bool is_prompt; // for stats tracking
         int32_t decision_order = 0;
         int32_t i_embd = -1; // row in embd, -1 if this is a token
+        bool padding = false;
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -252,6 +253,7 @@ struct server_batch {
                 view.add(t.token, t.pos[0], t.id_slot, t.output);
             }
             view.tokens.back().decision_order = t.decision_order;
+            view.tokens.back().padding = t.padding;
         }
     }
 };
@@ -646,13 +648,15 @@ struct server_slot {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
             }
 
-            // Fixed-size verification batching (nt = 6): pad tail with anchor token with output=false
+            // Keep the verification graph size fixed without routing padding specialists.
             const size_t target_ubatch_tokens = 6;
             const size_t current_tokens = 1 + spec_draft.size();
             if (current_tokens < target_ubatch_tokens) {
                 const size_t n_pad = target_ubatch_tokens - current_tokens;
                 for (size_t p = 0; p < n_pad; ++p) {
-                    add_ok &= batch.add(this->id, sampled, pos0++, false, false);
+                    const bool added = batch.add(this->id, sampled, pos0++, false, false);
+                    if (added) batch.tokens.back().padding = true;
+                    add_ok &= added;
                 }
             }
         }

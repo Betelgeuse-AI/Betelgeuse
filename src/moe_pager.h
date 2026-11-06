@@ -49,6 +49,8 @@ struct moe_batch_target {
     size_t up_bytes;
     void * dst_down;
     size_t down_bytes;
+    void * host = nullptr;
+    size_t host_bytes = 0;
 };
 
 class moe_pager {
@@ -57,7 +59,7 @@ public:
 
     // Open the GGUF and index every (layer, expert) slice. Returns false and
     // fills `err` on failure. Does not allocate GPU memory.
-    bool init(const char * gguf_path, int n_layer, int n_expert, int n_used, std::string & err);
+    bool init(const char * gguf_path, int n_layer, int n_expert, int n_used, std::string & err, int n_staging = NSTAGE);
 
     // Attach a CUDA backend + graph context so we can DMA into weight tensors.
     void attach_gpu(void * backend, size_t gate_up_elems, size_t down_elems);
@@ -149,6 +151,10 @@ public:
     // completed prefetch reads still unconsumed when a demand commit for the
     // same expert arrived (prefetch hit); cumulative
     long stats_pf_hit()   const { return n_pf_hit_; }
+    int64_t stats_batch_disk_wait_us() const { return disk_wait_us_; }
+    double  stats_batch_h2d_ms()       const { return (double) dma_us_ / 1000.0; }
+    int64_t stats_dma_wait_us()        const { return dma_wait_us_; }
+    int64_t stats_dma_bytes()          const { return dma_bytes_; }
     static void * worker_stream();
 
 private:
@@ -202,6 +208,11 @@ private:
     void * ring_ = nullptr;
     long io_ops_ = 0, io_bytes_ = 0, n_io_fail_ = 0;
     long n_pf_issued_ = 0, n_pf_hit_ = 0;
+    int64_t dma_us_ = 0, dma_wait_us_ = 0;
+    int64_t disk_wait_us_ = 0;
+    int64_t dma_bytes_ = 0;
+    void * dma_events_[72] = {};
+    void ensure_dma_events();
 
     int submit_(int key, bool demand);
     int find_(int key) const;

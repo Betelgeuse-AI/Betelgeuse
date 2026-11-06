@@ -405,11 +405,18 @@ void moe_doorbell_resolve_launch(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op
+    int32_t op,
+    const float * scores,
+    size_t scores_nb1,
+    const float * input,
+    size_t input_nb1,
+    bool hot_only
 ) {
     (void) table_nb0;
     (void) full; (void) fnk; (void) fnt; (void) full_nb1; (void) look; (void) lnk;
-
+    (void) scores; (void) scores_nb1;
+    (void) input; (void) input_nb1;
+    (void) hot_only;
     if (!g_active || !g_doorbells_dev || !g_plans_dev) return;
     if (g_lru_dev) GGML_ASSERT(n_exp == g_n_expert);
     const int64_t total64 = nk * nt;

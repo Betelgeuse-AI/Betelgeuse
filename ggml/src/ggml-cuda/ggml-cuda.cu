@@ -747,6 +747,12 @@ void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn) {
     ggml_cuda_moe_slot_resolve_fn = fn;
 }
 
+static ggml_cuda_moe_ffn_down_fn_t ggml_cuda_moe_ffn_down_fn = nullptr;
+
+void ggml_cuda_moe_ffn_down_register(ggml_cuda_moe_ffn_down_fn_t fn) {
+    ggml_cuda_moe_ffn_down_fn = fn;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -2559,6 +2565,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            if (dst->src[4] != nullptr && ggml_cuda_moe_ffn_down_fn != nullptr) {
+                ggml_cuda_moe_ffn_down_fn(ctx.stream(), dst->src[4], dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -2702,6 +2711,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * table = dst->src[1];
                 const ggml_tensor * full  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[2] : nullptr;
                 const ggml_tensor * look  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[3] : nullptr;
+                const ggml_tensor * scores_t = dst->op == GGML_OP_MOE_SLOT_RESOLVE_KICK ? dst->src[2] : nullptr;
+                const float * scores_data = scores_t ? (const float *) scores_t->data : nullptr;
+                const size_t  scores_nb1  = scores_t ? scores_t->nb[1] : 0;
+                const ggml_tensor * input_t = dst->op == GGML_OP_MOE_SLOT_RESOLVE_KICK ? dst->src[3] : nullptr;
+                const float * input_data = input_t ? (const float *) input_t->data : nullptr;
+                const size_t  input_nb1  = input_t ? input_t->nb[1] : 0;
+                const bool hot_only = (dst->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT) && (ggml_get_op_params_i32(dst, 3) != 0);
                 ggml_cuda_moe_slot_resolve_fn(ctx.stream(),
                     (const int32_t *) topk->data, (const int32_t *) table->data, (int32_t *) dst->data,
                     topk->ne[0], topk->ne[1], topk->nb[0], topk->nb[1], table->nb[0], dst->nb[0], dst->nb[1],
@@ -2711,7 +2727,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     look ? (const int32_t *) look->data : nullptr,
                     look ? look->ne[0] * look->ne[1] : 0,
                     ggml_get_op_params_i32(dst, 0), (int32_t) (table->ne[0] * table->ne[1]),
-                    ggml_get_op_params_i32(dst, 1), dst->op);
+                    ggml_get_op_params_i32(dst, 1), dst->op,
+                    scores_data, scores_nb1,
+                    input_data, input_nb1,
+                    hot_only);
             } break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -2900,7 +2919,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            if (ggml_cuda_mul_mat_id_needs_sync(node, cc) || node->src[4] != nullptr) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
@@ -2913,7 +2932,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             use_cuda_graph = false;
         }
         if ((node->op == GGML_OP_MOE_SLOT_RESOLVE_KICK || node->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT ||
-             node->op == GGML_OP_MOE_SLOT_PREKICK) && node->src[0]->ne[1] != 1) {
+             node->op == GGML_OP_MOE_SLOT_PREKICK) && (node->src[0]->ne[1] != 1 || ggml_get_op_params_i32(node, 2) != 0)) {
             use_cuda_graph = false;
         }
 
@@ -3984,6 +4003,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+static bool ggml_cuda_has_marked_down_op(const ggml_cgraph * cgraph, int start, int count) {
+    for (int k = 0; k < count; ++k) {
+        if (start + k < cgraph->n_nodes) {
+            const ggml_tensor * n = cgraph->nodes[start + k];
+            if (n->op == GGML_OP_MUL_MAT_ID && n->src[4] != nullptr) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -3991,6 +4022,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[4] != nullptr) {
+        return 0;
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
@@ -4952,6 +4987,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
+
+                if (nodes_to_skip != 0 && ggml_cuda_has_marked_down_op(cgraph, i, nodes_to_skip + 1)) {
+                    nodes_to_skip = 0;
+                }
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5151,7 +5190,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
-            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
+            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || cgraph->nodes[i]->src[4] != nullptr) {
                 continue;
             }
             for (int j = i + 3; j + 2 < cgraph->n_nodes; ++j) {
@@ -5159,6 +5198,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     break;
                 }
                 if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_expert(cgraph, i, j)) {
+                    continue;
+                }
+                if (ggml_cuda_has_marked_down_op(cgraph, i, j + 3 - i)) {
                     continue;
                 }
                 // Group both outputs before allocation so the shared result cannot alias intervening nodes.
@@ -6261,6 +6303,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_I32;
         case GGML_OP_MOE_SLOT_RESOLVE_KICK:
         case GGML_OP_MOE_SLOT_RESOLVE_WAIT:
+            return ggml_cuda_moe_slot_resolve_fn != nullptr &&
+                op->src[0]->type == GGML_TYPE_I32 && op->src[0]->ne[1] > 0 &&
+                (op->src[0]->ne[1] == 1 || (ggml_get_op_params_i32(op, 2) != 0 && op->src[0]->ne[0] <= 6 && op->src[0]->ne[1] <= 64)) &&
+                (op->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT
+                    ? op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_I32
+                    : op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
+                op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
         case GGML_OP_MOE_SLOT_PREKICK:
             return ggml_cuda_moe_slot_resolve_fn != nullptr &&
                 op->src[0]->type == GGML_TYPE_I32 && op->src[0]->ne[1] == 1 &&

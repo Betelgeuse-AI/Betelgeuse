@@ -11551,6 +11551,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
 
+    for (int used : {5, 6}) {
+        for (bool broadcast : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup(GGML_TYPE_Q2_K, GGML_TYPE_F32, 12, used, broadcast, 64, 16, 256));
+        }
+    }
+
     // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
 #if 0
     // repeated expert ids within a row

@@ -1223,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "moe_slot_resolve(topk, table)",
-    "moe_slot_resolve_kick(topk, table)",
+    "moe_slot_resolve_kick(topk, table, scores, input)",
     "moe_slot_resolve_wait(kick, dependency)",
     "moe_slot_prekick(topk, table)",
 
@@ -6751,22 +6751,44 @@ struct ggml_tensor * ggml_moe_slot_resolve_kick(
         struct ggml_context * ctx,
         struct ggml_tensor  * topk,
         struct ggml_tensor  * table,
+        struct ggml_tensor  * scores,
+        struct ggml_tensor  * input,
         int32_t               il,
         int32_t               sentinel) {
-    GGML_ASSERT(topk->ne[1] == 1);
-    struct ggml_tensor * result = ggml_moe_slot_resolve(ctx, topk, table, NULL, NULL, il, sentinel);
-    result->op = GGML_OP_MOE_SLOT_RESOLVE_KICK;
+    GGML_ASSERT(topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(table->type == GGML_TYPE_I32);
+    GGML_ASSERT(topk->ne[0] > 0 && topk->ne[1] > 0);
+    GGML_ASSERT(scores ? topk->ne[0] <= 6 && topk->ne[1] <= 64 : topk->ne[1] == 1);
+    GGML_ASSERT(scores == NULL || (scores->type == GGML_TYPE_F32 && ggml_is_matrix(scores) && scores->ne[0] == ggml_nelements(table) && scores->ne[1] == topk->ne[1]));
+    GGML_ASSERT(input == NULL || (input->type == GGML_TYPE_F32 && ggml_is_matrix(input) && input->ne[1] == topk->ne[1]));
+
+    struct ggml_tensor * result = scores
+        ? ggml_new_tensor_3d(ctx, GGML_TYPE_I32, topk->ne[0], topk->ne[1], input ? 3 : 2)
+        : ggml_new_tensor_2d(ctx, GGML_TYPE_I32, topk->ne[0], topk->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, il);
+    ggml_set_op_params_i32(result, 1, sentinel);
+    ggml_set_op_params_i32(result, 2, scores != NULL);
+
+    result->op     = GGML_OP_MOE_SLOT_RESOLVE_KICK;
+    result->src[0] = topk;
+    result->src[1] = table;
+    result->src[2] = scores;
+    result->src[3] = input;
+
     return result;
 }
 
 struct ggml_tensor * ggml_moe_slot_resolve_wait(
         struct ggml_context * ctx,
         struct ggml_tensor  * kick,
-        struct ggml_tensor  * dependency) {
+        struct ggml_tensor  * dependency,
+        bool                  hot_only) {
     GGML_ASSERT(kick->op == GGML_OP_MOE_SLOT_RESOLVE_KICK);
-    struct ggml_tensor * result = ggml_dup_tensor(ctx, kick);
-    memcpy(result->op_params, kick->op_params, sizeof(result->op_params));
+    struct ggml_tensor * result = ggml_view_tensor(ctx, kick);
     result->op = GGML_OP_MOE_SLOT_RESOLVE_WAIT;
+    memcpy(result->op_params, kick->op_params, sizeof(result->op_params));
+    ggml_set_op_params_i32(result, 3, hot_only ? 1 : 0);
     result->src[0] = kick;
     result->src[1] = kick->src[1];
     result->src[2] = dependency;
@@ -7951,6 +7973,10 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         const struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
 
         if (node->op != ops[i]) {
+            return false;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[4] != NULL) {
             return false;
         }
 

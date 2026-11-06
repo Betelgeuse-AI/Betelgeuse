@@ -61,9 +61,18 @@ typedef void (*ggml_cuda_moe_slot_resolve_fn_t)(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op);
+    int32_t op,
+    const float * scores,
+    size_t scores_nb1,
+    const float * input,
+    size_t input_nb1,
+    bool hot_only);
 
 GGML_BACKEND_API void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn);
+
+typedef void (*ggml_cuda_moe_ffn_down_fn_t)(void * stream, const struct ggml_tensor * kick, struct ggml_tensor * dst);
+
+GGML_BACKEND_API void ggml_cuda_moe_ffn_down_register(ggml_cuda_moe_ffn_down_fn_t fn);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 

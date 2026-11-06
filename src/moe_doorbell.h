@@ -68,7 +68,12 @@ void moe_doorbell_resolve_launch(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op
+    int32_t op,
+    const float * scores,
+    size_t scores_nb1,
+    const float * input,
+    size_t input_nb1,
+    bool hot_only
 );
 
 #ifdef __cplusplus

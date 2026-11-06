@@ -147,6 +147,10 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Mark a non-output tail token used to keep a verification batch at a fixed size.
+// The caller must remove its KV entry after verification.
+LLAMA_API bool llama_batch_ext_set_padding(struct llama_batch_ext * batch, int32_t idx, bool padding);
+
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 

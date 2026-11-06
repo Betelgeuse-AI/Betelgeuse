@@ -840,6 +840,7 @@ struct llm_graph_params {
     const ggml_tensor * const * moe_table   = nullptr;
     int32_t moe_n_layer = 0;
     bool moe_shared = false;
+    bool moe_resident = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -909,6 +910,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            moe_shared                     == other.moe_shared                     &&
+            moe_resident                   == other.moe_resident                   &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1091,6 +1094,7 @@ struct llm_graph_context {
     const ggml_tensor * const * moe_table   = nullptr;
     int32_t moe_n_layer = 0;
     bool moe_shared = false;
+    bool moe_resident = false;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1210,7 +1214,9 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+             ggml_tensor * moe_dependency = nullptr,
+             ggml_tensor * moe_kick_dep = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1238,7 +1244,9 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
-                   float   post_exp_norm_eps = 1e-5f) const;
+                   float   post_exp_norm_eps = 1e-5f,
+             ggml_tensor * moe_dependency = nullptr,
+             ggml_tensor * moe_kick_dep = nullptr) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(

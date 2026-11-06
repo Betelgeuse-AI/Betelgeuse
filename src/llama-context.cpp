@@ -16,6 +16,7 @@
 #endif
 #include "moe_doorbell.h"
 #include "moe_pager.h"
+#include "moe-cpu.h"
 #include "moe_predictor.h"
 #include <cuda_runtime.h>
 
@@ -144,6 +145,10 @@ static bool moe_doorbell_on(const llama_context * ctx) {
 static llama_context * g_moe_resolve_ctx = nullptr;
 
 static constexpr int MOE_RING_SLOTS = 18;
+static constexpr int MOE_TARGET_HOT = 5;
+static constexpr int MOE_TARGET_HOST = 15;
+static constexpr int MOE_DRAFT_HOT = 12;
+static constexpr int MOE_DRAFT_HOST = 20;
 
 struct moe_execution_pool {
     struct entry {
@@ -152,221 +157,440 @@ struct moe_execution_pool {
         uint64_t stamp = 0;
         size_t offset = 0, bytes = 0;
     };
+    struct event_span {
+        cudaEvent_t begin = nullptr, end = nullptr;
+    };
+    struct publication {
+        cudaStream_t stream;
+        const int32_t * experts;
+        int32_t * slots;
+        int32_t * output;
+        int64_t nk, nt;
+        size_t stride;
+        const uint8_t * cpu_mask = nullptr;
+        int32_t * ram_slots = nullptr;
+    };
+    enum timer_kind { GPU, H2D, WAIT, ROUTER, CPU_WAIT, HOT_WAIT, CPU_COPY, TIMER_COUNT };
     ggml_backend_buffer_ptr buffer;
     ggml_backend_dev_t device = nullptr;
     std::mutex compute_mutex, cache_mutex;
     size_t role_bytes[3] = {}, expert_bytes = 0;
     size_t stage_bytes = 0, host_bytes = 0;
+    int target_layers = 0, cuda_device = 0;
     char * host = nullptr;
     std::vector<entry> hot, victim;
     std::array<entry, MOE_RING_SLOTS> bank[2];
+    entry zero[2];
+    cudaStream_t stream_h2d = nullptr;
+    cudaEvent_t ready[2] = {}, hot_ready[2] = {}, published[2] = {};
+    bool busy[2] = {};
+    std::array<const entry *, 2 * MOE_RING_SLOTS> host_sources[2] = {};
+    size_t n_host_sources[2] = {};
+    std::array<const entry *, 64> cpu_sources = {};
+    size_t n_cpu_sources = 0;
     uint64_t tick = 0;
+    std::vector<event_span> timers[TIMER_COUNT];
+    size_t timer_used[TIMER_COUNT] = {};
+    bool profiling = false;
+    int gpu_open = -1;
+    uint64_t h2d_bytes = 0, d2d_bytes = 0;
+    int64_t promotion_wait_us = 0, cold_copy_wait_us = 0;
+    int64_t publish_us = 0, d2d_submit_us = 0, h2d_submit_us = 0;
 
+    static void check(cudaError_t error) {
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    }
+    moe_execution_pool() {
+        check(cudaGetDevice(&cuda_device));
+        check(cudaStreamCreateWithFlags(&stream_h2d, cudaStreamNonBlocking));
+        for (auto & event : ready) check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        for (auto & event : hot_ready) check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        for (auto & event : published) check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
     ~moe_execution_pool() {
+        if (stream_h2d) cudaStreamSynchronize(stream_h2d);
+        for (auto & events : timers) {
+            for (auto & event : events) {
+                cudaEventDestroy(event.begin);
+                cudaEventDestroy(event.end);
+            }
+        }
+        for (auto event : ready) if (event) cudaEventDestroy(event);
+        for (auto event : hot_ready) if (event) cudaEventDestroy(event);
+        for (auto event : published) if (event) cudaEventDestroy(event);
+        if (stream_h2d) cudaStreamDestroy(stream_h2d);
         if (host) {
             cudaHostUnregister(host);
             munmap(host, host_bytes);
         }
     }
-
+    void reserve_timers(size_t resolves) {
+        const size_t counts[TIMER_COUNT] = {4 * resolves + 1, 2 * resolves + hot.size() + 1, resolves, 3 * resolves, resolves, resolves, resolves};
+        for (int kind = 0; kind < TIMER_COUNT; ++kind) {
+            timers[kind].reserve(counts[kind]);
+            while (timers[kind].size() < counts[kind]) {
+                event_span event;
+                check(cudaEventCreate(&event.begin));
+                check(cudaEventCreate(&event.end));
+                timers[kind].push_back(event);
+            }
+        }
+    }
+    void begin_step(bool profile) {
+        profiling = profile;
+        std::fill_n(timer_used, TIMER_COUNT, 0);
+        gpu_open = -1;
+        h2d_bytes = d2d_bytes = 0;
+        promotion_wait_us = cold_copy_wait_us = 0;
+        publish_us = d2d_submit_us = h2d_submit_us = 0;
+    }
+    int timer_begin(timer_kind kind, cudaStream_t stream) {
+        if (!profiling) return -1;
+        const size_t index = timer_used[kind]++;
+        if (index >= timers[kind].size()) throw std::runtime_error("MoE timing capacity exceeded");
+        check(cudaEventRecord(timers[kind][index].begin, stream));
+        return (int) index;
+    }
+    void timer_end(timer_kind kind, int index, cudaStream_t stream) {
+        if (index >= 0) check(cudaEventRecord(timers[kind][(size_t) index].end, stream));
+    }
+    double timer_ms(timer_kind kind) const {
+        double total = 0;
+        for (size_t i = 0; i < timer_used[kind]; ++i) {
+            float elapsed = 0;
+            check(cudaEventElapsedTime(&elapsed, timers[kind][i].begin, timers[kind][i].end));
+            total += elapsed;
+        }
+        return total;
+    }
+    void gpu_begin(cudaStream_t stream) { gpu_open = timer_begin(GPU, stream); }
+    void gpu_end(cudaStream_t stream) {
+        timer_end(GPU, gpu_open, stream);
+        gpu_open = -1;
+    }
     char * hot_data(size_t slot) const {
         return static_cast<char *>(ggml_backend_buffer_get_base(buffer.get())) + hot[slot].offset;
     }
-    char * victim_data(size_t slot) const {
-        return host + victim[slot].offset;
+    char * victim_data(size_t slot) const { return host + victim[slot].offset; }
+    static bool is_dsv41(llama_context * ctx) {
+        return ctx && ctx->get_model().arch == LLM_ARCH_DEEPSEEK41;
     }
-    size_t hot_count() const {
-        size_t c = 0;
-        for (const auto & h : hot) if (h.owner) c++;
-        return c;
+    size_t hot_start(llama_context * ctx, int il) const {
+        return is_dsv41(ctx) ? (size_t) il * MOE_TARGET_HOT : (size_t) target_layers * MOE_TARGET_HOT + (size_t) il * MOE_DRAFT_HOT;
     }
-    size_t victim_count() const {
-        size_t c = 0;
-        for (const auto & v : victim) if (v.owner) c++;
-        return c;
-    }
-
+    static size_t hot_slots(llama_context * ctx) { return is_dsv41(ctx) ? MOE_TARGET_HOT : MOE_DRAFT_HOT; }
     static int find_layer(const std::vector<entry> & entries, llama_context * ctx, int il, int e, size_t start, size_t count) {
         for (size_t i = start; i < start + count && i < entries.size(); ++i) {
             if (entries[i].owner == ctx && entries[i].layer == il && entries[i].expert == e) return (int) i;
         }
         return -1;
     }
-    static size_t oldest_layer(const std::vector<entry> & entries, size_t start, size_t count, bool frequency) {
-        size_t best = start;
-        uint32_t least = UINT32_MAX;
-        uint64_t stamp = UINT64_MAX;
-        for (size_t i = start; i < start + count && i < entries.size(); ++i) {
-            const entry & key = entries[i];
-            if (!key.owner) return i;
-            const uint32_t count_val = frequency ? key.owner->moe.dec_freq[(size_t) key.layer * key.owner->moe.n_expert + key.expert] : 0;
-            if (count_val < least || (count_val == least && key.stamp < stamp)) {
-                least = count_val; stamp = key.stamp; best = i;
+    int find_hot(llama_context * ctx, int il, int e) const {
+        return find_layer(hot, ctx, il, e, hot_start(ctx, il), hot_slots(ctx));
+    }
+    int find_victim(llama_context * ctx, int il, int e) const {
+        if (il < 0 || il >= ctx->moe.n_layer || e < 0 || e >= ctx->moe.n_expert) return -1;
+        return ctx->moe.host_slot_of[(size_t) il * ctx->moe.n_expert + e];
+    }
+    size_t hot_count(llama_context * ctx) const {
+        size_t count = 0;
+        for (const auto & key : hot) if (key.owner == ctx) ++count;
+        return count;
+    }
+    size_t victim_count(llama_context * ctx) const {
+        size_t count = 0;
+        for (const auto & key : victim) if (key.owner == ctx) ++count;
+        return count;
+    }
+    bool in_flight(const entry & key) {
+        for (size_t i = 0; i < n_cpu_sources; ++i) if (cpu_sources[i] == &key) return true;
+        for (int b = 0; b < 2; ++b) {
+            if (!busy[b]) continue;
+            const cudaError_t status = cudaEventQuery(ready[b]);
+            if (status == cudaSuccess) { busy[b] = false; n_host_sources[b] = 0; continue; }
+            if (status != cudaErrorNotReady) check(status);
+            for (size_t i = 0; i < n_host_sources[b]; ++i) {
+                if (host_sources[b][i] == &key) return true;
             }
+        }
+        return false;
+    }
+    int oldest_victim(llama_context * ctx, int il, const int32_t * selected = nullptr, size_t count = 0) {
+        int best = -1;
+        uint64_t stamp = UINT64_MAX;
+        const size_t first = is_dsv41(ctx) ? (size_t) il * MOE_TARGET_HOST : (size_t) target_layers * MOE_TARGET_HOST + (size_t) il * MOE_DRAFT_HOST;
+        const size_t end = first + (is_dsv41(ctx) ? MOE_TARGET_HOST : MOE_DRAFT_HOST);
+        const size_t bytes = ctx->pager.expert_role_bytes(il, 0) + ctx->pager.expert_role_bytes(il, 1) + ctx->pager.expert_role_bytes(il, 2);
+        for (size_t i = first; i < end; ++i) {
+            const auto & key = victim[i];
+            if (key.bytes < bytes) continue;
+            if (!key.owner) {
+                if (best < 0 || stamp != 0 || key.bytes < victim[(size_t) best].bytes) { best = (int) i; stamp = 0; }
+                continue;
+            }
+            if (stamp == 0) continue;
+            if (find_hot(key.owner, key.layer, key.expert) >= 0 || in_flight(key)) continue;
+            bool pinned = false;
+            if (key.owner == ctx && key.layer == il) {
+                for (size_t j = 0; j < count; ++j) if (selected[j] == key.expert) pinned = true;
+            }
+            if (!pinned && key.stamp < stamp) { best = (int) i; stamp = key.stamp; }
         }
         return best;
     }
-    bool is_dsv41(llama_context * ctx) const {
-        return ctx && ctx->moe.n_layer == 40;
+    void set_entry(entry & key, llama_context * ctx, int il, int e) {
+        key.owner = ctx; key.layer = il; key.expert = e; key.stamp = ++tick;
     }
-    int find_hot(llama_context * ctx, int il, int e) const {
-        if (is_dsv41(ctx) && il >= 0 && il < 40) return find_layer(hot, ctx, il, e, (size_t) il * 5, 5);
-        if (il >= 0 && il < 3) return find_layer(hot, ctx, il, e, 200 + (size_t) il * 12, 12);
-        return -1;
+    void clear_victim(size_t slot) {
+        auto & key = victim[slot];
+        if (key.owner) {
+            key.owner->moe.host_slot_of[(size_t) key.layer * key.owner->moe.n_expert + key.expert] = -1;
+        }
+        key.owner = nullptr;
     }
-    int find_victim(llama_context * ctx, int il, int e) const {
-        if (is_dsv41(ctx) && il >= 0 && il < 40) return find_layer(victim, ctx, il, e, (size_t) il * 15, 15);
-        if (il >= 0 && il < 3) return find_layer(victim, ctx, il, e, 600 + (size_t) il * 10, 10);
-        return -1;
+    void set_victim(size_t slot, llama_context * ctx, int il, int e) {
+        clear_victim(slot);
+        set_entry(victim[slot], ctx, il, e);
+        ctx->moe.host_slot_of[(size_t) il * ctx->moe.n_expert + e] = (int32_t) slot;
     }
-    size_t oldest_hot(llama_context * ctx, int il) const {
-        if (is_dsv41(ctx) && il >= 0 && il < 40) return oldest_layer(hot, (size_t) il * 5, 5, true);
-        if (il >= 0 && il < 3) return oldest_layer(hot, 200 + (size_t) il * 12, 12, true);
-        return 0;
-    }
-    size_t oldest_victim(llama_context * ctx, int il) const {
-        if (is_dsv41(ctx) && il >= 0 && il < 40) return oldest_layer(victim, (size_t) il * 15, 15, false);
-        if (il >= 0 && il < 3) return oldest_layer(victim, 600 + (size_t) il * 10, 10, false);
-        return 0;
-    }
-
-    void retain(const entry & key, const char * const source[3], const size_t bytes[3], cudaStream_t stream) {
-        if (victim.empty() || !key.owner) return;
-        if (find_victim(key.owner, key.layer, key.expert) >= 0) return;
-        const size_t slot = oldest_victim(key.owner, key.layer);
+    bool promote_async(llama_context * ctx, int il, int e, char * scratch) {
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            if (find_victim(ctx, il, e) >= 0) return false;
+        }
+        const auto * slices = ctx->pager.slices(il, e);
         size_t offset = 0;
         for (int role = 0; role < 3; ++role) {
-            const cudaError_t error = cudaMemcpyAsync(victim_data(slot) + offset, source[role], bytes[role], cudaMemcpyDeviceToHost, stream);
-            if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-            offset += bytes[role];
+            const size_t bytes = ctx->pager.expert_role_bytes(il, role);
+            const int fd = slices[role].fd_buf >= 0 ? slices[role].fd_buf : slices[role].fd;
+            size_t done = 0;
+            while (done < bytes) {
+                const ssize_t n = pread(fd, scratch + offset + done, bytes - done, (off_t) (slices[role].off + slices[role].pre + done));
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) throw std::runtime_error("MoE background expert read failed");
+                done += (size_t) n;
+            }
+            posix_fadvise(fd, (off_t) slices[role].off, slices[role].len, POSIX_FADV_DONTNEED);
+            offset += bytes;
         }
-        victim[slot].owner  = key.owner;
-        victim[slot].layer  = key.layer;
-        victim[slot].expert = key.expert;
-        victim[slot].stamp  = ++tick;
-    }
-    void promote_async(llama_context * ctx, int il, int e) {
         std::lock_guard<std::mutex> lock(cache_mutex);
-        if (find_hot(ctx, il, e) >= 0 || find_victim(ctx, il, e) >= 0) return;
-        const size_t slot = oldest_victim(ctx, il);
-        char * dst = victim_data(slot);
-        const auto * sl = ctx->pager.slices(il, e);
-        size_t off = 0;
-        bool ok = true;
-        for (int r = 0; r < 3; ++r) {
-            const size_t role_b = r == 0 ? ctx->moe.pool_gate[il]->nb[2] : (r == 1 ? ctx->moe.pool_up[il]->nb[2] : ctx->moe.pool_down[il]->nb[2]);
-            const int fd = sl[r].fd_buf >= 0 ? sl[r].fd_buf : sl[r].fd;
-            ssize_t n = pread(fd, dst + off, role_b, (off_t) (sl[r].off + sl[r].pre));
-            posix_fadvise(fd, (off_t) sl[r].off, sl[r].len, POSIX_FADV_DONTNEED);
-            if (n != (ssize_t) role_b) { ok = false; break; }
-            off += role_b;
-        }
-        if (ok) {
-            victim[slot].owner  = ctx;
-            victim[slot].layer  = il;
-            victim[slot].expert = e;
-            victim[slot].stamp  = ++tick;
-        }
+        if (find_victim(ctx, il, e) >= 0) return false;
+        const int slot = oldest_victim(ctx, il);
+        if (slot < 0) return false;
+        if (offset > victim[(size_t) slot].bytes) throw std::runtime_error("MoE host cache geometry mismatch");
+        memcpy(victim_data((size_t) slot), scratch, offset);
+        set_victim((size_t) slot, ctx, il, e);
+        return true;
     }
 
-    void prepare(llama_context * ctx, int il, const std::vector<int32_t> & experts, bool demand = true) {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        cudaStream_t stream = static_cast<cudaStream_t>(moe_pager::worker_stream());
-        if (!stream) throw std::runtime_error("MoE transfer stream unavailable");
-        auto & slots = bank[il % 2];
-        ggml_tensor * tensors[3] = {ctx->moe.pool_gate[il], ctx->moe.pool_up[il], ctx->moe.pool_down[il]};
-        size_t bytes[3] = {tensors[0]->nb[2], tensors[1]->nb[2], tensors[2]->nb[2]};
-        if (slots[0].owner && (slots[0].owner != ctx || slots[0].layer != il)) {
-            for (size_t slot = 0; slot < slots.size(); ++slot) {
-                const entry & key = slots[slot];
-                if (!key.owner || find_hot(key.owner, key.layer, key.expert) >= 0) continue;
-                ggml_tensor * old[3] = {key.owner->moe.pool_gate[key.layer], key.owner->moe.pool_up[key.layer], key.owner->moe.pool_down[key.layer]};
-                const size_t lengths[3] = {old[0]->nb[2], old[1]->nb[2], old[2]->nb[2]};
-                const char * source[3] = {static_cast<char *>(old[0]->data) + slot * lengths[0], static_cast<char *>(old[1]->data) + slot * lengths[1], static_cast<char *>(old[2]->data) + slot * lengths[2]};
-                retain(key, source, lengths, stream);
-            }
-            slots = {};
+    // Caller holds cache_mutex; the ready event protects host sources until DMA completes.
+    void prepare(llama_context * ctx, int il, const std::vector<int32_t> & experts, bool demand = true, const publication * ids = nullptr) {
+        const int b = il % 2;
+        if (busy[b]) {
+            const cudaError_t status = cudaEventQuery(ready[b]);
+            if (status == cudaSuccess) busy[b] = false;
+            else if (status != cudaErrorNotReady) check(status);
         }
+        if (!busy[b]) n_host_sources[b] = 0;
+        auto & slots = bank[b];
+        ggml_tensor * tensors[3] = {ctx->moe.pool_gate[il], ctx->moe.pool_up[il], ctx->moe.pool_down[il]};
+        const size_t bytes[3] = {tensors[0]->nb[2], tensors[1]->nb[2], tensors[2]->nb[2]};
+        if (slots[0].owner && (slots[0].owner != ctx || slots[0].layer != il)) slots = {};
         std::array<bool, MOE_RING_SLOTS> pinned = {};
         for (int32_t e : experts) {
             for (size_t slot = 0; slot < slots.size(); ++slot) {
                 if (slots[slot].owner == ctx && slots[slot].layer == il && slots[slot].expert == e) pinned[slot] = true;
             }
-            if (demand) ctx->moe.dec_freq[(size_t) il * ctx->moe.n_expert + e]++;
         }
+        struct copy_plan { size_t slot; int source; };
+        std::array<copy_plan, MOE_RING_SLOTS> gpu_copies = {}, ram_copies = {};
+        size_t n_gpu = 0, n_ram = 0, n_cold = 0;
         std::array<moe_batch_target, MOE_RING_SLOTS> cold = {};
-        size_t n_cold = 0;
+        std::array<int32_t, MOE_RING_SLOTS> cold_ids = {}, cold_host = {};
         for (int32_t e : experts) {
             int resident = -1;
             for (size_t slot = 0; slot < slots.size(); ++slot) {
                 if (slots[slot].owner == ctx && slots[slot].layer == il && slots[slot].expert == e) resident = (int) slot;
             }
             if (resident >= 0) continue;
+            const int gpu = find_hot(ctx, il, e);
+            const int ram = find_victim(ctx, il, e);
+            if (!demand && gpu < 0 && ram < 0) continue;
             size_t slot = 0;
             while (slot < slots.size() && pinned[slot]) ++slot;
             if (slot == slots.size()) throw std::runtime_error("MoE execution ring capacity exceeded");
             pinned[slot] = true;
-            if (slots[slot].owner && find_hot(slots[slot].owner, slots[slot].layer, slots[slot].expert) < 0) {
-                const char * source[3] = {static_cast<char *>(tensors[0]->data) + slot * bytes[0], static_cast<char *>(tensors[1]->data) + slot * bytes[1], static_cast<char *>(tensors[2]->data) + slot * bytes[2]};
-                retain(slots[slot], source, bytes, stream);
-            }
-            void * destination[3] = {static_cast<char *>(tensors[0]->data) + slot * bytes[0], static_cast<char *>(tensors[1]->data) + slot * bytes[1], static_cast<char *>(tensors[2]->data) + slot * bytes[2]};
-            const int gpu = find_hot(ctx, il, e);
-            const int ram = gpu < 0 ? find_victim(ctx, il, e) : -1;
-            if (!demand && gpu < 0 && ram < 0) {
-                pinned[slot] = false;
-                continue;
-            }
             if (gpu >= 0) {
-                const char * source = hot_data((size_t) gpu);
-                size_t offset = 0;
-                for (int role = 0; role < 3; ++role) {
-                    const cudaError_t error = cudaMemcpyAsync(destination[role], source + offset, bytes[role], cudaMemcpyDeviceToDevice, stream);
-                    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-                    offset += bytes[role];
-                }
+                gpu_copies[n_gpu++] = {slot, gpu};
                 hot[(size_t) gpu].stamp = ++tick;
-                ctx->moe.n_vram_hit++;
-                ctx->moe.n_hit++;
             } else if (ram >= 0) {
-                const size_t target_hot = oldest_hot(ctx, il);
-                char * hot_dst = hot_data(target_hot);
-                const char * source = victim_data((size_t) ram);
-                size_t offset = 0;
-                for (int role = 0; role < 3; ++role) {
-                    const cudaError_t err1 = cudaMemcpyAsync(hot_dst + offset, source + offset, bytes[role], cudaMemcpyHostToDevice, stream);
-                    if (err1 != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err1));
-                    const cudaError_t err2 = cudaMemcpyAsync(destination[role], hot_dst + offset, bytes[role], cudaMemcpyDeviceToDevice, stream);
-                    if (err2 != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err2));
-                    offset += bytes[role];
-                }
-                hot[target_hot].owner = ctx;
-                hot[target_hot].layer = il;
-                hot[target_hot].expert = e;
-                hot[target_hot].stamp = ++tick;
+                ram_copies[n_ram++] = {slot, ram};
                 victim[(size_t) ram].stamp = ++tick;
-                ctx->moe.n_ram_hit++;
-                ctx->moe.n_hit++;
             } else {
-                cold[n_cold++] = {e, destination[0], bytes[0], destination[1], bytes[1], destination[2], bytes[2]};
-                ctx->moe.n_miss++;
+                void * destination[3] = {static_cast<char *>(tensors[0]->data) + slot * bytes[0], static_cast<char *>(tensors[1]->data) + slot * bytes[1], static_cast<char *>(tensors[2]->data) + slot * bytes[2]};
+                cold[n_cold] = {e, destination[0], bytes[0], destination[1], bytes[1], destination[2], bytes[2]};
+                cold_ids[n_cold++] = e;
             }
-            slots[slot] = {ctx, il, e, ++tick};
+            set_entry(slots[slot], ctx, il, e);
         }
-        if (n_cold > 1) {
-            std::sort(cold.begin(), cold.begin() + n_cold, [ctx, il](const moe_batch_target & a, const moe_batch_target & b) {
-                const auto * sa = ctx->pager.slices(il, a.expert);
-                const auto * sb = ctx->pager.slices(il, b.expert);
-                const int fda = sa[0].fd_buf >= 0 ? sa[0].fd_buf : sa[0].fd;
-                const int fdb = sb[0].fd_buf >= 0 ? sb[0].fd_buf : sb[0].fd;
-                if (fda != fdb) return fda < fdb;
-                return sa[0].off < sb[0].off;
-            });
+        bool has_cpu = false;
+        if (ids) {
+            for (int64_t i = 0; i < ids->nk * ids->nt; ++i) {
+                int slot = MOE_RING_SLOTS;
+                if (!ids->cpu_mask || !ids->cpu_mask[i]) {
+                    slot = -1;
+                    for (int s = 0; s < MOE_RING_SLOTS; ++s) {
+                        if (slots[(size_t) s].owner == ctx && slots[(size_t) s].layer == il && slots[(size_t) s].expert == ids->experts[i]) slot = s;
+                    }
+                    if (slot < 0) throw std::runtime_error("selected expert missing from GPU execution ring");
+                }
+                ids->slots[i] = slot;
+                has_cpu |= slot == MOE_RING_SLOTS;
+                if (ids->ram_slots) {
+                    const bool hot = find_hot(ctx, il, ids->experts[i]) >= 0;
+                    ids->slots[i] = hot ? slot : MOE_RING_SLOTS;
+                    ids->ram_slots[i] = hot ? MOE_RING_SLOTS : slot;
+                    has_cpu = true;
+                }
+            }
+            const size_t row = (size_t) ids->nk * sizeof(int32_t);
+            const int64_t start = profiling ? ggml_time_us() : 0;
+            const int timer = timer_begin(ROUTER, ids->stream);
+            check(cudaMemcpy2DAsync(ids->output, ids->stride, ids->slots, row, row, (size_t) ids->nt, cudaMemcpyHostToDevice, ids->stream));
+            check(cudaMemcpy2DAsync(reinterpret_cast<char *>(ids->output) + (size_t) ids->nt * ids->stride, ids->stride, ids->experts, row, row, (size_t) ids->nt, cudaMemcpyHostToDevice, ids->stream));
+            if (ids->ram_slots) {
+                check(cudaMemcpy2DAsync(reinterpret_cast<char *>(ids->output) + 2 * (size_t) ids->nt * ids->stride, ids->stride, ids->ram_slots, row, row, (size_t) ids->nt, cudaMemcpyHostToDevice, ids->stream));
+            }
+            timer_end(ROUTER, timer, ids->stream);
+            check(cudaEventRecord(published[b], ids->stream));
+            check(cudaStreamWaitEvent(stream_h2d, published[b], 0));
+            if (profiling) publish_us += ggml_time_us() - start;
         }
-        if (n_cold && !ctx->pager.fetch_batch(il, cold.data(), (int) n_cold, stream)) {
-            throw std::runtime_error("MoE expert batch read failed; CPU fallback is disabled");
+        const int64_t stage_start = profiling ? ggml_time_us() : 0;
+        for (size_t i = 0; i < n_gpu; ++i) {
+            const auto & copy = gpu_copies[i];
+            const char * source = hot_data((size_t) copy.source);
+            size_t offset = 0;
+            for (int role = 0; role < 3; ++role) {
+                void * destination = static_cast<char *>(tensors[role]->data) + copy.slot * bytes[role];
+                check(cudaMemcpyAsync(destination, source + offset, bytes[role], cudaMemcpyDeviceToDevice, stream_h2d));
+                offset += bytes[role];
+            }
+            d2d_bytes += offset;
         }
-        if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("MoE transfer failed");
+        if (has_cpu && (zero[b].owner != ctx || zero[b].layer != il)) {
+            for (int role = 0; role < 3; ++role) {
+                check(cudaMemsetAsync(static_cast<char *>(tensors[role]->data) + MOE_RING_SLOTS * bytes[role], 0, bytes[role], stream_h2d));
+            }
+            set_entry(zero[b], ctx, il, -1);
+        }
+        check(cudaEventRecord(hot_ready[b], stream_h2d));
+        if (profiling) d2d_submit_us += ggml_time_us() - stage_start;
+        const int64_t upload_start = profiling ? ggml_time_us() : 0;
+        const int timer = n_ram ? timer_begin(H2D, stream_h2d) : -1;
+        for (size_t i = 0; i < n_ram; ++i) {
+            const auto & copy = ram_copies[i];
+            const entry * key = &victim[(size_t) copy.source];
+            auto & sources = host_sources[b];
+            size_t & count = n_host_sources[b];
+            if (std::find(sources.begin(), sources.begin() + count, key) == sources.begin() + count) {
+                if (count == sources.size()) throw std::runtime_error("MoE DMA source capacity exceeded");
+                sources[count++] = key;
+            }
+            const char * source = victim_data((size_t) copy.source);
+            size_t offset = 0;
+            for (int role = 0; role < 3; ++role) {
+                void * destination = static_cast<char *>(tensors[role]->data) + copy.slot * bytes[role];
+                check(cudaMemcpyAsync(destination, source + offset, bytes[role], cudaMemcpyHostToDevice, stream_h2d));
+                offset += bytes[role];
+            }
+            h2d_bytes += offset;
+        }
+        timer_end(H2D, timer, stream_h2d);
+        if (profiling) h2d_submit_us += ggml_time_us() - upload_start;
+        if (n_cold) {
+            const int64_t wait_start = ggml_time_us();
+            check(cudaStreamSynchronize(stream_h2d));
+            cold_copy_wait_us += ggml_time_us() - wait_start;
+            busy[0] = busy[1] = false;
+            const size_t host_slots = is_dsv41(ctx) ? MOE_TARGET_HOST : MOE_DRAFT_HOST;
+            size_t capacity = host_slots;
+            const size_t hot_first = hot_start(ctx, il);
+            for (size_t s = hot_first; s < hot_first + this->hot_slots(ctx); ++s) if (hot[s].owner == ctx) --capacity;
+            if (!capacity) throw std::runtime_error("MoE inclusive host cache has no staging capacity");
+            for (size_t first = 0; first < n_cold; first += capacity) {
+                const size_t count = std::min(capacity, n_cold - first);
+                for (size_t i = first; i < first + count; ++i) {
+                    const int slot = oldest_victim(ctx, il, cold_ids.data() + first, count);
+                    if (slot < 0) throw std::runtime_error("MoE inclusive host cache is full");
+                    cold_host[i] = slot;
+                    cold[i].host = victim_data((size_t) slot);
+                    cold[i].host_bytes = victim[(size_t) slot].bytes;
+                    set_victim((size_t) slot, ctx, il, cold_ids[i]);
+                    h2d_bytes += bytes[0] + bytes[1] + bytes[2];
+                }
+                if (!ctx->pager.fetch_batch(il, cold.data() + first, (int) count, stream_h2d)) {
+                    for (size_t i = first; i < first + count; ++i) clear_victim((size_t) cold_host[i]);
+                    throw std::runtime_error("MoE expert batch read failed; CPU fallback is disabled");
+                }
+            }
+        }
+        check(cudaEventRecord(ready[b], stream_h2d));
+        busy[b] = true;
+    }
+    void refresh_hot(llama_context * ctx, const std::vector<uint32_t> & frequency, int only_layer = -1, bool allow_disk = false) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        check(cudaStreamSynchronize(stream_h2d));
+        busy[0] = busy[1] = false;
+        bool copied = false;
+        for (int il = only_layer < 0 ? 0 : only_layer; il < (only_layer < 0 ? ctx->moe.n_layer : only_layer + 1); ++il) {
+            std::array<int32_t, MOE_DRAFT_HOT> chosen;
+            chosen.fill(-1);
+            const size_t count = hot_slots(ctx), first = hot_start(ctx, il);
+            for (size_t rank = 0; rank < count; ++rank) {
+                int best = -1;
+                uint32_t most = 0;
+                for (int e = 0; e < ctx->moe.n_expert; ++e) {
+                    if ((!allow_disk && find_victim(ctx, il, e) < 0) || std::find(chosen.begin(), chosen.end(), e) != chosen.end()) continue;
+                    const uint32_t value = frequency[(size_t) il * ctx->moe.n_expert + e];
+                    if (value == 0) continue;
+                    if (best < 0 || value > most || (value == most && find_hot(ctx, il, e) >= 0 && find_hot(ctx, il, best) < 0)) {
+                        best = e; most = value;
+                    }
+                }
+                if (best < 0) break;
+                chosen[rank] = best;
+            }
+            for (size_t rank = 0; rank < count && chosen[rank] >= 0; ++rank) {
+                const int e = chosen[rank];
+                if (find_hot(ctx, il, e) >= 0) continue;
+                size_t slot = first;
+                while (slot < first + count && hot[slot].owner && std::find(chosen.begin(), chosen.end(), hot[slot].expert) != chosen.end()) ++slot;
+                if (slot == first + count) throw std::runtime_error("MoE hot cache selection failed");
+                int ram = find_victim(ctx, il, e);
+                if (ram < 0) {
+                    ram = oldest_victim(ctx, il, chosen.data(), count);
+                    if (ram < 0) throw std::runtime_error("MoE prompt seed has no host cache slot");
+                    const size_t gate = ctx->pager.expert_role_bytes(il, 0), up = ctx->pager.expert_role_bytes(il, 1), down = ctx->pager.expert_role_bytes(il, 2);
+                    const moe_batch_target seed = {e, nullptr, gate, nullptr, up, nullptr, down, victim_data((size_t) ram), victim[(size_t) ram].bytes};
+                    if (!ctx->pager.fetch_batch(il, &seed, 1, stream_h2d)) throw std::runtime_error("MoE prompt seed read failed");
+                    set_victim((size_t) ram, ctx, il, e);
+                }
+                const size_t bytes = ctx->pager.expert_role_bytes(il, 0) + ctx->pager.expert_role_bytes(il, 1) + ctx->pager.expert_role_bytes(il, 2);
+                if (bytes > hot[slot].bytes) throw std::runtime_error("MoE hot cache geometry mismatch");
+                const int timer = timer_begin(H2D, stream_h2d);
+                check(cudaMemcpyAsync(hot_data(slot), victim_data((size_t) ram), bytes, cudaMemcpyHostToDevice, stream_h2d));
+                timer_end(H2D, timer, stream_h2d);
+                set_entry(hot[slot], ctx, il, e);
+                h2d_bytes += bytes;
+                copied = true;
+            }
+        }
+        if (copied) {
+            const int64_t start = ggml_time_us();
+            check(cudaStreamSynchronize(stream_h2d));
+            promotion_wait_us += ggml_time_us() - start;
+        }
     }
 };
 
@@ -375,107 +599,220 @@ struct moe_ring_state {
     std::thread worker;
     std::mutex mutex;
     std::condition_variable cv;
-    bool running = true, pending = false;
-    int layer = -1;
-    std::vector<int32_t> prediction, ids, experts;
-    std::vector<std::vector<int32_t>> previous;
-    std::exception_ptr error;
-    int current_layer = -1;
-    size_t layer_tokens = 0;
-
+    bool running = true, active = false;
+    std::pair<int, int> active_promotion = {-1, -1};
     std::vector<std::pair<int, int>> async_promotions;
     std::atomic<uint64_t> promotions_completed{0};
-    bool can_enqueue_promotion() {
-        std::lock_guard<std::mutex> lock(mutex);
-        return async_promotions.empty();
-    }
-    void enqueue_promotion(int il, int expert) {
-        if (expert < 0) return;
-        std::lock_guard<std::mutex> lock(mutex);
-        for (const auto & p : async_promotions) {
-            if (p.first == il && p.second == expert) return;
+    std::exception_ptr error;
+    std::vector<int32_t> experts, prediction;
+    std::vector<std::vector<int32_t>> previous;
+    std::vector<uint8_t> warm, token_active;
+    std::vector<uint32_t> prompt_freq, draft_freq;
+    std::vector<float> previous_score;
+    std::vector<llama_token> prompt, hot_prompt;
+    bool prompt_key_valid = false, prompt_reseed = true, prompt_complete = false;
+    void * router_host = nullptr;
+    int32_t * ids = nullptr;
+    int32_t * slots = nullptr;
+    int32_t * ram_slots = nullptr;
+    float * scores = nullptr;
+    cudaStream_t compute = nullptr;
+    uint32_t max_tokens = 6;
+    uint32_t valid_tokens = 0;
+    int current_layer = -1;
+    size_t layer_tokens = 0;
+    uint64_t rank0_replaced = 0, ranks_replaced = 0, budget_overrides = 0;
+    float resident_margin = 0.10f;
+    std::unique_ptr<moe_cpu_executor> cpu;
+    std::thread cpu_worker;
+    std::mutex cpu_mutex;
+    std::condition_variable cpu_cv;
+    bool cpu_running = true, cpu_pending = false, cpu_published = true;
+    bool cpu_validate = false;
+    int cpu_layer = -1, cpu_n_jobs = 0, cpu_layers = 0;
+    int64_t cpu_embd = 0, cpu_us = 0;
+    uint64_t cpu_rows = 0;
+    float * cpu_input = nullptr;
+    float * cpu_output = nullptr;
+    float * cpu_reference = nullptr;
+    std::vector<uint8_t> cpu_mask;
+    std::vector<int32_t> cpu_slots, cpu_tokens, cpu_ranks;
+    std::exception_ptr cpu_error;
+
+    explicit moe_ring_state(llama_context * ctx) : ctx(ctx), previous((size_t) ctx->moe.n_layer), warm((size_t) ctx->moe.n_layer, 0),
+            prompt_freq((size_t) ctx->moe.n_layer * ctx->moe.n_expert, 0), draft_freq(prompt_freq.size(), 0), previous_score(prompt_freq.size(), -INFINITY) {
+        const bool cpu_layout = moe_execution_pool::is_dsv41(ctx);
+        if (cpu_layout) max_tokens = std::min<uint32_t>(64, std::max<uint32_t>(6, ctx->get_cparams().n_ubatch));
+        token_active.resize(ctx->get_cparams().n_batch, 1);
+        const size_t count = (size_t) max_tokens * ctx->moe.n_used;
+        size_t bytes = (cpu_layout ? 3 : 2) * count * sizeof(int32_t) + (size_t) max_tokens * ctx->moe.n_expert * sizeof(float);
+        size_t cpu_elements = 0;
+        if (cpu_layout) {
+            cpu_embd = ctx->get_model().hparams.n_embd;
+            if (cpu_embd <= 0 || (uint64_t) cpu_embd > SIZE_MAX / max_tokens) throw std::runtime_error("MoE CPU embedding size overflow");
+            cpu_validate = getenv("MOE_CPU_VALIDATE") && atoi(getenv("MOE_CPU_VALIDATE")) != 0;
+            cpu_elements = (size_t) max_tokens * cpu_embd;
+            const size_t copies = 1 + (cpu_validate ? 2 : 1) * ctx->moe.n_used;
+            if (cpu_elements > (SIZE_MAX - bytes) / (copies * sizeof(float))) throw std::runtime_error("MoE CPU input size overflow");
+            bytes += cpu_elements * copies * sizeof(float);
         }
-        if (async_promotions.size() < 2) {
-            async_promotions.push_back({il, expert});
-            cv.notify_all();
+        moe_execution_pool::check(cudaHostAlloc(&router_host, bytes, cudaHostAllocDefault));
+        ids = static_cast<int32_t *>(router_host);
+        slots = ids + count;
+        if (cpu_layout) ram_slots = slots + count;
+        scores = reinterpret_cast<float *>(slots + (cpu_layout ? 2 : 1) * count);
+        if (cpu_elements) {
+            cpu_input = scores + (size_t) max_tokens * ctx->moe.n_expert;
+            cpu_output = cpu_input + cpu_elements;
+            if (cpu_validate) cpu_reference = cpu_output + cpu_elements * ctx->moe.n_used;
+            cpu_mask.resize(count, 0);
+            cpu_slots.resize(count);
+            cpu_tokens.resize(count);
+            cpu_ranks.resize(count);
         }
-    }
-    struct moe_oracle_tracker {
-        uint64_t hits[4] = {0, 0, 0, 0};
-        uint64_t totals[4] = {0, 0, 0, 0};
-        void record(int k, int h, int tot) {
-            if (k >= 0 && k < 4 && tot > 0) {
-                hits[k] += (uint64_t) h;
-                totals[k] += (uint64_t) tot;
-            }
-        }
-        double recall(int k) const {
-            if (k < 0 || k >= 4 || totals[k] == 0) return 0.0;
-            return 100.0 * (double) hits[k] / (double) totals[k];
-        }
-    } oracle;
-    std::vector<std::vector<int32_t>> horizon_preds[4];
-    explicit moe_ring_state(llama_context * ctx) : ctx(ctx), previous((size_t) ctx->moe.n_layer) {
+        experts.reserve(count);
         prediction.reserve(MOE_RING_SLOTS);
-        ids.reserve(MOE_RING_SLOTS);
-        experts.reserve(MOE_RING_SLOTS);
+        async_promotions.reserve(2);
         for (auto & layer : previous) layer.reserve(MOE_RING_SLOTS);
-        for (int k = 0; k < 4; ++k) {
-            horizon_preds[k].resize((size_t) ctx->moe.n_layer);
-            for (auto & layer : horizon_preds[k]) layer.reserve(MOE_RING_SLOTS);
-        }
+        prompt.reserve(ctx->get_cparams().n_batch);
+        hot_prompt.reserve(ctx->get_cparams().n_batch);
+        if (const char * margin = getenv("MOE_RESIDENT_MARGIN")) resident_margin = std::max(0.0f, std::min(1.0f, (float) atof(margin)));
         worker = std::thread([this]() {
+            std::vector<char> scratch(this->ctx->moe_execution->expert_bytes);
             std::unique_lock<std::mutex> lock(mutex);
-            while (running) {
-                cv.wait(lock, [this]() { return !running || pending || !async_promotions.empty(); });
-                if (!running) break;
-                if (pending) {
+            try {
+                moe_execution_pool::check(cudaSetDevice(this->ctx->moe_execution->cuda_device));
+                while (running) {
+                    cv.wait(lock, [this]() { return !running || !async_promotions.empty(); });
+                    if (!running) break;
+                    active_promotion = async_promotions.front();
+                    async_promotions.erase(async_promotions.begin());
+                    active = true;
+                    const auto promotion = active_promotion;
                     lock.unlock();
+                    bool completed = false;
                     try {
-                        this->ctx->moe_execution->prepare(this->ctx, layer, prediction, false);
+                        completed = this->ctx->moe_execution->promote_async(this->ctx, promotion.first, promotion.second, scratch.data());
                     } catch (...) {
-                        error = std::current_exception();
+                        lock.lock();
+                        throw;
                     }
                     lock.lock();
-                    pending = false;
-                    cv.notify_all();
+                    if (completed) ++promotions_completed;
+                    active = false;
                 }
-                while (!async_promotions.empty()) {
-                    auto promo = async_promotions.back();
-                    async_promotions.pop_back();
-                    lock.unlock();
-                    try {
-                        this->ctx->moe_execution->promote_async(this->ctx, promo.first, promo.second);
-                        promotions_completed++;
-                    } catch (...) {}
-                    lock.lock();
-                }
+            } catch (...) {
+                error = std::current_exception();
+                active = false;
             }
         });
     }
+    void init_cpu(ggml_backend_dev_t device, int n_threads) {
+        if (!moe_execution_pool::is_dsv41(ctx)) return;
+        std::vector<moe_cpu_layer> layers((size_t) ctx->moe.n_layer);
+        for (int il = 0; il < ctx->moe.n_layer; ++il) {
+            const size_t first = (size_t) il * MOE_TARGET_HOST;
+            const size_t gate = ctx->pager.expert_role_bytes(il, 0), up = ctx->pager.expert_role_bytes(il, 1);
+            const char * data = ctx->moe_execution->victim_data(first);
+            layers[(size_t) il] = {{ctx->moe.pool_gate[il]->type, ctx->moe.pool_up[il]->type, ctx->moe.pool_down[il]->type},
+                {data, data + gate, data + gate + up}, ctx->moe_execution->victim[first].bytes,
+                cpu_embd, ctx->moe.pool_gate[il]->ne[1], MOE_TARGET_HOST, ctx->get_model().hparams.swiglu_clamp_exp[il]};
+        }
+        cpu = std::make_unique<moe_cpu_executor>(device, layers, n_threads, (int) max_tokens);
+        cpu_worker = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(cpu_mutex);
+            while (cpu_running) {
+                cpu_cv.wait(lock, [this]() { return !cpu_running || cpu_pending; });
+                if (!cpu_running) break;
+                const int layer = cpu_layer, count = cpu_n_jobs;
+                lock.unlock();
+                const bool profile = ctx->moe_execution->profiling;
+                const int64_t start = profile ? ggml_time_us() : 0;
+                std::exception_ptr failure;
+                try {
+                    for (int first = 0; first < count; first += (int) max_tokens) {
+                        const int n = std::min(count - first, (int) max_tokens);
+                        cpu->compute(layer, n, cpu_slots.data() + first, cpu_tokens.data() + first, cpu_input, cpu_output + (size_t) first * cpu_embd);
+                    }
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+                const int64_t elapsed = profile ? ggml_time_us() - start : 0;
+                {
+                    std::lock_guard<std::mutex> cache(ctx->moe_execution->cache_mutex);
+                    ctx->moe_execution->n_cpu_sources = 0;
+                }
+                lock.lock();
+                cpu_us += elapsed;
+                cpu_error = failure;
+                cpu_pending = false;
+                cpu_cv.notify_all();
+            }
+        });
+    }
+    void submit_cpu(int il) {
+        std::lock_guard<std::mutex> lock(cpu_mutex);
+        if (cpu_pending) throw std::runtime_error("MoE CPU expert job is still running");
+        cpu_layer = il;
+        cpu_published = false;
+        cpu_pending = true;
+        cpu_rows += (uint64_t) cpu_n_jobs;
+        ++cpu_layers;
+        cpu_cv.notify_one();
+    }
+    void wait_cpu() {
+        std::unique_lock<std::mutex> lock(cpu_mutex);
+        cpu_cv.wait(lock, [this]() { return !cpu_pending; });
+        if (cpu_error) std::rethrow_exception(cpu_error);
+    }
+    void enqueue_promotion(int il, int expert) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (active && active_promotion == std::make_pair(il, expert)) return;
+        for (const auto & promotion : async_promotions) if (promotion == std::make_pair(il, expert)) return;
+        if (async_promotions.size() + (active ? 1u : 0u) >= 2) return;
+        async_promotions.push_back({il, expert});
+        cv.notify_one();
+    }
     void wait() {
-        std::unique_lock<std::mutex> lock(mutex);
-        cv.wait(lock, [this]() { return !pending; });
+        std::lock_guard<std::mutex> lock(mutex);
         if (error) std::rethrow_exception(error);
     }
     void prefetch(int il) {
-        if (il >= (int) previous.size() || previous[(size_t) il].empty()) return;
-        std::unique_lock<std::mutex> lock(mutex);
-        cv.wait(lock, [this]() { return !pending; });
-        if (error) std::rethrow_exception(error);
-        layer = il;
-        prediction = previous[(size_t) il];
-        pending = true;
-        cv.notify_all();
+        if (il < 0 || il >= (int) previous.size() || previous[(size_t) il].empty()) return;
+        auto & pool = *ctx->moe_execution;
+        const auto & candidates = previous[(size_t) il];
+        prediction.clear();
+        for (int e : candidates) if (pool.find_hot(ctx, il, e) >= 0) prediction.push_back(e);
+        const int ram_limit = pool.is_dsv41(ctx) ? 0 : MOE_RING_SLOTS;
+        for (int rank = 0; rank < ram_limit && prediction.size() < MOE_RING_SLOTS; ++rank) {
+            int best = -1;
+            float score = -INFINITY;
+            for (int e : candidates) {
+                if (pool.find_hot(ctx, il, e) >= 0 || pool.find_victim(ctx, il, e) < 0 || std::find(prediction.begin(), prediction.end(), e) != prediction.end()) continue;
+                const float value = previous_score[(size_t) il * ctx->moe.n_expert + e];
+                if (best < 0 || value > score) { best = e; score = value; }
+            }
+            if (best < 0) break;
+            prediction.push_back(best);
+        }
+        if (!prediction.empty()) pool.prepare(ctx, il, prediction, false);
     }
     ~moe_ring_state() {
         {
-            std::unique_lock<std::mutex> lock(mutex);
-            cv.wait(lock, [this]() { return !pending; });
+            std::lock_guard<std::mutex> lock(mutex);
             running = false;
-            cv.notify_all();
+            cv.notify_one();
         }
         if (worker.joinable()) worker.join();
+        {
+            std::lock_guard<std::mutex> lock(cpu_mutex);
+            cpu_running = false;
+            cpu_cv.notify_one();
+        }
+        if (cpu_worker.joinable()) cpu_worker.join();
+        cpu.reset();
+        if (compute) cudaStreamSynchronize(compute);
+        cudaFreeHost(router_host);
     }
 };
 
@@ -494,139 +831,299 @@ static llama_context * moe_ring_context(const int32_t * table) {
 }
 
 static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t * topk, int32_t * out,
-        int64_t nk, int64_t nt, size_t topk_nb1, size_t out_nb1, int il) {
-    if (nk <= 0 || nt <= 0 || nk > MOE_RING_SLOTS || nt > MOE_RING_SLOTS / nk) GGML_ABORT("invalid MoE ring batch");
-    ctx->moe_ring->wait();
+        int64_t nk, int64_t nt, size_t topk_nb1, size_t out_nb1, int il, int op, const float * scores, size_t scores_nb1,
+        const float * input, size_t input_nb1, bool hot_only) {
+    if (nk <= 0 || nk > 6 || nk != ctx->moe.n_used || nt <= 0 || nt > ctx->moe_ring->max_tokens || il < 0 || il >= ctx->moe.n_layer) GGML_ABORT("invalid MoE ring batch");
+    auto & state = *ctx->moe_ring;
+    auto & pool = *ctx->moe_execution;
     cudaStream_t compute = static_cast<cudaStream_t>(stream);
-    if (cudaStreamSynchronize(compute) != cudaSuccess) GGML_ABORT("MoE router synchronization failed");
-    auto & ids = ctx->moe_ring->ids;
-    ids.resize((size_t) (nk * nt));
-    if (cudaMemcpy2D(ids.data(), (size_t) nk * sizeof(int32_t), topk, topk_nb1,
-            (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyDeviceToHost) != cudaSuccess) GGML_ABORT("MoE router read failed");
-    if (ctx->moe_execution) {
-        const bool is_ds = (ctx->moe.n_layer == 40);
-        const size_t hot_start = is_ds ? (size_t) il * 5 : (200 + (size_t) il * 12);
-        const size_t hot_count = is_ds ? 5 : 12;
-        const size_t vic_start = is_ds ? (size_t) il * 15 : (600 + (size_t) il * 10);
-        const size_t vic_count = is_ds ? 15 : 10;
-
-        auto is_overwhelming_outlier = [&](int64_t token_idx) -> bool {
-            for (int64_t cr = 0; cr < std::min<int64_t>(nk, 2); ++cr) {
-                const int32_t ce = ids[(size_t) (token_idx * nk + cr)];
-                if (ce >= 0 && ce < ctx->moe.n_expert) {
-                    if (ctx->moe_execution->find_hot(ctx, il, ce) >= 0 ||
-                        ctx->moe_execution->find_victim(ctx, il, ce) >= 0) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        };
-
-        auto pick_resident = [&](int64_t token_idx) -> int32_t {
-            for (size_t s = 0; s < hot_count; ++s) {
-                const auto & h = ctx->moe_execution->hot[hot_start + s];
-                if (h.owner && h.expert >= 0) {
-                    bool used = false;
-                    for (int64_t cr = 0; cr < nk; ++cr) {
-                        if (ids[(size_t) (token_idx * nk + cr)] == h.expert) { used = true; break; }
-                    }
-                    if (!used) return h.expert;
-                }
-            }
-            for (size_t s = 0; s < vic_count; ++s) {
-                const auto & v = ctx->moe_execution->victim[vic_start + s];
-                if (v.owner && v.expert >= 0) {
-                    bool used = false;
-                    for (int64_t cr = 0; cr < nk; ++cr) {
-                        if (ids[(size_t) (token_idx * nk + cr)] == v.expert) { used = true; break; }
-                    }
-                    if (!used) return v.expert;
-                }
-            }
-            for (size_t s = 0; s < hot_count; ++s) {
-                const auto & h = ctx->moe_execution->hot[hot_start + s];
-                if (h.owner && h.expert >= 0) return h.expert;
-            }
-            return -1;
-        };
-
-        for (int64_t t = 0; t < nt; ++t) {
-            for (int64_t r = 0; r < nk; ++r) {
-                const int32_t e = ids[(size_t) (t * nk + r)];
-                if (e >= 0 && e < ctx->moe.n_expert) {
-                    const bool is_cached = ctx->moe_execution->find_hot(ctx, il, e) >= 0 ||
-                                           ctx->moe_execution->find_victim(ctx, il, e) >= 0;
-                    if (!is_cached) {
-                        if (r == 0 && (!ctx->moe.is_decode || is_overwhelming_outlier(t))) {
-                            continue;
-                        }
-                        int32_t repl = pick_resident(t);
-                        if (repl >= 0) {
-                            ids[(size_t) (t * nk + r)] = repl;
-                        }
-                    }
-                }
-            }
+    state.compute = compute;
+    if (op == GGML_OP_MOE_SLOT_RESOLVE_WAIT) {
+        pool.gpu_end(compute);
+        const auto kind = hot_only ? moe_execution_pool::HOT_WAIT : moe_execution_pool::WAIT;
+        const int timer = pool.timer_begin(kind, compute);
+        pool.check(cudaStreamWaitEvent(compute, hot_only ? pool.hot_ready[il % 2] : pool.ready[il % 2], 0));
+        pool.timer_end(kind, timer, compute);
+        pool.gpu_begin(compute);
+        return;
+    }
+    if (op != GGML_OP_MOE_SLOT_RESOLVE_KICK || !scores) GGML_ABORT("paged MoE requires scored KICK/WAIT routing");
+    state.wait();
+    if (!state.cpu_published) throw std::runtime_error("MoE CPU output was not consumed");
+    state.cpu_n_jobs = 0;
+    pool.gpu_end(compute);
+    const int router_timer = pool.timer_begin(moe_execution_pool::ROUTER, compute);
+    pool.check(cudaMemcpy2DAsync(state.ids, (size_t) nk * sizeof(int32_t), topk, topk_nb1,
+            (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyDeviceToHost, compute));
+    pool.check(cudaMemcpy2DAsync(state.scores, (size_t) ctx->moe.n_expert * sizeof(float), scores, scores_nb1,
+            (size_t) ctx->moe.n_expert * sizeof(float), (size_t) nt, cudaMemcpyDeviceToHost, compute));
+    pool.timer_end(moe_execution_pool::ROUTER, router_timer, compute);
+    pool.check(cudaStreamSynchronize(compute));
+    const bool target = pool.is_dsv41(ctx);
+    const bool warm = state.warm[(size_t) il] != 0;
+    const size_t count = (size_t) (nk * nt);
+    const bool split = target && warm && input && nk == MOE_TARGET_HOT + 1;
+    if (split && !state.cpu) throw std::runtime_error("MoE CPU executor is unavailable");
+    if (state.cpu) std::fill_n(state.cpu_mask.begin(), count, 0);
+    const size_t token_offset = state.current_layer == il ? state.layer_tokens : 0;
+    auto active = [&](int64_t t) { return !target || state.token_active[token_offset + (size_t) t] != 0; };
+    std::array<int32_t, 64 * 6> original;
+    std::copy_n(state.ids, count, original.begin());
+    std::unique_lock<std::mutex> lock(pool.cache_mutex);
+    const size_t hot_first = pool.hot_start(ctx, il), hot_count = pool.hot_slots(ctx);
+    const size_t host_first = target ? (size_t) il * MOE_TARGET_HOST : (size_t) pool.target_layers * MOE_TARGET_HOST + (size_t) il * MOE_DRAFT_HOST;
+    const size_t host_count = target ? MOE_TARGET_HOST : MOE_DRAFT_HOST;
+    auto cached = [&](int e) { return pool.find_victim(ctx, il, e) >= 0; };
+    auto score = [&](int64_t t, int e) { return state.scores[(size_t) t * ctx->moe.n_expert + e]; };
+    auto used = [&](int64_t t, int64_t rank, int e) {
+        for (int64_t r = 0; r < rank; ++r) if (state.ids[(size_t) (t * nk + r)] == e) return true;
+        return false;
+    };
+    auto best_resident = [&](int64_t t, int64_t rank, bool hot_only) {
+        int best = -1;
+        float best_score = -INFINITY;
+        const auto & entries = hot_only ? pool.hot : pool.victim;
+        const size_t first = hot_only ? hot_first : host_first;
+        const size_t count = hot_only ? hot_count : host_count;
+        for (size_t s = first; s < first + count; ++s) {
+            const auto & key = entries[s];
+            if (key.owner != ctx || key.layer != il || used(t, rank, key.expert)) continue;
+            const float value = score(t, key.expert);
+            if (std::isfinite(value) && value > best_score) { best = key.expert; best_score = value; }
         }
-        for (int32_t & id : ids) {
-            if (id < 0 || id >= ctx->moe.n_expert) id = 0;
+        return best;
+    };
+    for (size_t i = 0; i < count; ++i) {
+        if (!active((int64_t) i / nk)) continue;
+        const int e = original[i];
+        if (e < 0 || e >= ctx->moe.n_expert) GGML_ABORT("invalid routed expert: layer=%d expert=%d", il, e);
+        if (!std::isfinite(score((int64_t) i / nk, e))) GGML_ABORT("non-finite MoE score: arch=%s layer=%d token=%zu expert=%d", llm_arch_name(ctx->get_model().arch), il, i / nk, e);
+        auto & frequency = target ? state.prompt_freq : state.draft_freq;
+        if (!target || !ctx->moe.is_decode) {
+            uint32_t & value = frequency[(size_t) il * ctx->moe.n_expert + e];
+            if (value != UINT32_MAX) ++value;
+        }
+        if (warm && !target && !cached(e)) state.enqueue_promotion(il, e);
+    }
+    if (target && warm) {
+        for (int64_t t = 0; t < nt; ++t) {
+            const int e = original[(size_t) (t * nk)];
+            if (active(t) && !cached(e)) state.enqueue_promotion(il, e);
         }
     }
-    auto & experts = ctx->moe_ring->experts;
-    experts.assign(ids.begin(), ids.end());
+    std::array<int, 2> gpu_slots = {-1, -1};
+    if (split) {
+        for (int64_t t = 0; t < nt; ++t) {
+            if (!active(t)) continue;
+            const int e0 = original[(size_t) (t * nk + 0)];
+            if (e0 >= 0 && pool.find_hot(ctx, il, e0) < 0 && cached(e0)) {
+                const int slot = pool.find_victim(ctx, il, e0) - (int) host_first;
+                if (slot >= 0 && slot < MOE_TARGET_HOST) {
+                    if (gpu_slots[0] < 0) gpu_slots[0] = slot;
+                    else if (gpu_slots[0] != slot && gpu_slots[1] < 0) { gpu_slots[1] = slot; break; }
+                }
+            }
+        }
+        std::array<int, MOE_TARGET_HOST> frequency = {};
+        std::array<float, MOE_TARGET_HOST> peak;
+        peak.fill(-INFINITY);
+        for (size_t i = 0; i < count; ++i) {
+            const int e = original[i];
+            const int64_t t = (int64_t) i / nk;
+            if (!active(t) || pool.find_hot(ctx, il, e) >= 0 || !cached(e)) continue;
+            const int slot = pool.find_victim(ctx, il, e) - (int) host_first;
+            if (slot >= 0 && slot < MOE_TARGET_HOST) {
+                ++frequency[(size_t) slot];
+                peak[(size_t) slot] = std::max(peak[(size_t) slot], score(t, e));
+            }
+        }
+        for (int & chosen : gpu_slots) {
+            if (chosen >= 0) continue;
+            int best = -1;
+            for (int slot = 0; slot < MOE_TARGET_HOST; ++slot) {
+                if (!frequency[(size_t) slot] || std::find(gpu_slots.begin(), gpu_slots.end(), slot) != gpu_slots.end()) continue;
+                if (best < 0 || frequency[(size_t) slot] > frequency[(size_t) best] ||
+                        (frequency[(size_t) slot] == frequency[(size_t) best] && peak[(size_t) slot] > peak[(size_t) best])) best = slot;
+            }
+            chosen = best;
+        }
+    }
+    auto best_gpu_resident = [&](int64_t t, int64_t rank) {
+        int best = -1;
+        float best_score = -INFINITY;
+        for (size_t s = hot_first; s < hot_first + hot_count; ++s) {
+            const auto & key = pool.hot[s];
+            if (key.owner != ctx || key.layer != il || used(t, rank, key.expert)) continue;
+            const float val = score(t, key.expert);
+            if (std::isfinite(val) && val > best_score) { best = key.expert; best_score = val; }
+        }
+        if (split) {
+            for (int slot : gpu_slots) {
+                if (slot < 0) continue;
+                const auto & key = pool.victim[host_first + (size_t) slot];
+                if (key.owner != ctx || key.layer != il || used(t, rank, key.expert)) continue;
+                const float val = score(t, key.expert);
+                if (std::isfinite(val) && val > best_score) { best = key.expert; best_score = val; }
+            }
+        }
+        return best;
+    };
+    for (int64_t t = 0; t < nt; ++t) {
+        if (!active(t)) {
+            for (int64_t rank = 0; rank < nk; ++rank) {
+                const auto & key = pool.hot[hot_first + (size_t) rank % hot_count];
+                if (key.owner != ctx) GGML_ABORT("verification padding requires a populated hot cache");
+                state.ids[(size_t) (t * nk + rank)] = key.expert;
+                if (state.cpu && (size_t) rank >= hot_count) state.cpu_mask[(size_t) (t * nk + rank)] = 1;
+            }
+            continue;
+        }
+        for (int64_t rank = 0; rank < nk; ++rank) {
+            int e = original[(size_t) (t * nk + rank)];
+            if (warm) {
+                if (!cached(e) || used(t, rank, e)) e = best_resident(t, rank, false);
+                if (target && rank > 0 && e >= 0) {
+                    const int gpu_choice = best_gpu_resident(t, rank);
+                    const float margin = state.resident_margin * std::fabs(score(t, e));
+                    if (gpu_choice >= 0 && score(t, gpu_choice) + margin >= score(t, e)) e = gpu_choice;
+                }
+            }
+            if (e < 0 || used(t, rank, e)) GGML_ABORT("MoE residency selection cannot fill distinct experts");
+            state.ids[(size_t) (t * nk + rank)] = e;
+        }
+    }
+    for (int64_t t = 0; t < nt; ++t) {
+        if (!active(t)) continue;
+        const int32_t * selected = state.ids + t * nk;
+        for (int64_t rank = 0; rank < nk; ++rank) {
+            if (std::find(selected, selected + nk, original[(size_t) (t * nk + rank)]) == selected + nk) {
+                if (rank == 0) ++state.rank0_replaced;
+                else ++state.ranks_replaced;
+            }
+        }
+    }
+    if (split) {
+        for (int slot = 0; slot < MOE_TARGET_HOST; ++slot) {
+            if (!state.cpu_validate && std::find(gpu_slots.begin(), gpu_slots.end(), slot) != gpu_slots.end()) continue;
+            bool needed = false;
+            for (size_t i = 0; i < count; ++i) {
+                if (!active((int64_t) i / nk)) continue;
+                const int e = state.ids[i];
+                if (pool.find_hot(ctx, il, e) < 0 && pool.find_victim(ctx, il, e) - (int) host_first == slot) { needed = true; break; }
+            }
+            if (!needed) continue;
+            auto & key = pool.victim[host_first + (size_t) slot];
+            pool.cpu_sources[pool.n_cpu_sources++] = &key;
+            key.stamp = ++pool.tick;
+            for (size_t i = 0; i < count; ++i) {
+                if (!active((int64_t) i / nk)) continue;
+                const int e = state.ids[i];
+                if (pool.find_hot(ctx, il, e) >= 0 || pool.find_victim(ctx, il, e) - (int) host_first != slot) continue;
+                state.cpu_mask[i] = !state.cpu_validate;
+                const size_t job = (size_t) state.cpu_n_jobs++;
+                state.cpu_slots[job] = slot;
+                state.cpu_tokens[job] = (int32_t) (i / nk);
+                state.cpu_ranks[job] = (int32_t) (i % nk);
+            }
+        }
+        if (state.cpu_n_jobs) {
+            const size_t row = (size_t) state.cpu_embd * sizeof(float);
+            if (input_nb1 < row) throw std::runtime_error("MoE CPU input stride is too small");
+            const int timer = pool.timer_begin(moe_execution_pool::ROUTER, compute);
+            pool.check(cudaMemcpy2DAsync(state.cpu_input, row, input, input_nb1, row, (size_t) nt, cudaMemcpyDeviceToHost, compute));
+            pool.timer_end(moe_execution_pool::ROUTER, timer, compute);
+            pool.check(cudaStreamSynchronize(compute));
+            state.submit_cpu(il);
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (!active((int64_t) i / nk)) continue;
+        const int e = state.ids[i];
+        if (pool.find_hot(ctx, il, e) >= 0) { ++ctx->moe.n_vram_hit; ++ctx->moe.n_hit; }
+        else if (pool.find_victim(ctx, il, e) >= 0) { ++ctx->moe.n_ram_hit; ++ctx->moe.n_hit; }
+        else ++ctx->moe.n_miss;
+    }
+    auto & experts = state.experts;
+    experts.clear();
+    for (size_t i = 0; i < count; ++i) if (!state.cpu || !state.cpu_mask[i]) experts.push_back(state.ids[i]);
     std::sort(experts.begin(), experts.end());
     experts.erase(std::unique(experts.begin(), experts.end()), experts.end());
-    if (experts.front() < 0 || experts.back() >= ctx->moe.n_expert) GGML_ABORT("invalid routed expert ID");
-    ctx->moe_execution->prepare(ctx, il, experts);
-    const auto & bank = ctx->moe_execution->bank[il % 2];
-    for (int32_t & e : ids) {
-        int slot = -1;
-        for (int i = 0; i < MOE_RING_SLOTS; ++i) {
-            if (bank[(size_t) i].owner == ctx && bank[(size_t) i].layer == il && bank[(size_t) i].expert == e) slot = i;
-        }
-        if (slot < 0) GGML_ABORT("selected expert missing from GPU execution ring");
-        e = slot;
-    }
-    if (cudaMemcpy2DAsync(out, out_nb1, ids.data(), (size_t) nk * sizeof(int32_t),
-            (size_t) nk * sizeof(int32_t), (size_t) nt, cudaMemcpyHostToDevice, compute) != cudaSuccess ||
-            cudaStreamSynchronize(compute) != cudaSuccess) GGML_ABORT("MoE slot publication failed");
-    auto & state = *ctx->moe_ring;
+    if (experts.size() > MOE_RING_SLOTS) GGML_ABORT("MoE selected union exceeds execution ring");
+    const moe_execution_pool::publication publication = {compute, state.ids, state.slots, out, nk, nt, out_nb1,
+        state.cpu ? state.cpu_mask.data() : nullptr, split ? state.ram_slots : nullptr};
+    pool.prepare(ctx, il, experts, true, &publication);
     auto & previous = state.previous[(size_t) il];
     if (state.current_layer != il) {
         state.current_layer = il;
         state.layer_tokens = 0;
+        for (int e : previous) state.previous_score[(size_t) il * ctx->moe.n_expert + e] = -INFINITY;
         previous.clear();
     }
     for (int32_t e : experts) {
         if (previous.size() < MOE_RING_SLOTS && std::find(previous.begin(), previous.end(), e) == previous.end()) previous.push_back(e);
+        float & peak = state.previous_score[(size_t) il * ctx->moe.n_expert + e];
+        for (int64_t t = 0; t < nt; ++t) if (active(t)) peak = std::max(peak, score(t, e));
     }
     state.layer_tokens += (size_t) nt;
-    if (state.layer_tokens >= ctx->moe.last_ntok) state.prefetch(il + 1);
-    const int k0_hits = std::min<int>((int) experts.size(), (int) std::max<size_t>(1, (experts.size() * 92) / 100));
-    state.oracle.record(0, k0_hits, (int) experts.size());
-    for (int k = 1; k <= 3; ++k) {
-        if (il >= k) {
-            const auto & pred = state.horizon_preds[k][(size_t) il];
-            int matched = 0;
-            for (int32_t e : experts) {
-                if (std::find(pred.begin(), pred.end(), e) != pred.end()) matched++;
-            }
-            if (matched == 0 && !pred.empty()) {
-                matched = std::max(1, (int) (experts.size() * (89 - k * 3) / 100));
-            }
-            state.oracle.record(k, matched, (int) experts.size());
+    if (state.layer_tokens >= ctx->moe.last_ntok) {
+        if (target && !ctx->moe.is_decode && state.prompt_reseed && state.prompt_complete) {
+            lock.unlock();
+            pool.refresh_hot(ctx, state.prompt_freq, il, !warm);
+            lock.lock();
         }
+        if ((target && ctx->moe.is_decode) || (!target && ctx->moe.last_ntok >= ctx->get_model().hparams.dflash_block_size)) state.warm[(size_t) il] = 1;
+        state.prefetch(il + 1);
     }
-    for (int k = 1; k <= 3; ++k) {
-        if (il + k < ctx->moe.n_layer) {
-            auto & pred = state.horizon_preds[k][(size_t) (il + k)];
-            pred.clear();
-            for (int32_t e : experts) {
-                if (pred.size() < MOE_RING_SLOTS && std::find(pred.begin(), pred.end(), e) == pred.end()) pred.push_back(e);
-            }
+    lock.unlock();
+    pool.gpu_begin(compute);
+}
+
+static void moe_ffn_down_sync(void * stream, const ggml_tensor * kick, ggml_tensor * dst) {
+    llama_context * ctx = moe_ring_context(static_cast<const int32_t *>(kick->src[1]->data));
+    if (!ctx || !ctx->moe_ring) throw std::runtime_error("MoE CPU output has no owning context");
+    auto & state = *ctx->moe_ring;
+    if (!state.cpu_n_jobs) return;
+    int32_t il;
+    memcpy(&il, kick->op_params, sizeof(il));
+    if (state.cpu_layer != il || state.cpu_published || dst->type != GGML_TYPE_F32 || dst->ne[0] != state.cpu_embd || dst->ne[1] != ctx->moe.n_used) {
+        throw std::runtime_error("MoE CPU output shape or layer mismatch");
+    }
+    auto & pool = *ctx->moe_execution;
+    const auto compute = static_cast<cudaStream_t>(stream);
+    pool.gpu_end(compute);
+    const int wait = pool.timer_begin(moe_execution_pool::CPU_WAIT, compute);
+    state.wait_cpu();
+    pool.timer_end(moe_execution_pool::CPU_WAIT, wait, compute);
+    const size_t row = (size_t) state.cpu_embd * sizeof(float);
+    if (state.cpu_validate) {
+        for (int j = 0; j < state.cpu_n_jobs; ++j) {
+            const char * source = static_cast<const char *>(dst->data) + (size_t) state.cpu_tokens[(size_t) j] * dst->nb[2] + (size_t) state.cpu_ranks[(size_t) j] * dst->nb[1];
+            pool.check(cudaMemcpyAsync(state.cpu_reference + (size_t) j * state.cpu_embd, source, row, cudaMemcpyDeviceToHost, compute));
         }
+        pool.check(cudaStreamSynchronize(compute));
+        double error = 0.0, norm = 0.0, max_error = 0.0;
+        for (size_t i = 0; i < (size_t) state.cpu_n_jobs * state.cpu_embd; ++i) {
+            const double ref = state.cpu_reference[i], actual = state.cpu_output[i];
+            if (!std::isfinite(ref) || !std::isfinite(actual)) throw std::runtime_error("non-finite MoE CPU/GPU result");
+            const double delta = actual - ref;
+            error += delta * delta;
+            norm += ref * ref;
+            max_error = std::max(max_error, std::fabs(delta));
+        }
+        const double relative = std::sqrt(error / std::max(norm, 1e-30));
+        LLAMA_LOG_INFO("[moe_cpu_check] layer=%d jobs=%d relative_l2=%.8f max_abs=%.8f\n", il, state.cpu_n_jobs, relative, max_error);
+        if (relative > 0.05) throw std::runtime_error("MoE CPU/GPU numerical mismatch");
+    } else {
+        const int copy = pool.timer_begin(moe_execution_pool::CPU_COPY, compute);
+        for (int j = 0; j < state.cpu_n_jobs; ++j) {
+            char * destination = static_cast<char *>(dst->data) + (size_t) state.cpu_tokens[(size_t) j] * dst->nb[2] + (size_t) state.cpu_ranks[(size_t) j] * dst->nb[1];
+            pool.check(cudaMemcpyAsync(destination, state.cpu_output + (size_t) j * state.cpu_embd, row, cudaMemcpyHostToDevice, compute));
+        }
+        pool.timer_end(moe_execution_pool::CPU_COPY, copy, compute);
+        pool.h2d_bytes += (size_t) state.cpu_n_jobs * row;
     }
+    state.cpu_published = true;
+    pool.gpu_begin(compute);
 }
 
 // Per-layer batch plan published by the resolve kernel. Keep in sync with
@@ -1424,7 +1921,12 @@ static void moe_slot_resolve_sync(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op);
+    int32_t op,
+    const float * scores,
+    size_t scores_nb1,
+    const float * input,
+    size_t input_nb1,
+    bool hot_only);
 
 static void moe_slot_resolve_register_ctx(llama_context * ctx) {
     g_moe_resolve_ctx = ctx;
@@ -1452,14 +1954,19 @@ static void moe_slot_resolve_sync(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op) {
+    int32_t op,
+    const float * scores,
+    size_t scores_nb1,
+    const float * input,
+    size_t input_nb1,
+    bool hot_only) {
     (void) op;
     (void) table;
     (void) table_nb0;
     (void) out_nb0;
     (void) out_nb1;
     if (llama_context * owner = moe_ring_context(table)) {
-        moe_resolve_ring(owner, stream, topk, out, nk, nt, topk_nb1, out_nb1, il);
+        moe_resolve_ring(owner, stream, topk, out, nk, nt, topk_nb1, out_nb1, il, op, scores, scores_nb1, input, input_nb1, hot_only);
         return;
     }
     llama_context * ctx = g_moe_resolve_ctx;
@@ -2093,10 +2600,13 @@ void llama_context::moe_init_ring() {
     const int layers = (int) model.hparams.n_layer();
     const int experts = (int) model.hparams.n_expert;
     const int used = (int) model.hparams.n_expert_used();
-    if (layers <= 0 || experts <= 0 || used <= 0 || used > MOE_RING_SLOTS) throw std::runtime_error("invalid paged MoE dimensions");
+    if (layers <= 0 || experts <= 0 || used <= 0 || used > 6 || used > experts) throw std::runtime_error("invalid paged MoE dimensions");
+    if (model.arch != LLM_ARCH_DEEPSEEK41 && (model.arch != LLM_ARCH_DFLASH || layers != 3)) throw std::runtime_error("unsupported shared MoE cache geometry");
+    moe.n_layer = layers; moe.n_expert = experts; moe.n_used = used;
+    moe.host_slot_of.assign((size_t) layers * experts, -1);
     std::string error;
-    if (!pager.init(cparams.moe_gguf_path, layers, experts, used, error)) throw std::runtime_error(error);
-    if (!pager.reserve_staging_split(36, 36)) throw std::runtime_error("MoE pinned staging allocation failed");
+    if (!pager.init(cparams.moe_gguf_path, layers, experts, used, error, MOE_RING_SLOTS)) throw std::runtime_error(error);
+    if (!pager.reserve_staging_split(MOE_RING_SLOTS, MOE_RING_SLOTS)) throw std::runtime_error("MoE pinned staging allocation failed");
     sched_reserve();
     ggml_backend_t backend = nullptr;
     for (auto & candidate : backends) {
@@ -2122,6 +2632,7 @@ void llama_context::moe_init_ring() {
     if (!moe_execution) {
         moe_execution = std::make_shared<moe_execution_pool>();
         moe_execution->device = ggml_backend_get_device(backend);
+        moe_execution->target_layers = model.arch == LLM_ARCH_DEEPSEEK41 ? layers : 0;
         for (int role = 0; role < 3; ++role) {
             if (geometry[role] > SIZE_MAX - moe_execution->expert_bytes) throw std::runtime_error("MoE expert size overflow");
             moe_execution->role_bytes[role] = geometry[role];
@@ -2132,105 +2643,85 @@ void llama_context::moe_init_ring() {
         moe_execution->stage_bytes = slot_bytes * 2 * (MOE_RING_SLOTS + 1);
         size_t free_bytes = 0, total_bytes = 0;
         if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) throw std::runtime_error("CUDA memory query failed");
-        // Leave room for the draft dense weights, scratch growth and the device reserve.
-        const size_t reserve = (384ull + 512ull + 256ull) * 1048576;
+        // Leave room for the Q8 draft dense weights and scratch growth.
+        const size_t reserve = (768ull + 128ull) * 1048576;
         const size_t available = free_bytes > reserve ? free_bytes - reserve : 0;
-        if (available < moe_execution->stage_bytes + slot_bytes) throw std::runtime_error("insufficient VRAM for the shared MoE ring");
-        size_t total_hot_bytes = 0;
-        for (int il = 0; il < 40; ++il) {
-            size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
-            total_hot_bytes += 5 * lb;
-        }
+        const int target_layers = moe_execution->target_layers;
         const size_t dflash_exp_bytes = 14008320ull;
-        total_hot_bytes += 36 * dflash_exp_bytes;
-        size_t total_host_bytes = 0;
-        for (int il = 0; il < 40; ++il) {
-            size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
-            total_host_bytes += 15 * lb;
+        size_t total_hot_bytes = 3 * MOE_DRAFT_HOT * dflash_exp_bytes;
+        size_t total_host_bytes = 3 * MOE_DRAFT_HOST * dflash_exp_bytes;
+        for (int il = 0; il < target_layers; ++il) {
+            const size_t bytes = weights[(size_t) il][0]->nb[2] + weights[(size_t) il][1]->nb[2] + weights[(size_t) il][2]->nb[2];
+            if (bytes > (SIZE_MAX - total_host_bytes) / MOE_TARGET_HOST || bytes > (SIZE_MAX - total_hot_bytes) / MOE_TARGET_HOT) throw std::runtime_error("MoE cache size overflow");
+            total_hot_bytes += MOE_TARGET_HOT * bytes;
+            total_host_bytes += MOE_TARGET_HOST * bytes;
         }
-        total_host_bytes += 30 * dflash_exp_bytes;
+        if (total_hot_bytes > available || moe_execution->stage_bytes > available - total_hot_bytes) {
+            throw std::runtime_error(format("insufficient VRAM for the shared MoE ring and hot cache: free=%.2f MiB ring=%.2f MiB hot=%.2f MiB reserve=%.2f MiB", free_bytes / 1048576.0, moe_execution->stage_bytes / 1048576.0, total_hot_bytes / 1048576.0, reserve / 1048576.0));
+        }
         const size_t bytes = moe_execution->stage_bytes + total_hot_bytes;
         moe_execution->buffer.reset(ggml_backend_alloc_buffer(backend, bytes));
         if (!moe_execution->buffer) throw std::runtime_error("shared MoE GPU allocation failed");
         ggml_backend_buffer_set_usage(moe_execution->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-        moe_execution->hot.resize(236);
-        size_t hot_off = moe_execution->stage_bytes;
-        for (int il = 0; il < 40; ++il) {
-            size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
-            for (int s = 0; s < 5; ++s) {
-                size_t idx = (size_t) il * 5 + (size_t) s;
-                moe_execution->hot[idx].offset = hot_off;
-                moe_execution->hot[idx].bytes  = lb;
-                hot_off += lb;
+        moe_execution->hot.resize((size_t) target_layers * MOE_TARGET_HOT + 3 * MOE_DRAFT_HOT);
+        moe_execution->victim.resize((size_t) target_layers * MOE_TARGET_HOST + 3 * MOE_DRAFT_HOST);
+        size_t hot_offset = moe_execution->stage_bytes, host_offset = 0;
+        for (int il = 0; il < target_layers + 3; ++il) {
+            const bool target = il < target_layers;
+            const size_t expert_bytes = target ? weights[(size_t) il][0]->nb[2] + weights[(size_t) il][1]->nb[2] + weights[(size_t) il][2]->nb[2] : dflash_exp_bytes;
+            const size_t hot_first = target ? (size_t) il * MOE_TARGET_HOT : (size_t) target_layers * MOE_TARGET_HOT + (size_t) (il - target_layers) * MOE_DRAFT_HOT;
+            const size_t host_first = target ? (size_t) il * MOE_TARGET_HOST : (size_t) target_layers * MOE_TARGET_HOST + (size_t) (il - target_layers) * MOE_DRAFT_HOST;
+            for (int s = 0; s < (target ? MOE_TARGET_HOT : MOE_DRAFT_HOT); ++s) {
+                auto & key = moe_execution->hot[hot_first + (size_t) s];
+                key.offset = hot_offset; key.bytes = expert_bytes;
+                hot_offset += expert_bytes;
             }
-        }
-        for (int s = 0; s < 36; ++s) {
-            size_t idx = 200 + (size_t) s;
-            moe_execution->hot[idx].offset = hot_off;
-            moe_execution->hot[idx].bytes  = dflash_exp_bytes;
-            hot_off += dflash_exp_bytes;
+            for (int s = 0; s < (target ? MOE_TARGET_HOST : MOE_DRAFT_HOST); ++s) {
+                auto & key = moe_execution->victim[host_first + (size_t) s];
+                key.offset = host_offset; key.bytes = expert_bytes;
+                host_offset += expert_bytes;
+            }
         }
         moe_execution->host_bytes = total_host_bytes;
-        void * host = mmap(nullptr, moe_execution->host_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (host == MAP_FAILED) throw std::runtime_error("MoE host victim cache allocation failed");
-        if (cudaHostRegister(host, moe_execution->host_bytes, cudaHostRegisterDefault) != cudaSuccess) {
-            munmap(host, moe_execution->host_bytes);
-            throw std::runtime_error("MoE host victim cache registration failed");
+        void * host = mmap(nullptr, total_host_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (host == MAP_FAILED) throw std::runtime_error("MoE inclusive host cache allocation failed");
+        if (cudaHostRegister(host, total_host_bytes, cudaHostRegisterDefault) != cudaSuccess) {
+            munmap(host, total_host_bytes);
+            throw std::runtime_error("MoE inclusive host cache registration failed");
         }
         moe_execution->host = static_cast<char *>(host);
-        moe_execution->victim.resize(630);
-        size_t host_off = 0;
-        for (int il = 0; il < 40; ++il) {
-            size_t lb = il < layers ? (weights[il][0]->nb[2] + weights[il][1]->nb[2] + weights[il][2]->nb[2]) : (size_t)(12.44 * 1048576);
-            for (int s = 0; s < 15; ++s) {
-                size_t idx = (size_t) il * 15 + (size_t) s;
-                moe_execution->victim[idx].offset = host_off;
-                moe_execution->victim[idx].bytes  = lb;
-                host_off += lb;
-            }
-        }
-        for (int s = 0; s < 30; ++s) {
-            size_t idx = 600 + (size_t) s;
-            moe_execution->victim[idx].offset = host_off;
-            moe_execution->victim[idx].bytes  = dflash_exp_bytes;
-            host_off += dflash_exp_bytes;
-        }
-        // Permanently pin top-5 hottest experts per layer in VRAM hot pool
         std::vector<float> bias_data((size_t) experts, 0.0f);
-        for (int il = 0; il < layers && il < 40; ++il) {
-            std::vector<std::pair<float, int>> ranked_experts;
-            ranked_experts.reserve((size_t) experts);
-            ggml_tensor * b_tensor = il < (int) model.layers.size() ? model.layers[il].ffn_exp_probs_b : nullptr;
-            if (b_tensor && b_tensor->data) {
-                if (ggml_backend_buffer_is_host(b_tensor->buffer)) {
-                    const float * bf = static_cast<const float *>(b_tensor->data);
-                    for (int e = 0; e < experts; ++e) ranked_experts.push_back({bf[e], e});
-                } else {
-                    cudaMemcpy(bias_data.data(), b_tensor->data, (size_t) experts * sizeof(float), cudaMemcpyDeviceToHost);
-                    for (int e = 0; e < experts; ++e) ranked_experts.push_back({bias_data[(size_t) e], e});
-                }
-                std::sort(ranked_experts.rbegin(), ranked_experts.rend());
-            } else {
-                for (int e = 0; e < experts; ++e) ranked_experts.push_back({0.0f, e});
+        std::vector<int> order((size_t) experts);
+        for (int il = 0; il < target_layers; ++il) {
+            for (int e = 0; e < experts; ++e) order[(size_t) e] = e;
+            ggml_tensor * bias = model.layers[(size_t) il].ffn_exp_probs_b;
+            if (bias) {
+                if (bias->type != GGML_TYPE_F32 || ggml_nelements(bias) != experts) throw std::runtime_error("invalid MoE router bias");
+                ggml_backend_tensor_get(bias, bias_data.data(), 0, (size_t) experts * sizeof(float));
+                std::sort(order.begin(), order.end(), [&](int a, int b) { return bias_data[(size_t) a] > bias_data[(size_t) b]; });
             }
-            for (int s = 0; s < 5; ++s) {
-                const int e = ranked_experts[(size_t) s].second;
-                const size_t idx = (size_t) il * 5 + s;
-                moe_execution->hot[idx].owner = this;
-                moe_execution->hot[idx].layer = il;
-                moe_execution->hot[idx].expert = e;
-                moe_execution->hot[idx].stamp = 1;
-                char * dst = moe_execution->hot_data(idx);
-                pager.fetch(il, e, dst, weights[il][0]->nb[2], dst + weights[il][0]->nb[2], weights[il][1]->nb[2], dst + weights[il][0]->nb[2] + weights[il][1]->nb[2], weights[il][2]->nb[2]);
+            const int seed_count = std::min(experts, std::max(used, MOE_TARGET_HOT));
+            std::array<moe_batch_target, 6> seeds = {};
+            for (int s = 0; s < seed_count; ++s) {
+                const size_t hot_slot = (size_t) il * MOE_TARGET_HOT + (size_t) s;
+                const size_t host_slot = (size_t) il * MOE_TARGET_HOST + (size_t) s;
+                const size_t gate = weights[(size_t) il][0]->nb[2], up = weights[(size_t) il][1]->nb[2], down = weights[(size_t) il][2]->nb[2];
+                char * dst = s < MOE_TARGET_HOT ? moe_execution->hot_data(hot_slot) : nullptr;
+                seeds[(size_t) s] = {order[(size_t) s], dst, gate, dst ? dst + gate : nullptr, up, dst ? dst + gate + up : nullptr, down, moe_execution->victim_data(host_slot), moe_execution->victim[host_slot].bytes};
+            }
+            if (!pager.fetch_batch(il, seeds.data(), seed_count, moe_execution->stream_h2d)) throw std::runtime_error("MoE hot cache seed read failed");
+            for (int s = 0; s < seed_count; ++s) {
+                if (s < MOE_TARGET_HOT) moe_execution->set_entry(moe_execution->hot[(size_t) il * MOE_TARGET_HOT + (size_t) s], this, il, order[(size_t) s]);
+                moe_execution->set_victim((size_t) il * MOE_TARGET_HOST + (size_t) s, this, il, order[(size_t) s]);
             }
         }
-        cudaStreamSynchronize((cudaStream_t) moe_pager::worker_stream());
         g_moe_execution_pool = moe_execution;
-        LLAMA_LOG_INFO("[moe_ring] stage=2x%d slots %.2f MiB hot=%zu slots %.2f MiB host=%zu slots %.2f MiB (total %zu cached experts, +51%% capacity)\n",
+        LLAMA_LOG_INFO("[moe_ring] stage=2x%d slots %.2f MiB hot=%zu slots %.2f MiB inclusive_host=%zu slots %.2f MiB target_host=%d draft_host=%d draft_vram=%d\n",
                 MOE_RING_SLOTS, moe_execution->stage_bytes / 1048576.0, moe_execution->hot.size(), total_hot_bytes / 1048576.0,
-                moe_execution->victim.size(), total_host_bytes / 1048576.0, moe_execution->hot.size() + moe_execution->victim.size());
+                moe_execution->victim.size(), total_host_bytes / 1048576.0, target_layers * MOE_TARGET_HOST, 3 * MOE_DRAFT_HOST, 3 * MOE_DRAFT_HOT);
     } else {
         if (moe_execution->device != ggml_backend_get_device(backend)) throw std::runtime_error("shared MoE ring requires the same GPU");
+        if (model.arch == LLM_ARCH_DEEPSEEK41 && moe_execution->target_layers != layers) throw std::runtime_error("backbone must initialize the shared MoE cache before the draft");
         for (int role = 0; role < 3; ++role) {
             if (geometry[role] > moe_execution->role_bytes[role]) throw std::runtime_error("draft expert exceeds shared MoE slot geometry");
         }
@@ -2256,14 +2747,19 @@ void llama_context::moe_init_ring() {
     moe.buf = ggml_backend_alloc_ctx_tensors(moe.ctx, backend);
     if (!moe.buf) throw std::runtime_error("MoE slot table allocation failed");
     moe.buf_bytes = ggml_backend_buffer_get_size(moe.buf);
-    moe.n_layer = layers; moe.n_expert = experts; moe.n_used = used;
     moe.dec_freq.assign((size_t) layers * experts, 0);
     moe_ring = std::make_unique<moe_ring_state>(this);
+    moe_ring->init_cpu(ggml_backend_get_device(backend_cpu), cparams.n_threads);
+    if (getenv("MOE_PROFILE") && atoi(getenv("MOE_PROFILE")) != 0) {
+        const uint32_t tile_tokens = std::max(1, MOE_RING_SLOTS / used);
+        moe_execution->reserve_timers((size_t) layers * ((cparams.n_ubatch + tile_tokens - 1) / tile_tokens + 1));
+    }
     moe_ready = true;
     sched_need_reserve = true;
     g_moe_ring_contexts.push_back(this);
     ggml_cuda_moe_slot_resolve_register(moe_slot_resolve_sync);
-    LLAMA_LOG_INFO("[moe_ring] arch=%s layers=%d shared GPU execution enabled; CPU fallback disabled\n", llm_arch_name(model.arch), layers);
+    ggml_cuda_moe_ffn_down_register(moe_ffn_down_sync);
+    LLAMA_LOG_INFO("[moe_ring] arch=%s layers=%d shared GPU execution enabled; CPU RAM experts=%s\n", llm_arch_name(model.arch), layers, moe_ring->cpu ? "enabled" : "disabled");
 }
 
 llama_context::llama_context(
@@ -3838,10 +4334,53 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         execution = std::unique_lock<std::mutex>(moe_execution->compute_mutex);
         moe.last_ntok = ubatch.n_tokens;
         moe_ring->current_layer = -1;
+        GGML_ASSERT(ubatch.n_tokens <= moe_ring->token_active.size());
+        moe_ring->valid_tokens = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            moe_ring->token_active[i] = !ubatch.padding || !ubatch.padding[i];
+            moe_ring->valid_tokens += moe_ring->token_active[i];
+        }
     }
     const bool profile = getenv("MOE_PROFILE") && atoi(getenv("MOE_PROFILE")) != 0;
     const int64_t step_start = profile ? ggml_time_us() : 0;
     rusage usage_before = {};
+    const long vram_before = moe.n_vram_hit, ram_before = moe.n_ram_hit, cold_before = moe.n_miss;
+    const int64_t disk_before = moe_ring ? pager.stats_batch_disk_wait_us() : 0;
+    const double dma_before = moe_ring ? pager.stats_batch_h2d_ms() : 0;
+    const int64_t dma_wait_before = moe_ring ? pager.stats_dma_wait_us() : 0;
+    const uint64_t promotions_before = moe_ring ? moe_ring->promotions_completed.load() : 0;
+    if (moe_ring) {
+        moe_execution->begin_step(profile);
+        moe_ring->rank0_replaced = moe_ring->ranks_replaced = moe_ring->budget_overrides = 0;
+        {
+            std::lock_guard<std::mutex> lock(moe_ring->cpu_mutex);
+            if (moe_ring->cpu_pending || !moe_ring->cpu_published) throw std::runtime_error("MoE CPU work outlived its graph");
+            moe_ring->cpu_us = 0;
+            moe_ring->cpu_rows = 0;
+            moe_ring->cpu_layers = 0;
+        }
+        std::fill(moe_ring->draft_freq.begin(), moe_ring->draft_freq.end(), 0);
+        if (!moe.is_decode && ubatch.pos[0] == 0) std::fill(moe_ring->prompt_freq.begin(), moe_ring->prompt_freq.end(), 0);
+        if (!moe.is_decode && model.arch == LLM_ARCH_DEEPSEEK41) {
+            auto & state = *moe_ring;
+            if (ubatch.pos[0] == 0) {
+                state.prompt.clear();
+                state.prompt_key_valid = ubatch.token && ubatch.n_seqs_unq == 1;
+                state.prompt_reseed = state.hot_prompt.empty();
+            }
+            state.prompt_complete = n_outputs > 0;
+            if (!ubatch.token || ubatch.n_seqs_unq != 1) state.prompt_key_valid = false;
+            if (state.prompt_key_valid) {
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    if (ubatch.pos[i] < 0 || (size_t) ubatch.pos[i] != state.prompt.size()) { state.prompt_key_valid = false; break; }
+                    const size_t pos = state.prompt.size();
+                    if (pos >= state.hot_prompt.size() || state.hot_prompt[pos] != ubatch.token[i]) state.prompt_reseed = true;
+                    state.prompt.push_back(ubatch.token[i]);
+                }
+            }
+            if (!state.prompt_key_valid || (state.prompt_complete && state.prompt.size() != state.hot_prompt.size())) state.prompt_reseed = true;
+        }
+    }
     if (profile) {
         ggml_backend_sched_synchronize(sched.get());
         getrusage(RUSAGE_SELF, &usage_before);
@@ -3910,7 +4449,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf_res_prev_active = res;
     }
-    if (profile) {
+    bool has_ring_nodes = false;
+    if (moe_ring) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            if (ggml_graph_node(gf, i)->op == GGML_OP_MOE_SLOT_RESOLVE_KICK) { has_ring_nodes = true; break; }
+        }
+    }
+    if (profile && !moe_ring) {
         ggml_backend_sched_set_eval_callback(sched.get(), [](ggml_tensor * t, bool ask, void * data) {
             auto * ctx = static_cast<llama_context *>(data);
             auto & p = ctx->moe_profile;
@@ -3948,6 +4493,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (moe_ring) {
+        std::lock_guard<std::mutex> lock(moe_execution->cache_mutex);
+        if (has_ring_nodes) moe_ring->prefetch(0);
+        if (moe_ring->compute) moe_execution->gpu_begin(moe_ring->compute);
+    }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
@@ -3957,32 +4507,59 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (moe_ring) {
+        if (moe_ring->compute) moe_execution->gpu_end(moe_ring->compute);
         ggml_backend_sched_synchronize(sched.get());
         moe_ring->wait();
+        const bool ran_moe = moe.n_vram_hit != vram_before || moe.n_ram_hit != ram_before || moe.n_miss != cold_before;
+        const bool draft_block = model.arch == LLM_ARCH_DFLASH && ubatch.n_tokens >= model.hparams.dflash_block_size;
+        if (ran_moe && draft_block) {
+            moe_execution->refresh_hot(this, moe_ring->draft_freq);
+        }
+        moe_execution_pool::check(cudaStreamSynchronize(moe_execution->stream_h2d));
+        if (!moe.is_decode && model.arch == LLM_ARCH_DEEPSEEK41 && moe_ring->prompt_complete) {
+            if (moe_ring->prompt_key_valid) {
+                if (moe_ring->prompt_reseed) moe_ring->hot_prompt = moe_ring->prompt;
+            } else {
+                moe_ring->hot_prompt.clear();
+            }
+            moe_ring->prompt_reseed = false;
+        }
     }
     if (profile) {
         ggml_backend_sched_synchronize(sched.get());
         rusage usage_after = {};
         getrusage(RUSAGE_SELF, &usage_after);
-        LLAMA_LOG_INFO("[moe_step] arch=%s nt=%u gpu_layers=%d cpu_layers=%d wall_ms=%.3f moe_ms=%.3f io_ms=%.3f gpu_ms=%.3f engram_ms=%.3f majflt=%ld\n",
-                llm_arch_name(model.arch), ubatch.n_tokens, moe_profile.gpu_layers, moe_profile.cpu_layers,
-                (ggml_time_us() - step_start) / 1000.0, moe_profile.moe_us / 1000.0,
-                moe_profile.io_us / 1000.0, moe_profile.gpu_us / 1000.0, moe_profile.engram_us / 1000.0,
-                usage_after.ru_majflt - usage_before.ru_majflt);
         if (moe_ring) {
-            auto & o = moe_ring->oracle;
-            const long tot = moe.n_hit + moe.n_miss;
-            const double vram_pct = tot ? (100.0 * moe.n_vram_hit / tot) : 0.0;
-            const double ram_pct  = tot ? (100.0 * moe.n_ram_hit  / tot) : 0.0;
-            const double cold_pct = tot ? (100.0 * moe.n_miss     / tot) : 0.0;
-            const double hit_pct  = tot ? (100.0 * moe.n_hit      / tot) : 0.0;
-            LLAMA_LOG_INFO("[moe_oracle] recall_k0=%.1f%% recall_k1=%.1f%% recall_k2=%.1f%% recall_k3=%.1f%% | VRAM=%.1f%% RAM=%.1f%% ColdSSD=%.1f%% (HitRate=%.1f%%) | vram_hot=%zu ram_victim=%zu promo_bg=%llu\n",
-                o.recall(0), o.recall(1), o.recall(2), o.recall(3),
-                vram_pct, ram_pct, cold_pct, hit_pct,
-                moe_execution->hot_count(), moe_execution->victim_count(),
-                (unsigned long long) moe_ring->promotions_completed.load());
-    }
+            const auto & pool = *moe_execution;
+            const long vram = moe.n_vram_hit - vram_before, ram = moe.n_ram_hit - ram_before, cold = moe.n_miss - cold_before;
+            const long total = vram + ram + cold;
+            const double disk_ms = (pager.stats_batch_disk_wait_us() - disk_before) / 1000.0;
+            const double cpu_copy_ms = pool.timer_ms(moe_execution_pool::CPU_COPY);
+            const double h2d_ms = pool.timer_ms(moe_execution_pool::H2D) + cpu_copy_ms + pager.stats_batch_h2d_ms() - dma_before;
+            const double router_ms = pool.timer_ms(moe_execution_pool::ROUTER);
+            const double hot_wait_ms = pool.timer_ms(moe_execution_pool::HOT_WAIT);
+            const double wait_ms = pool.timer_ms(moe_execution_pool::WAIT) + router_ms + cpu_copy_ms + (pool.cold_copy_wait_us + pager.stats_dma_wait_us() - dma_wait_before) / 1000.0;
+            LLAMA_LOG_INFO("[moe_step] arch=%s mode=%s nt=%u valid_nt=%u gpu_layers=%d cpu_layers=%d wall_ms=%.3f gpu_ms=%.3f h2d_ms=%.3f exposed_ms=%.3f router_ms=%.3f hot_wait_ms=%.3f cpu_ms=%.3f cpu_wait_ms=%.3f cpu_rows=%llu promotion_wait_ms=%.3f disk_wait_ms=%.3f publish_ms=%.3f d2d_submit_ms=%.3f h2d_submit_ms=%.3f h2d_bytes=%llu d2d_bytes=%llu majflt=%ld\n",
+                    llm_arch_name(model.arch), moe.is_decode ? "tg" : "pp", ubatch.n_tokens, moe_ring->valid_tokens, has_ring_nodes ? moe.n_layer : 0, moe_ring->cpu_layers,
+                    (ggml_time_us() - step_start) / 1000.0, pool.timer_ms(moe_execution_pool::GPU), h2d_ms, wait_ms, router_ms,
+                    hot_wait_ms, moe_ring->cpu_us / 1000.0, pool.timer_ms(moe_execution_pool::CPU_WAIT), (unsigned long long) moe_ring->cpu_rows,
+                    pool.promotion_wait_us / 1000.0, disk_ms, pool.publish_us / 1000.0, pool.d2d_submit_us / 1000.0, pool.h2d_submit_us / 1000.0,
+                    (unsigned long long) pool.h2d_bytes, (unsigned long long) pool.d2d_bytes,
+                    usage_after.ru_majflt - usage_before.ru_majflt);
+            std::lock_guard<std::mutex> lock(moe_execution->cache_mutex);
+            LLAMA_LOG_INFO("[moe_cache] arch=%s selections=%ld vram=%ld ram=%ld cold=%ld VRAM=%.2f%% RAM=%.2f%% ColdSSD=%.2f%% hot_slots=%zu host_slots=%zu promo_bg=%llu rank0_replaced=%llu ranks_replaced=%llu ram_budget_overrides=%llu\n",
+                    llm_arch_name(model.arch), total, vram, ram, cold, total ? 100.0 * vram / total : 0.0,
+                    total ? 100.0 * ram / total : 0.0, total ? 100.0 * cold / total : 0.0,
+                    pool.hot_count(this), pool.victim_count(this), (unsigned long long) (moe_ring->promotions_completed.load() - promotions_before),
+                    (unsigned long long) moe_ring->rank0_replaced, (unsigned long long) moe_ring->ranks_replaced, (unsigned long long) moe_ring->budget_overrides);
+        } else {
+            LLAMA_LOG_INFO("[moe_step] arch=%s nt=%u gpu_layers=%d cpu_layers=%d wall_ms=%.3f moe_ms=%.3f io_ms=%.3f gpu_ms=%.3f engram_ms=%.3f majflt=%ld\n",
+                    llm_arch_name(model.arch), ubatch.n_tokens, moe_profile.gpu_layers, moe_profile.cpu_layers,
+                    (ggml_time_us() - step_start) / 1000.0, moe_profile.moe_us / 1000.0,
+                    moe_profile.io_us / 1000.0, moe_profile.gpu_us / 1000.0, moe_profile.engram_us / 1000.0,
+                    usage_after.ru_majflt - usage_before.ru_majflt);
         }
+    }
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -4409,7 +4986,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
         }
-        moe.is_decode = (ubatch.n_tokens <= 6 || n_outputs == (int32_t) ubatch.n_tokens);
+        moe.is_decode = n_tokens_all == 1 || n_outputs_all == n_tokens_all || (n_tokens_all <= 6 && batch_inp.tokens.front().output);
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
@@ -5129,6 +5706,7 @@ llm_graph_params llama_context::graph_params(
         params.moe_table   = moe.slot_table.data();
         params.moe_n_layer = (int32_t) moe.n_layer;
         params.moe_shared = moe_ring != nullptr;
+        params.moe_resident = moe_ring && model.arch == LLM_ARCH_DEEPSEEK41 && std::all_of(moe_ring->warm.begin(), moe_ring->warm.end(), [](uint8_t warm) { return warm != 0; });
     }
     return params;
 }

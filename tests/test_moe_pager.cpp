@@ -137,6 +137,110 @@ int main(int argc, char ** argv) {
             if (!ok) bad = 1;
         }
     }
+    // Caller-owned host copies must survive reuse of the pager staging arena.
+    {
+        const int layer = NL / 2;
+        const int expert = NE / 3;
+        const moe_expert_slice * slices = pager.slices(layer, expert);
+        const size_t gate_bytes = pager.expert_role_bytes(layer, 0);
+        const size_t up_bytes   = pager.expert_role_bytes(layer, 1);
+        const size_t down_bytes = pager.expert_role_bytes(layer, 2);
+        const size_t total_bytes = gate_bytes + up_bytes + down_bytes;
+
+        char * device = nullptr;
+        char * cache = nullptr;
+        if (cudaMalloc(&device, total_bytes) != cudaSuccess ||
+            cudaHostAlloc(&cache, total_bytes, cudaHostAllocDefault) != cudaSuccess) {
+            bad = 1;
+        } else {
+            memset(cache, 0x5A, total_bytes);
+            moe_batch_target bad_cap = {expert, device, gate_bytes, device + gate_bytes, up_bytes, device + gate_bytes + up_bytes, down_bytes, cache, total_bytes - 1};
+            bool rejected_cap = !pager.fetch_batch(layer, &bad_cap, 1, nullptr);
+            bool cap_intact = std::all_of(cache, cache + total_bytes, [](char byte) { return byte == 0x5A; });
+            printf("  capacity-rejection: %s\n", (rejected_cap && cap_intact) ? "PASS" : "FAIL");
+            if (!rejected_cap || !cap_intact) bad = 1;
+
+            memset(cache, 0x3C, total_bytes);
+            moe_batch_target bad_size = {expert, device, gate_bytes - 1, device + gate_bytes, up_bytes, device + gate_bytes + up_bytes, down_bytes, cache, total_bytes};
+            bool rejected_size = !pager.fetch_batch(layer, &bad_size, 1, nullptr);
+            bool size_intact = std::all_of(cache, cache + total_bytes, [](char byte) { return byte == 0x3C; });
+            printf("  size-rejection: %s\n", (rejected_size && size_intact) ? "PASS" : "FAIL");
+            if (!rejected_size || !size_intact) bad = 1;
+
+            memset(cache, 0, total_bytes);
+            moe_batch_target target = {expert, device, gate_bytes, device + gate_bytes, up_bytes, device + gate_bytes + up_bytes, down_bytes, cache, total_bytes};
+            bool exact = pager.fetch_batch(layer, &target, 1, nullptr);
+            size_t offset = 0;
+            for (int role = 0; role < 3 && exact; ++role) {
+                const size_t bytes = pager.expert_role_bytes(layer, role);
+                std::vector<char> reference(bytes), actual(bytes);
+                exact = read_reference(slices[role].fd, slices[role], reference.data(), bytes) &&
+                        cudaMemcpy(actual.data(), device + offset, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                        reference == actual &&
+                        memcmp(reference.data(), cache + offset, bytes) == 0;
+                offset += bytes;
+            }
+            printf("  write-allocate(L%2d,E%3d): %zu bytes in host and device %s\n",
+                   layer, expert, total_bytes, exact ? "EXACT MATCH" : "MISMATCH");
+            if (!exact) bad = 1;
+
+            const int expert2 = (expert + 1) % NE;
+            const moe_expert_slice * slices2 = pager.slices(layer, expert2);
+            const size_t total_bytes2 = pager.expert_role_bytes(layer, 0) + pager.expert_role_bytes(layer, 1) + pager.expert_role_bytes(layer, 2);
+            if (total_bytes2 <= total_bytes) {
+                moe_batch_target target2 = {expert2, device, gate_bytes, device + gate_bytes, up_bytes, device + gate_bytes + up_bytes, down_bytes, cache, total_bytes};
+                bool reuse_ok = pager.fetch_batch(layer, &target2, 1, nullptr);
+                size_t off2 = 0;
+                for (int role = 0; role < 3 && reuse_ok; ++role) {
+                    const size_t bytes = pager.expert_role_bytes(layer, role);
+                    std::vector<char> reference(bytes), actual(bytes);
+                    reuse_ok = read_reference(slices2[role].fd, slices2[role], reference.data(), bytes) &&
+                               cudaMemcpy(actual.data(), device + off2, bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                               reference == actual &&
+                               memcmp(reference.data(), cache + off2, bytes) == 0;
+                    off2 += bytes;
+                }
+                bool refetch_ok = reuse_ok && pager.fetch_batch(layer, &target, 1, nullptr);
+                size_t off1 = 0;
+                for (int role = 0; role < 3 && refetch_ok; ++role) {
+                    const size_t bytes = pager.expert_role_bytes(layer, role);
+                    std::vector<char> reference(bytes);
+                    refetch_ok = read_reference(slices[role].fd, slices[role], reference.data(), bytes) &&
+                                 memcmp(reference.data(), cache + off1, bytes) == 0;
+                    off1 += bytes;
+                }
+                printf("  reuse-stability(L%2d,E%3d<->E%3d): %s\n", layer, expert, expert2, refetch_ok ? "PASS" : "FAIL");
+                if (!refetch_ok) bad = 1;
+            }
+
+            // Consume an outstanding prefetch through the batched path.
+            const int expert_pref = (expert + 5) % NE;
+            if (pager.prefetch(layer, expert_pref)) {
+                pager.reap();
+                moe_batch_target target_pref = {expert_pref, device, gate_bytes, device + gate_bytes, up_bytes, device + gate_bytes + up_bytes, down_bytes, cache, total_bytes};
+                const long pf_hit_before = pager.stats_pf_hit();
+                bool pref_ok = pager.fetch_batch(layer, &target_pref, 1, nullptr);
+                const moe_expert_slice * slices_pref = pager.slices(layer, expert_pref);
+                size_t off_pref = 0;
+                for (int role = 0; role < 3 && pref_ok; ++role) {
+                    const size_t bytes = pager.expert_role_bytes(layer, role);
+                    std::vector<char> reference(bytes);
+                    pref_ok = read_reference(slices_pref[role].fd, slices_pref[role], reference.data(), bytes) &&
+                              memcmp(reference.data(), cache + off_pref, bytes) == 0;
+                    off_pref += bytes;
+                }
+                printf("  prefetch-batch(L%2d,E%3d): %s (pf_hit=%ld->%ld)\n",
+                       layer, expert_pref, pref_ok ? "PASS" : "FAIL", pf_hit_before, pager.stats_pf_hit());
+                if (!pref_ok) bad = 1;
+            }
+
+            printf("  telemetry: disk_wait_us=%ld dma_ms=%.3f dma_wait_us=%ld dma_bytes=%ld\n",
+                   (long) pager.stats_batch_disk_wait_us(), pager.stats_batch_h2d_ms(),
+                   (long) pager.stats_dma_wait_us(), (long) pager.stats_dma_bytes());
+        }
+        if (device) cudaFree(device);
+        if (cache) cudaFreeHost(cache);
+    }
     // Mix host-cache hits and pending prefetches, then reuse the staging arena.
     if (!pager.init_cache(pager.bytes_per_expert() * 4)) bad = 1;
     const int batch_layers[] = {0, NL / 2, NL - 1};
@@ -179,7 +283,8 @@ int main(int argc, char ** argv) {
     free(h_ref); free(h_pag);
     cudaFree(d_dst);
 
-    printf("\nresult: %s   io_ops=%ld io_bytes=%ld pf_hit=%ld\n",
-           bad ? "FAIL" : "PASS", pager.stats_io_ops(), pager.stats_io_bytes(), pager.stats_pf_hit());
+    printf("\nresult: %s   io_ops=%ld io_bytes=%ld pf_hit=%ld disk_wait_us=%ld dma_ms=%.3f\n",
+           bad ? "FAIL" : "PASS", pager.stats_io_ops(), pager.stats_io_bytes(), pager.stats_pf_hit(),
+           (long) pager.stats_batch_disk_wait_us(), pager.stats_batch_h2d_ms());
     return bad;
 }
