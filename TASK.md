@@ -211,3 +211,69 @@ Misses:
 - The first launch was an implementation failure, not a benchmark rerun; the five-pass session was run once after the graph fix.
 
 The final implementation and this file were committed locally on `betelgeuse-ds41` with `moe: task 11 zone A/B invariant routing and single-pass PP`. No push or PR; `fluxaeros-mtp` untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, and `/tmp/opencode/atomic_hot10_pass*.log`.
+
+---
+
+## Atomic task 12: learn on Pass 1, consolidate and freeze 5+15
+
+### Objective
+Keep the single-pass PP and warm zero-SSD behavior, but make Pass 1 a true learning pass: Rank 0 is never replaced while learning. Every cold Rank-0 miss is fetched and inserted into the layer's 15 Host-RAM slots by evicting an untouched startup slot, then the least-used non-Rank-0 slot, then the LRU Rank-0 slot. At the end of a learning pass, promote the top five most-used experts into the 5 VRAM Hot slots and freeze all 20 slots for the warm repeat.
+
+### Implementation
+1. Learning mode starts enabled. A cold learning pass keeps every routed Rank 0 and writes it into host via `learn_victim`; no Rank-0 fallback occurs, so `rank0_replaced = 0` on Pass 1.
+2. `learn_victim` skips experts selected in the current batch and in-flight DMA sources. Priority is: empty slot, untouched startup slot (`!was_rank0 && hit_count == 0`), least-recent non-Rank-0 slot, least-recent Rank-0 slot.
+3. Per-slot `hit_count` and per-expert `learn_hits` are updated for every selection during learning. Secondary ranks select from the full resident 5 hot + 15 host slots.
+4. On the first prompt ubatch after a learning pass, `moe_ring_phase` consolidates: for each layer it ranks the 15 host residents by `learn_hits`, copies the top five into the 5 hot slots, and freezes the layer. Hot is always a subset of host, so the frozen PP union is at most 15 distinct experts.
+5. A new prompt is detected by comparing its tokens with the previous frozen prompt. Pass 2/3 use the same prompt and stay frozen; Pass 4a has a different prompt and starts a new learning phase; Pass 4b consolidates Pass 4a at its first ubatch. A learning prompt alone (no decode) is enough to consolidate, since the one-token Pass 4a may not decode.
+6. Graph tiling depends on the frozen flag: learning passes use `18 / n_expert_used`-token tiles; frozen target passes use 64-token tiles for one MoE pass per PP ubatch. The target CPU branch remains limited to `nt <= 6`.
+7. Pass 1 and Pass 3 use `n_predict = 96`; the harness prints both generations.
+
+### Acceptance
+- Pass 1 target `rank0_replaced = 0`.
+- Warm Pass 2/3/4b target `ColdSSD = 0.00%`, `disk_wait_ms = 0.0`.
+- Scope `MemoryPeak` inside `MemoryMax=12G`, zero OOM.
+- Warm Pass 4b PP about 50+ tok/s; Pass 2/3 TG 15-18+ tok/s.
+- Complete `binary_search` code from Pass 1 and Pass 3.
+- One benchmark session; then commit locally with `moe: task 12 learn on pass 1 and freeze consolidated 5+15 cache`. No push or PR.
+
+### Evidence
+The single five-pass session completed under `MemoryMax=12G`; it was not rerun. Geometry was unchanged: `stage=2x18 554.41 MiB hot=236 2854.42 MiB inclusive_host=660 7922.02 MiB target_host=600 draft_host=60 draft_vram=36`. Protocol was valid: `prompt_n` 7/7/7/64/64 and `cache_n=0` on every pass.
+
+| Pass | Target `rank0_replaced` | Target PP ColdSSD | Target TG ColdSSD | Disk wait | VRAM hit | TG tok/s | PP tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 cold learn 96-token TG | 0 | 221/1680 = 13.15% | 989/26880 = 3.68% | 4968.2 ms | 11.86% TG | 4.532 | - |
+| 2 warm 32-token TG | 593 | 0/1680 = 0.00% | 0/7440 = 0.00% | 0.0 ms | 50.28% TG | 15.056 | - |
+| 3 warm 96-token TG | 1836 | 0/1680 = 0.00% | 0/22800 = 0.00% | 0.0 ms | 48.13% TG | 16.545 | - |
+| 4a learning 64-token PP | 0 | 627/15360 = 4.08% | - | 2726.2 ms | 44.85% PP | - | 6.329 |
+| 4b warm 64-token PP | 622 | 0/15360 = 0.00% | - | 0.0 ms | 56.08% PP | - | 36.958 |
+
+Pass 1 target `rank0_replaced` is `0`, and Pass 4a is also `0`; learning never replaced Rank 0. Warm target ColdSSD is exactly `0.00%` with `disk_wait_ms = 0.0` on Pass 2, Pass 3, and Pass 4b, with zero `[moe_cold]` lines. Pass 2/3 TG are `15.056`/`16.545 tok/s`, inside 15-18. `host_slots` grew from 598 to 600 and `hot_slots` stayed 200.
+
+Scope memory: peak `12,070,862,848 B` (11.24 GiB), `MemoryCurrent` 11,112,423,424 B before requests and 11,546,906,624 B after Pass 4b, `MemorySwapPeak=0`, `Result=success`, zero OOM, zero aborts.
+
+Pass 1 generated the complete function body plus extra scaffolding, but the continuation ended at `target =`, so the whole completion is not valid Python:
+
+```python
+    left, right = 0, len(arr) - 1
+    while left <= right:
+        mid = left + (right - left) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            left = mid + 1
+        else:
+            right = mid - 1
+    return -1
+n = int(input())
+arr = list(map(int, input().split()))
+target =
+```
+
+Pass 3 did not reproduce that function; the frozen warm pass emitted 24 copies of `return None` (`PASS3_VALID_PYTHON=True` only because that is syntactically valid).
+
+Misses:
+- Pass 4b PP is `36.958 tok/s`, below 50+. The request includes the synchronous Pass 4a consolidation (up to five host-to-hot copies per layer) and stages the frozen host set in one pass.
+- Warm Pass 2/3 still replace Rank 0 (`593`, `1836`) because the 96-token generation touched more than 15 distinct Rank-0 experts per layer; the 15 host slots retain only the latest survivors, so early function-body experts are evicted before the warm repeat. Warm ColdSSD stays zero because the replacements are resident, but the trajectory degenerates.
+- Warm VRAM hit was `50.28%` (Pass 2 TG) and `48.13%` (Pass 3 TG), below the expected 75%.
+
+The first launch was not rerun; this is the single five-pass session. The final implementation and this file were committed locally on `betelgeuse-ds41` with `moe: task 12 learn on pass 1 and freeze consolidated 5+15 cache`. No push or PR; `fluxaeros-mtp` untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, and `/tmp/opencode/atomic_hot10_pass*.log`.

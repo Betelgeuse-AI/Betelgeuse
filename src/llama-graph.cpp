@@ -1521,7 +1521,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_table        (params.moe_table),
     moe_n_layer      (params.moe_n_layer),
     moe_shared       (params.moe_shared),
-    moe_resident     (params.moe_resident) {
+    moe_resident     (params.moe_resident),
+    moe_frozen       (params.moe_frozen) {
         res->set_params(params);
     }
 
@@ -2174,7 +2175,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
-    const int64_t tile_size = moe_shared ? (n_expert_used == 6 ? 64 : std::max<int64_t>(1, 18 / n_expert_used)) : 6;
+    const int64_t tile_size = moe_shared ? (moe_frozen ? 64 : std::max<int64_t>(1, 18 / n_expert_used)) : 6;
     if (moe_shared && n_tokens > tile_size) {
         ggml_tensor * output = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_tensor * prev_tile = nullptr;

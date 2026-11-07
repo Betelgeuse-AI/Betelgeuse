@@ -841,6 +841,7 @@ struct llm_graph_params {
     int32_t moe_n_layer = 0;
     bool moe_shared = false;
     bool moe_resident = false;
+    bool moe_frozen = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -912,6 +913,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             moe_shared                     == other.moe_shared                     &&
             moe_resident                   == other.moe_resident                   &&
+            moe_frozen                     == other.moe_frozen                     &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1095,6 +1097,7 @@ struct llm_graph_context {
     int32_t moe_n_layer = 0;
     bool moe_shared = false;
     bool moe_resident = false;
+    bool moe_frozen = false;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
