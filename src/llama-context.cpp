@@ -1110,59 +1110,94 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     auto best_any_resident = [&](int64_t t, int64_t rank) {
         return best_of(t, rank, best_host(t, rank, MOE_TARGET_HOST));
     };
-    const bool frozen_layer = target && state.frozen[(size_t) il];
-    std::array<int32_t, MOE_RING_SLOTS> resident_union;
-    size_t n_union = 0;
-    auto union_has = [&](int e) {
-        return std::find(resident_union.begin(), resident_union.begin() + n_union, e) != resident_union.begin() + n_union;
-    };
-    auto union_add = [&](int e) {
-        if (!union_has(e) && n_union < resident_union.size()) resident_union[n_union++] = e;
-    };
-    auto union_best = [&](int64_t t, int64_t rank) {
-        int best = -1;
-        float best_score = -INFINITY;
-        for (size_t j = 0; j < n_union; ++j) {
-            const int c = resident_union[j];
-            if (used(t, rank, c)) continue;
-            const float val = score(t, c);
-            if (std::isfinite(val) && val > best_score) { best = c; best_score = val; }
-        }
-        return best;
-    };
-    if (frozen_layer) {
+    if (target) {
+        std::array<int32_t, MOE_RING_SLOTS> sec_pool;
+        size_t n_pool = 0;
+        auto pool_has = [&](int e) {
+            return std::find(sec_pool.begin(), sec_pool.begin() + n_pool, e) != sec_pool.begin() + n_pool;
+        };
+        auto pool_add = [&](int e) {
+            if (e >= 0 && !pool_has(e) && n_pool < sec_pool.size()) sec_pool[n_pool++] = e;
+        };
+        // Step A: resolve every token's Rank 0 first
         for (int64_t t = 0; t < nt; ++t) {
             if (!active(t)) continue;
-            const int e = original[(size_t) (t * nk)];
-            if (pool.find_hot(ctx, il, e) >= 0 || cached(e)) union_add(e);
+            int e = original[(size_t) (t * nk)];
+            if (state.frozen[(size_t) il] && pool.find_hot(ctx, il, e) < 0 && !cached(e)) {
+                const int alt = best_any_resident(t, 0);
+                if (alt >= 0) e = alt;
+            }
+            state.ids[(size_t) (t * nk)] = e;
+            pool_add(e);
         }
-    }
-    for (int64_t t = 0; t < nt; ++t) {
-        if (!active(t)) {
+        // Step B pool: the 5 VRAM Hot slots, then at most two extra host experts
+        for (size_t k = 0; k < hot_count; ++k) {
+            const auto & key = pool.hot[hot_first + k];
+            if (key.owner == ctx) pool_add(key.expert);
+        }
+        std::array<int32_t, 2> extra = {-1, -1};
+        std::array<float, 2> extra_score = {-INFINITY, -INFINITY};
+        for (size_t s = 0; s < MOE_TARGET_HOST; ++s) {
+            const auto & key = pool.victim[host_first + s];
+            if (key.owner != ctx || key.layer != il || pool_has(key.expert)) continue;
+            float best = -INFINITY;
+            for (int64_t t = 0; t < nt; ++t) {
+                if (!active(t)) continue;
+                best = std::max(best, score(t, key.expert));
+            }
+            if (!std::isfinite(best)) continue;
+            if (best > extra_score[0]) {
+                extra_score[1] = extra_score[0]; extra[1] = extra[0];
+                extra_score[0] = best; extra[0] = key.expert;
+            } else if (best > extra_score[1]) {
+                extra_score[1] = best; extra[1] = key.expert;
+            }
+        }
+        pool_add(extra[0]);
+        pool_add(extra[1]);
+        // Padding rows reuse the allowed pool
+        for (int64_t t = 0; t < nt; ++t) {
+            if (active(t)) continue;
             for (int64_t rank = 0; rank < nk; ++rank) {
-                const auto & key = pool.hot[hot_first + (size_t) rank % hot_count];
-                if (key.owner != ctx) GGML_ABORT("verification padding requires a populated hot cache");
-                state.ids[(size_t) (t * nk + rank)] = key.expert;
+                state.ids[(size_t) (t * nk + rank)] = sec_pool[(size_t) rank % n_pool];
                 if (state.cpu && (size_t) rank >= hot_count) state.cpu_mask[(size_t) (t * nk + rank)] = 1;
             }
-            continue;
         }
-        for (int64_t rank = 0; rank < nk; ++rank) {
-            int e = original[(size_t) (t * nk + rank)];
-            if (target) {
-                const bool resident = pool.find_hot(ctx, il, e) >= 0 || cached(e);
-                if (rank > 0) {
-                    e = frozen_layer && n_union == resident_union.size() ? union_best(t, rank) : best_any_resident(t, rank);
-                } else if (frozen_layer && !resident) {
-                    const int alt = n_union == resident_union.size() ? union_best(t, 0) : best_any_resident(t, 0);
-                    if (alt >= 0) e = alt;
+        // Step B: secondary ranks reuse the pooled experts
+        for (int64_t t = 0; t < nt; ++t) {
+            if (!active(t)) continue;
+            for (int64_t rank = 1; rank < nk; ++rank) {
+                int best = -1;
+                float best_score = -INFINITY;
+                for (size_t j = 0; j < n_pool; ++j) {
+                    const int e = sec_pool[j];
+                    if (used(t, rank, e)) continue;
+                    const float val = score(t, e);
+                    if (std::isfinite(val) && val > best_score) { best = e; best_score = val; }
                 }
-                if (frozen_layer && e >= 0) union_add(e);
-            } else if (warm) {
-                if (!cached(e) || used(t, rank, e)) e = best_resident(t, rank, false);
+                if (best < 0) GGML_ABORT("MoE secondary pool cannot fill distinct experts");
+                state.ids[(size_t) (t * nk + rank)] = best;
             }
-            if (e < 0 || used(t, rank, e)) GGML_ABORT("MoE residency selection cannot fill distinct experts");
-            state.ids[(size_t) (t * nk + rank)] = e;
+        }
+    } else {
+        for (int64_t t = 0; t < nt; ++t) {
+            if (!active(t)) {
+                for (int64_t rank = 0; rank < nk; ++rank) {
+                    const auto & key = pool.hot[hot_first + (size_t) rank % hot_count];
+                    if (key.owner != ctx) GGML_ABORT("verification padding requires a populated hot cache");
+                    state.ids[(size_t) (t * nk + rank)] = key.expert;
+                    if (state.cpu && (size_t) rank >= hot_count) state.cpu_mask[(size_t) (t * nk + rank)] = 1;
+                }
+                continue;
+            }
+            for (int64_t rank = 0; rank < nk; ++rank) {
+                int e = original[(size_t) (t * nk + rank)];
+                if (warm) {
+                    if (!cached(e) || used(t, rank, e)) e = best_resident(t, rank, false);
+                }
+                if (e < 0 || used(t, rank, e)) GGML_ABORT("MoE residency selection cannot fill distinct experts");
+                state.ids[(size_t) (t * nk + rank)] = e;
+            }
         }
     }
     if (target && state.learning) {
