@@ -1,5 +1,4 @@
 #include "moe_doorbell.h"
-#include "llama-impl.h"
 #include <atomic>
 #include "ggml-cuda.h"
 
@@ -406,11 +405,18 @@ void moe_doorbell_resolve_launch(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op
+    int32_t op,
+    const float * scores,
+    size_t scores_nb1,
+    const float * input,
+    size_t input_nb1,
+    bool hot_only
 ) {
     (void) table_nb0;
     (void) full; (void) fnk; (void) fnt; (void) full_nb1; (void) look; (void) lnk;
-
+    (void) scores; (void) scores_nb1;
+    (void) input; (void) input_nb1;
+    (void) hot_only;
     if (!g_active || !g_doorbells_dev || !g_plans_dev) return;
     if (g_lru_dev) GGML_ASSERT(n_exp == g_n_expert);
     const int64_t total64 = nk * nt;
@@ -487,7 +493,7 @@ static bool moe_doorbell_dma_init() {
     if (error == cudaSuccess) error = cudaHostAlloc((void **) &g_dma_one, sizeof(uint32_t), cudaHostAllocPortable);
     if (error != cudaSuccess) GGML_ABORT("moe_doorbell_dma_init failed: %s", cudaGetErrorString(error));
     *g_dma_one = 1;
-    LLAMA_LOG_DEBUG("[moe_dma] enabled, dedicated nonblocking H2D stream\n");
+    fprintf(stderr, "[moe_dma] enabled, dedicated nonblocking H2D stream\n");
     return true;
 }
 
@@ -500,13 +506,13 @@ extern "C" bool moe_doorbell_stage_init(size_t stride, int n_slots) {
     const unsigned int flags = cudaHostAllocMapped | cudaHostAllocPortable | (write_combined ? cudaHostAllocWriteCombined : 0);
     cudaError_t err = cudaHostAlloc((void **) &g_stage_host, bytes, flags);
     if (err != cudaSuccess) {
-        LLAMA_LOG_ERROR("moe_doorbell_stage_init: cudaHostAlloc(%zu) failed: %s (%d)\n",
+        fprintf(stderr, "moe_doorbell_stage_init: cudaHostAlloc(%zu) failed: %s (%d)\n",
                 bytes, cudaGetErrorString(err), (int) err);
         return false;
     }
     err = cudaHostGetDevicePointer((void **) &g_stage_dev, g_stage_host, 0);
     if (err != cudaSuccess) {
-        LLAMA_LOG_ERROR("moe_doorbell_stage_init: cudaHostGetDevicePointer failed: %s (%d)\n",
+        fprintf(stderr, "moe_doorbell_stage_init: cudaHostGetDevicePointer failed: %s (%d)\n",
                 cudaGetErrorString(err), (int) err);
         cudaFreeHost(g_stage_host);
         g_stage_host = nullptr;
@@ -515,7 +521,7 @@ extern "C" bool moe_doorbell_stage_init(size_t stride, int n_slots) {
     g_stage_stride = stride;
     g_stage_cap = n_slots;
     moe_doorbell_dma_init();
-    LLAMA_LOG_DEBUG("moe_doorbell_stage_init: %zu bytes (%d x %zu), dev=%p\n",
+    fprintf(stderr, "moe_doorbell_stage_init: %zu bytes (%d x %zu), dev=%p\n",
             bytes, n_slots, stride, (void *) g_stage_dev);
     return true;
 }
@@ -552,7 +558,7 @@ bool moe_doorbell_dma_submit_from(int il, int copy_index, const char * source) {
     }
     if (error == cudaSuccess) error = cudaMemcpyAsync(g_dma_done + il * MOE_DOORBELL_PLAN_MAX + copy_index,
         g_dma_one, sizeof(uint32_t), cudaMemcpyHostToDevice, g_stream_h2d);
-    if (error != cudaSuccess) LLAMA_LOG_ERROR("[moe_dma] submission failed: %s\n", cudaGetErrorString(error));
+    if (error != cudaSuccess) fprintf(stderr, "[moe_dma] submission failed: %s\n", cudaGetErrorString(error));
     return error == cudaSuccess;
 }
 
@@ -576,7 +582,7 @@ bool moe_doorbell_dma_store(int il, int slot, char * destination) {
         error = cudaMemcpyAsync(destination + offset, source, lengths[role], cudaMemcpyDeviceToHost, g_stream_h2d);
         offset += lengths[role];
     }
-    if (error != cudaSuccess) LLAMA_LOG_ERROR("[moe_dma] cache store failed: %s\n", cudaGetErrorString(error));
+    if (error != cudaSuccess) fprintf(stderr, "[moe_dma] cache store failed: %s\n", cudaGetErrorString(error));
     return error == cudaSuccess;
 }
 
@@ -596,13 +602,13 @@ bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
     cudaError_t err = cudaHostAlloc((void **) &g_doorbells_host, db_bytes,
             cudaHostAllocMapped | cudaHostAllocPortable);
     if (err != cudaSuccess) {
-        LLAMA_LOG_ERROR("moe_doorbell_init: cudaHostAlloc failed: %s (%d)\n",
+        fprintf(stderr, "moe_doorbell_init: cudaHostAlloc failed: %s (%d)\n",
                 cudaGetErrorString(err), (int) err);
         return false;
     }
     err = cudaHostGetDevicePointer((void **) &g_doorbells_dev, g_doorbells_host, 0);
     if (err != cudaSuccess) {
-        LLAMA_LOG_ERROR("moe_doorbell_init: cudaHostGetDevicePointer failed: %s (%d)\n",
+        fprintf(stderr, "moe_doorbell_init: cudaHostGetDevicePointer failed: %s (%d)\n",
                 cudaGetErrorString(err), (int) err);
         cudaFreeHost(g_doorbells_host);
         g_doorbells_host = nullptr;
@@ -612,7 +618,7 @@ bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
     err = cudaHostAlloc((void **) &g_plans_host, plan_bytes,
             cudaHostAllocMapped | cudaHostAllocPortable);
     if (err != cudaSuccess) {
-        LLAMA_LOG_ERROR("moe_doorbell_init: plan cudaHostAlloc failed: %s (%d)\n",
+        fprintf(stderr, "moe_doorbell_init: plan cudaHostAlloc failed: %s (%d)\n",
                 cudaGetErrorString(err), (int) err);
         cudaFreeHost(g_doorbells_host);
         g_doorbells_host = nullptr;
@@ -621,7 +627,7 @@ bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
     }
     err = cudaHostGetDevicePointer((void **) &g_plans_dev, g_plans_host, 0);
     if (err != cudaSuccess) {
-        LLAMA_LOG_ERROR("moe_doorbell_init: plan cudaHostGetDevicePointer failed: %s (%d)\n",
+        fprintf(stderr, "moe_doorbell_init: plan cudaHostGetDevicePointer failed: %s (%d)\n",
                 cudaGetErrorString(err), (int) err);
         cudaFreeHost(g_plans_host);
         cudaFreeHost(g_doorbells_host);
@@ -659,13 +665,13 @@ bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
         if (err == cudaSuccess) err = cudaMemset(g_lru_epoch, 0, (size_t) n_layer * sizeof(uint64_t));
         if (err != cudaSuccess) GGML_ABORT("doorbell LRU allocation failed: %s", cudaGetErrorString(err));
         memset(g_lru_host, 0, touch_bytes);
-        LLAMA_LOG_DEBUG("[moe_gpu_lru] tracking all expert selections, %zu bytes\n", touch_bytes);
+        fprintf(stderr, "[moe_gpu_lru] tracking all expert selections, %zu bytes\n", touch_bytes);
     }
 
     ggml_cuda_moe_slot_resolve_register(moe_doorbell_resolve_launch);
     g_active = true;
     moe_doorbell_dma_init();
-    LLAMA_LOG_DEBUG("moe_doorbell_init: SUCCESS, %zu + %zu bytes for %d layers (plan cap %d)\n",
+    fprintf(stderr, "moe_doorbell_init: SUCCESS, %zu + %zu bytes for %d layers (plan cap %d)\n",
             db_bytes, plan_bytes, n_layer, MOE_DOORBELL_PLAN_MAX);
     return true;
 }
@@ -729,7 +735,7 @@ void moe_doorbell_log_stats() {
     }
     if (selected == g_logged_selected) return;
     g_logged_selected = selected;
-    LLAMA_LOG_DEBUG("[moe_slots] selected=%llu misses=%llu decode_layers=%llu decode_selected=%llu decode_misses=%llu hit=%.3f%%\n",
+    fprintf(stderr, "[moe_slots] selected=%llu misses=%llu decode_layers=%llu decode_selected=%llu decode_misses=%llu hit=%.3f%%\n",
             (unsigned long long) selected, (unsigned long long) misses, (unsigned long long) decode_layers,
             (unsigned long long) decode_selected, (unsigned long long) decode_misses,
             selected ? 100.0 * (double) (selected - misses) / selected : 0.0);

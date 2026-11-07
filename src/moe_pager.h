@@ -24,9 +24,11 @@ struct ggml_backend;
 // off is 4 KiB aligned-down; len covers the pre-pad plus the expert bytes,
 // aligned UP to 4 KiB so O_DIRECT reads always transfer in full.
 struct moe_expert_slice {
-    uint64_t off;   // 4 KiB aligned-down file offset (read starts here)
-    uint32_t len;   // read length, aligned UP to 4 KiB
-    uint32_t pre;   // leading pad bytes before the true expert data (off + pre = true offset)
+    int      fd     = -1; // primary direct/buffered fd
+    int      fd_buf = -1; // persistent buffered fd for Btrfs safe eviction
+    uint64_t off    = 0;  // 4 KiB aligned-down file offset (read starts here)
+    uint32_t len = 0;  // read length, aligned UP to 4 KiB
+    uint32_t pre = 0;  // leading pad bytes before the true expert data
 };
 
 struct moe_lru {
@@ -47,6 +49,8 @@ struct moe_batch_target {
     size_t up_bytes;
     void * dst_down;
     size_t down_bytes;
+    void * host = nullptr;
+    size_t host_bytes = 0;
 };
 
 class moe_pager {
@@ -55,7 +59,7 @@ public:
 
     // Open the GGUF and index every (layer, expert) slice. Returns false and
     // fills `err` on failure. Does not allocate GPU memory.
-    bool init(const char * gguf_path, int n_layer, int n_expert, int n_used, std::string & err);
+    bool init(const char * gguf_path, int n_layer, int n_expert, int n_used, std::string & err, int n_staging = NSTAGE);
 
     // Attach a CUDA backend + graph context so we can DMA into weight tensors.
     void attach_gpu(void * backend, size_t gate_up_elems, size_t down_elems);
@@ -65,6 +69,7 @@ public:
     int  n_expert() const { return n_expert_; }
     int  n_used()   const { return n_used_; }
     size_t bytes_per_expert() const { return bytes_per_expert_; }
+    size_t expert_role_bytes(int il, int role) const { return role_bytes_[(size_t) il * 3 + (size_t) role]; }
 
     // Fetch expert `e` of layer `il` into pinned staging and DMA it into the
     // supplied device pointers (gate, then up, then down). Blocking.
@@ -72,9 +77,8 @@ public:
     bool fetch(int il, int e, void * dst_gate, size_t gate_bytes,
                                   void * dst_up,     size_t up_bytes,
                                   void * dst_down,   size_t down_bytes);
-    // Batched fetch: submit all n_targets in one io_uring_submit (QD = n_targets).
-    // DMAs each expert as its CQE arrives and synchronizes stream once at the end.
-    bool fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream = nullptr, bool sync_gpu = true);
+    // Batched fetch of up to 36 experts, with one submission and one final DMA wait.
+    bool fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream = nullptr);
 
     bool fetch_direct_io(int il, int e, void * dst_gate, size_t gate_bytes,
                          void * dst_up, size_t up_bytes,
@@ -119,9 +123,12 @@ public:
     const moe_expert_slice * slices(int il, int e) const { return &idx_[((size_t) il * n_expert_ + e) * 3]; }
     const char * path() const { return path_.c_str(); }
 
-    // experts.bin is layer-major, with gate|up|down bytes per expert.
-    // Stripped bundles pad each expert to 4096 bytes; legacy packs pad only EOF.
-    bool use_pack(const char * experts_bin, bool aligned, std::string & err);
+    // Optional single-blob expert pack (iq_pack.py output): experts.bin holds
+    // all n_expert experts of a layer back-to-back as gate|up|down, so one
+    // expert is ONE contiguous read instead of three fragmented GGUF ranges.
+    // The blob bytes are identical to the GGUF's, so this is an IO change only.
+    // native_experts.txt gives each layer's base offset and blob_bytes.
+    bool use_pack(const char * experts_bin, const char * index_txt, std::string & err);
     bool pack_mode() const { return pack_mode_; }
     int pack_fd() const { return fd_pack_; }
     int pack_fd_buf();
@@ -144,6 +151,10 @@ public:
     // completed prefetch reads still unconsumed when a demand commit for the
     // same expert arrived (prefetch hit); cumulative
     long stats_pf_hit()   const { return n_pf_hit_; }
+    int64_t stats_batch_disk_wait_us() const { return disk_wait_us_; }
+    double  stats_batch_h2d_ms()       const { return (double) dma_us_ / 1000.0; }
+    int64_t stats_dma_wait_us()        const { return dma_wait_us_; }
+    int64_t stats_dma_bytes()          const { return dma_bytes_; }
     static void * worker_stream();
 
 private:
@@ -153,6 +164,7 @@ private:
     std::string path_;
     int n_layer_ = 0, n_expert_ = 0, n_used_ = 0;
     int fd_ = -1;
+    std::vector<int> fds_;                 // open file descriptors for multi-shard GGUFs
     std::vector<moe_expert_slice> idx_;   // n_layer * n_expert * 3
     size_t bytes_per_expert_ = 0;
     // per-(layer,role) byte length taken from the GGUF index; the pack blob is
@@ -196,6 +208,11 @@ private:
     void * ring_ = nullptr;
     long io_ops_ = 0, io_bytes_ = 0, n_io_fail_ = 0;
     long n_pf_issued_ = 0, n_pf_hit_ = 0;
+    int64_t dma_us_ = 0, dma_wait_us_ = 0;
+    int64_t disk_wait_us_ = 0;
+    int64_t dma_bytes_ = 0;
+    void * dma_events_[72] = {};
+    void ensure_dma_events();
 
     int submit_(int key, bool demand);
     int find_(int key) const;

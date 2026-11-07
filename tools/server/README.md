@@ -1,10 +1,8 @@
-# bel-server: Betelgeuse HTTP server
+# LLaMA.cpp HTTP Server
 
 Fast, lightweight, pure C/C++ HTTP server based on [httplib](https://github.com/yhirose/cpp-httplib), [nlohmann::json](https://github.com/nlohmann/json) and **llama.cpp**.
 
-Set of LLM REST APIs and a web UI, with Betelgeuse's native demand-paged MoE path. The engine remains a llama.cpp fork; API names and `LLAMA_ARG_*` environment variables are unchanged.
-
-**Experimental and partly broken.** `bel-server` is recommended over the CLI for the tested RTX 3060 12 GB / 16 GB RAM / NVMe configuration. Paging supports one context per process and one slot (`-np 1`), CUDA `sm_86`, and no certified MTP. The general features below are inherited server capabilities, not a certification that each works with paged MoE. Start with the [four-file bundle guide](../../README.md) and [historical limits and measurements](../../docs/fluxaeros.md).
+Set of LLM REST APIs and a web UI to interact with llama.cpp.
 
 **Features:**
  * LLM inference of F16 and quantized models on GPU and CPU
@@ -24,10 +22,6 @@ Set of LLM REST APIs and a web UI, with Betelgeuse's native demand-paged MoE pat
 For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
 
 ## Usage
-
-For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, `Qwen3.8-Flash-Next-PLE.gguf` and `profile-qwen4exp.bin` in one directory. The stripped model needs `--moe-direct-io` and `--moe-pack-dir`; no text index is required. Use the [paged quick start](#quick-start), not generic multi-model or parallel examples below.
-
-`--moe-direct-io` is a historical flag name: the optimized demand worker uses buffered `io_uring` reads. `--moe-slots 5000` sizes the shared VRAM expert pool. `--moe-profile PATH` seeds hot-expert choices but does not guarantee 22 tok/s. These are distinct from generated cache warmup: `--auto-warm` opts into up to 256 generated tokens plus one replay (about 42 seconds in the historical test), while `--cache-warmup N` sets the budget and `0` disables it. `--no-warmup` disables only the ordinary empty graph warmup. None of these settings makes the whole expert store resident.
 
 <!-- HELP_START -->
 
@@ -86,6 +80,7 @@ For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, 
 | `-ot, --override-tensor <tensor name pattern>=<buffer type>,...` | override tensor buffer type<br/>(env: LLAMA_ARG_OVERRIDE_TENSOR) |
 | `-cmoe, --cpu-moe` | keep all Mixture of Experts (MoE) weights in the CPU<br/>(env: LLAMA_ARG_CPU_MOE) |
 | `-ncmoe, --n-cpu-moe N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU<br/>(env: LLAMA_ARG_N_CPU_MOE) |
+| `--moe-cache-mib N` | GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)<br/>(env: LLAMA_ARG_MOE_CACHE_MIB) |
 | `-ncffn, --n-cpu-ffn N` | keep the dense FFN weights of the first N layers in the CPU<br/>(dense models; for MoE expert weights use --n-cpu-moe)<br/>(env: LLAMA_ARG_N_CPU_FFN) |
 | `-ngl, --gpu-layers, --n-gpu-layers N` | max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS) |
 | `-sm, --split-mode {none,layer,row,tensor}` | how to split the model across multiple GPUs, one of:<br/>- none: use one GPU only<br/>- layer (default): split layers and KV across GPUs (pipelined)<br/>- row: split weight across GPUs by rows (parallelized)<br/>- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)<br/>(env: LLAMA_ARG_SPLIT_MODE) |
@@ -170,16 +165,13 @@ For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, 
 | `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
-| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
 | `--warmup, --no-warmup` | whether to perform warmup with an empty run (default: enabled) |
-| `--auto-warm` | generate up to 256 cache-warmup tokens and replay the sequence before accepting requests (opt-in) |
-| `--cache-warmup N` | cache-warmup token budget; 0 disables, maximum 8192, bounded by context size (env: `LLAMA_ARG_CACHE_WARMUP`) |
-| `--cache-warmup-prompt TEXT` | representative cache-warmup prompt; startup cost is separate from request timings |
 | `--spm-infill` | use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: disabled) |
 | `--pooling {none,mean,cls,last,rank}` | pooling type for embeddings, use model default if unspecified<br/>(env: LLAMA_ARG_POOLING) |
 | `-np, --parallel N` | number of server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL) |
@@ -199,7 +191,7 @@ For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, 
 | `--tags STRING` | set model tags, comma-separated (informational, not used for routing)<br/>(env: LLAMA_ARG_TAGS) |
 | `--embd-normalize N` | normalisation for embeddings (default: 2) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm) |
 | `--host HOST` | IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: 127.0.0.1)<br/>(env: LLAMA_ARG_HOST) |
-| `--port PORT` | port to listen (default: 8080)<br/>(env: LLAMA_ARG_PORT) |
+| `--port PORT` | port to listen (default: 9931)<br/>(env: LLAMA_ARG_PORT) |
 | `--reuse-port` | allow multiple sockets to bind to the same port (default: disabled)<br/>(env: LLAMA_ARG_REUSE_PORT) |
 | `--path PATH` | path to serve static files from (default: )<br/>(env: LLAMA_ARG_STATIC_PATH) |
 | `--cors-origins ORIGINS` | comma-separated list of allowed origins for CORS (default: *)<br/>if set to special value 'localhost', reflect the Origin header only if it is localhost<br/>(env: LLAMA_ARG_CORS_ORIGINS) |
@@ -216,6 +208,8 @@ For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, 
 | `--mcp-servers-json JSON` | experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_JSON) |
 | `-ag, --agent, -no-ag, --no-agent` | whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_AGENT) |
 | `--ui, --webui, --no-ui, --no-webui` | whether to enable the Web UI (default: enabled)<br/>(env: LLAMA_ARG_UI) |
+| `--connect` | (experimental) open a peer-to-peer tunnel for server using llama-connect (default: disabled)<br/>(env: LLAMA_ARG_CONNECT) |
+| `--connect-code CODE` | manually specify a 40-character code for --connect (default: generate a new one for each run)<br/>(env: LLAMA_ARG_CONNECT_CODE) |
 | `--embedding, --embeddings` | restrict to only support embedding use case; use only with dedicated embedding models (default: disabled)<br/>(env: LLAMA_ARG_EMBEDDINGS) |
 | `--rerank, --reranking` | enable reranking endpoint on server (default: disabled)<br/>(env: LLAMA_ARG_RERANKING) |
 | `--api-key KEY` | API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)<br/>(env: LLAMA_API_KEY) |
@@ -231,11 +225,12 @@ For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, 
 | `--metrics` | enable prometheus compatible metrics endpoint (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_METRICS) |
 | `--props` | enable changing global properties via POST /props (default: disabled)<br/>(env: LLAMA_ARG_ENDPOINT_PROPS) |
 | `--slots, --no-slots` | expose slots monitoring endpoint (default: enabled)<br/>(env: LLAMA_ARG_ENDPOINT_SLOTS) |
-| `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
+| `--slot-save-path PATH` | path to save slot kv cache (default: disabled)<br/>(env: LLAMA_ARG_SLOT_SAVE_PATH) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
+| `--models-memory-margin N` | for router server, MiB of device memory to keep free per device, unload LRU models until a new one fits (default: 0, 0 = disabled)<br/>(env: LLAMA_ARG_MODELS_MEMORY_MARGIN) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
@@ -243,7 +238,7 @@ For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, 
 | `--reasoning-effort LEVEL` | reasoning effort level given to the chat template: 'default' to keep the template default,<br/>or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)<br/>(env: LLAMA_ARG_REASONING_EFFORT) |
 | `--reasoning-budget N` | token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
 | `--reasoning-budget-message MESSAGE` | message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
-| `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: enabled)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
+| `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: template default)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
 | `--chat-template JINJA_TEMPLATE` | set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE) |
 | `--chat-template-file JINJA_TEMPLATE_FILE` | set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE) |
 | `--skip-chat-parsing, --no-skip-chat-parsing` | force a pure content parser, even if a Jinja template is specified; model will output everything in the content section, including any reasoning and/or tool calls (default: disabled)<br/>(env: LLAMA_ARG_SKIP_CHAT_PARSING) |
@@ -269,11 +264,13 @@ For the Betelgeuse bundle, keep `Qwen3.8-Flash-Next-Dense.gguf`, `experts.bin`, 
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
+| `--spec-draft-n-ubatch N` | physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH) |
 | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
 | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |
+| `--spec-draft-sampling {greedy,probabilistic}` | how the draft is sampled: greedy takes its argmax, probabilistic samples it and has the target verify by rejection sampling (default: greedy)<br/>(env: LLAMA_ARG_SPEC_DRAFT_SAMPLING) |
 | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
@@ -324,7 +321,7 @@ For boolean options like `--kv-offload`:
 - `LLAMA_ARG_KV_OFFLOAD=true` means enabled, other accepted values are: `1`, `on`, `enabled`
 - `LLAMA_ARG_KV_OFFLOAD=false` means disabled, other accepted values are: `0`, `off`, `disabled`
 
-Upstream-only reference for docker compose environment variables: the following upstream image does **not** provide Betelgeuse paging or load the stripped bundle. Build this fork for that configuration.
+Example usage of docker compose with environment variables:
 
 ```yml
 services:
@@ -342,6 +339,14 @@ services:
       LLAMA_ARG_ENDPOINT_METRICS: 1
       LLAMA_ARG_PORT: 8080
 ```
+
+### Experimental DeepSeek expert paging
+
+For DeepSeek41 and DSpark/DFlash, `--moe-direct-io` replaces host routed expert weights with a shared CUDA execution ring. Use `-b 64 -ub 16 -c 512 -np 1 -fit off`; MoE execution tiles at six tokens without splitting non-causal draft attention blocks.
+Target and draft share two 36-expert buffers, an LFU GPU hot cache and an 8192 MiB host victim-cache budget (`MOE_CACHE_MIB`). Native MXFP4 draft experts require about 1291 MiB for the execution buffers. GPU cache sizing reserves room for draft weights and scratch; host cache and staging must fit alongside other processes, especially on 16 GiB systems.
+Next-layer lookahead stages previously selected cached experts. Untrained predictions do not issue speculative SSD reads; exact cold demand unions use batched multi-shard GGUF I/O. Model loading does not prefetch or lock routed expert pages. Incomplete reads or unsupported GPU expert operations fail instead of running MoE on CPU.
+`MOE_PLE_STAGING=1` stages only active Engram rows from the companion file: 48 rows of 144 bytes per token across layers 1 and 14. The staged graph never gathers from the full CPU table.
+`MOE_PROFILE=1` reports synchronized per-ubatch GPU/CPU MoE counts and wall-time components, with separate Engram read/dequantization/upload timings. Disable profiling for throughput measurements. GPU execution alone does not establish 32 TG tok/s or 1000 PP tok/s; cold I/O and draft acceptance remain workload-dependent limits.
 
 ### Multimodal support
 
@@ -361,7 +366,7 @@ To use this feature, start the server with `--tools all`. You can also enable on
 
 ### MCP servers
 
-Besides the built-in tools, the server can expose tools coming from MCP servers, added in [#26062](https://github.com/ggml-org/llama.cpp/pull/26062). Only the stdio transport is supported: such a server is a child process reading JSON-RPC messages on its stdin and writing replies on its stdout, so nothing has to be started or maintained outside `bel-server`.
+Besides the built-in tools, the server can expose tools coming from MCP servers, added in [#26062](https://github.com/ggml-org/llama.cpp/pull/26062). Only the stdio transport is supported: such a server is a child process reading JSON-RPC messages on its stdin and writing replies on its stdout, so nothing has to be started or maintained outside `llama-server`.
 
 Servers are declared in a Cursor-compatible JSON file:
 
@@ -374,7 +379,7 @@ Servers are declared in a Cursor-compatible JSON file:
 ```
 
 ```sh
-bel-server -m model.gguf --mcp-servers-config mcp.json
+llama-server -m model.gguf --mcp-servers-config mcp.json
 ```
 
 The same JSON can be passed inline with `--mcp-servers-json`. Each entry under `mcpServers` accepts:
@@ -411,48 +416,61 @@ Recommended `--cors-origins` setting, depending on where the server runs:
 
 Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-credentials` / `--no-cors-credentials`. Background and rationale: [#25655](https://github.com/ggml-org/llama.cpp/pull/25655).
 
+### Running behind a proxy
+
+If your host reaches the internet through a corporate proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before running commands that download models (e.g. `export HTTPS_PROXY=http://proxy.example.com:8080`). Hosts listed in `NO_PROXY` and loopback addresses are contacted directly.
+
 ## Build
 
-`bel-server` is built from the retained CMake target `llama-server`. For the paged configuration, use Linux with the CUDA toolkit and liburing development package. Python 3, `rsvg-convert` and ImageMagick generate the embedded SVG terminal banner at build time; no image tools are needed at runtime.
+`llama-server` is built alongside everything else from the root of the project
 
 - Using `CMake`:
 
   ```bash
-  cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
+  cmake -B build
   cmake --build build --config Release -t llama-server
   ```
 
-  The native binary is `./build/bin/bel-server`; this is not a wrapper or a llama API rename.
+  Binary is at `./build/bin/llama-server`
 
 ## Build with SSL
 
-`bel-server` can also be built with SSL support using OpenSSL 3:
+`llama-server` can also be built with SSL support using OpenSSL 3
 
 - Using `CMake`:
 
   ```bash
-  cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_OPENSSL=ON
+  cmake -B build -DLLAMA_OPENSSL=ON
   cmake --build build --config Release -t llama-server
   ```
 
 ## Quick Start
 
-Download the four runtime files from [Betelgeuse-AI/Alpha-Orionis-XS](https://huggingface.co/Betelgeuse-AI/Alpha-Orionis-XS) under their separate model licenses. The following Linux command keeps the historical memory envelope, one slot and a localhost-only listener. It does not enable generated cache warmup.
+To get started right away, run the following command, making sure to use the correct path for the model you have:
+
+### Unix-based systems (Linux, macOS, etc.)
 
 ```bash
-export BUNDLE=/path/to/Alpha-Orionis-XS
-export MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0
-systemd-run --user --scope --quiet -p MemoryMax=12G -p MemorySwapMax=0 \
-    build/bin/bel-server -m "$BUNDLE/Qwen3.8-Flash-Next-Dense.gguf" \
-    --moe-direct-io --moe-pack-dir "$BUNDLE" \
-    --moe-profile "$BUNDLE/profile-qwen4exp.bin" --moe-slots 5000 \
-    -ngl 99 -np 1 -c 512 -ub 64 -t 6 --cache-warmup 0 \
-    --host 127.0.0.1 --port 8080
+./llama-server -m models/7B/ggml-model.gguf -c 2048
 ```
 
-Open `http://127.0.0.1:8080` for the web UI or use the API below. Do not expose the service to an untrusted network without an authentication and deployment review. Other platforms, upstream container images, larger contexts and multi-model routing are not certified for this paged bundle. The general API reference is retained for ordinary models as well.
+### Windows
 
-When paging initializes, the startup log displays the same true-color star rendering from `assets/betelgeuse.svg` as `bel-cli`, with a native text wordmark. Use `--color on` to force the ANSI image, or `--color off` for the plain-text banner. `NO_COLOR` disables automatic color selection.
+```powershell
+llama-server.exe -m models\7B\ggml-model.gguf -c 2048
+```
+
+The above command will start a server that by default listens on `127.0.0.1:9931`.
+You can consume the endpoints with Postman or NodeJS with axios library. You can visit the web front end at the same url.
+
+### Docker
+
+```bash
+docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:server -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080
+
+# or, with CUDA:
+docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
+```
 
 ## Using with CURL
 
@@ -460,7 +478,7 @@ Using [curl](https://curl.se/). On Windows, `curl.exe` should be available in th
 
 ```sh
 curl --request POST \
-    --url http://localhost:8080/completion \
+    --url http://localhost:9931/completion \
     --header "Content-Type: application/json" \
     --data '{"prompt": "Building a website can be done in 10 simple steps:","n_predict": 128}'
 ```
@@ -554,7 +572,7 @@ These words will not be included in the completion, so make sure to add them to 
 
 `dry_penalty_last_n`: How many tokens to scan for repetitions. Default: `64`, where `0` is disabled.
 
-`dry_sequence_breakers`: Specify an array of sequence breakers for DRY sampling. Only a JSON array of strings is accepted. Default: `['\n', ':', '"', '*']`
+`dry_sequence_breakers`: Specify an array of sequence breakers for DRY sampling. Only a JSON array of strings is accepted. At most 64 distinct breakers, duplicates are ignored. Default: `['\n', ':', '"', '*']`
 
 `xtc_probability`: Set the chance for token removal via XTC sampler. Default: `0.0`, which is disabled.
 
@@ -762,35 +780,125 @@ This endpoint also supports multimodal embeddings. See the documentation for the
 
 ### POST `/reranking`: Rerank documents according to a given query
 
+> [!IMPORTANT]
+>
+> This endpoint is **not** OAI-compatible.
 Similar to https://jina.ai/reranker/ but might change in the future.
-Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)) and the `--embedding --pooling rank` options.
+Requires a reranker model (such as [bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)) and the `--embedding --pooling rank` or `--reranking` options.
 
-*Options:*
+`query` and each `documents`/`texts` element accept a plain string, or
+(for multimodal rerankers such as Qwen3-VL-Reranker) an object of the form
+`{"text": string | [strings], "image": url | data-uri | raw-base64 | [urls]}`.
+All keys are optional; a plain string is treated as `{"text": "..."}`.
 
-`query`: The query against which the documents will be ranked.
-
-`documents`: An array strings representing the documents to be ranked.
+Options: `top_n` (default: all), `model` (echoed in the Jina response), `return_text` (TEI only).
 
 *Aliases:*
   - `/rerank`
   - `/v1/rerank`
   - `/v1/reranking`
 
-*Examples:*
+The format is selected by which key carries the documents: `texts` (TEI, same input shape as Jina,
+set `return_text: true` to echo document text) or `documents` (Jina, multimodal supported).
+
+**Text only (TEI format)** - `query` + `texts`; set `return_text: true` to echo document text:
 
 ```shell
 curl http://127.0.0.1:8012/v1/rerank \
     -H "Content-Type: application/json" \
     -d '{
-        "model": "some-model",
-            "query": "What is panda?",
-            "top_n": 3,
-            "documents": [
-                "hi",
-            "it is a bear",
-            "The giant panda (Ailuropoda melanoleuca), sometimes called a panda bear or simply panda, is a bear species endemic to China."
-            ]
+        "query": "What is machine learning?",
+        "texts": [
+            "Machine learning is a subset of artificial intelligence.",
+            "A python is a large snake."
+        ],
+        "return_text": true
     }' | jq
+```
+
+**Multimodal (Jina Format)** - mix text and images in `query` and/or `documents`:
+
+```shell
+curl http://127.0.0.1:8012/v1/rerank \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen/Qwen3-VL-Reranker-2B",
+        "query": {
+            "text": "A city skyline with tall buildings and a river",
+            "image": "data:image/jpeg;base64,<base64>"
+        },
+        "documents": [
+            "a plain string document is also valid",
+            {
+                "text": "A photograph of the Boston skyline at dusk",
+                "image": "https://example.com/skyline.jpg"
+            },
+            {
+                "text": "caption for the two-figure spread",
+                "image": ["https://example.com/fig1.png", "data:image/jpeg;base64,<base64>"]
+            }
+        ],
+        "top_n": 2
+    }' | jq
+```
+
+Jina format returns a wrapped object with `model`, `object`, `usage` (`prompt_tokens` is the sum
+of `tokens_evaluated` across all scored pairs), and a `results` array of `{index, relevance_score}`.
+TEI format returns a bare array of `{index, score}` (+ `text` when `return_text: true`).
+Both are sorted descending by score and truncated to `top_n`; the score is the match probability in `[0, 1]`.
+
+Images never appear in any response shape.
+
+> **NOTE:** **Input size limit:** A bidirectional-encoder reranker (e.g. `bge-reranker-v2-m3`) must fit the whole prompt within
+`--ubatch-size`; if the input is too large to process, increase `--ubatch-size`.
+Causal decoder rerankers (e.g. `Qwen3-VL-Reranker`) have no such limitation.
+
+
+
+### POST `/tts`: Generate speech audio from text
+
+Returns raw audio bytes (`audio/wav` by default) rather than JSON. For more info, see [tts/README.md](../tts/README.md)
+
+*Options:*
+
+`input`: The text to speak (alias: `prompt`).
+
+`lang`: Language code for the utterance (model-dependent, e.g. `en`, `zh`). Optional.
+
+`voice`: Voice for the utterance (model-dependent, e.g. `female` or `male` for LFM3-Audio). Optional.
+
+`speaker_ref_b64`: Base64-encoded reference audio to clone the speaker's voice. Optional. Alternatively, upload the reference audio as a `speaker_ref` file field via `multipart/form-data` (see example below) - if both are provided, the uploaded file takes precedence.
+
+`top_k`, `top_p`: Sampling params for the acoustic code predictor. Optional, model-dependent defaults apply.
+
+`repeat_penalty`: Repetition penalty applied to the backbone sampler over the whole generation (default `1.05`). Without this, the backbone can loop and re-generate the same utterance.
+
+`seed`: RNG seed for both the backbone sampler and the codec/vocoder (`-1` = random, the default). Set to a fixed value for reproducible output.
+
+`n_predict`: Max number of audio frames to generate. Defaults to `512`; generation normally stops earlier once the model emits an end-of-speech token.
+
+`response_format`: `wav` (default) or `pcm` (raw `float32` little-endian mono samples, no header; the response `Content-Type` carries the sample rate, e.g. `audio/pcm;rate=24000;encoding=float;bits=32`).
+
+`stream`: If `true`, the response is streamed as audio becomes available instead of waiting for the full generation to finish. WAV streaming writes an RFC-noncompliant header with an unknown (`0xFFFFFFFF`) size field, since the final length isn't known up front; most players and decoders (ffmpeg, VLC, ...) handle this by reading until EOF.
+
+Note: it's highly recommended to always provide a speaker reference voice; otherwise, the model's performance may be degraded.
+
+*Examples:*
+
+```shell
+curl -X POST http://127.0.0.1:9931/tts \
+    -H "Content-Type: application/json" \
+    -d '{"input": "Hello, this is a test."}' \
+    -o output.wav
+```
+
+With a speaker reference uploaded as a file (`multipart/form-data`), instead of base64-encoding it into the JSON body:
+
+```shell
+curl -X POST http://127.0.0.1:9931/tts \
+    -F "input=Hello, this is a test." \
+    -F "speaker_ref=@/path/to/speaker-reference.wav;type=audio/wav" \
+    -o output.wav
 ```
 
 ### POST `/infill`: For code infilling.
@@ -919,7 +1027,7 @@ By default, it is read-only. To make POST request to change global properties, y
 - `total_slots` - the total number of slots for process requests (defined by `--parallel` option)
 - `model_path` - the path to model file (same with `-m` argument)
 - `chat_template` - the model's original Jinja2 prompt template
-- `chat_template_caps` - capabilities of the chat template (see `common/jinja/caps.h` for more info)
+- `chat_template_caps` - capabilities of the chat template (see `common/jinja/caps.h` for more info), `reasoning_effort_levels` lists the `reasoning_effort` values the template renders distinctly, from lowest to highest
 - `modalities` - the list of supported modalities
 - `is_sleeping` - sleeping status, see [Sleeping on idle](#sleeping-on-idle)
 
@@ -1253,11 +1361,12 @@ Each object in `data` has an `architecture` object. It has two string arrays:
 - `input_modalities` lists what the model can read. It always has `text`, plus each media type that the model supports.
 - `output_modalities` lists what the model can produce.
 
-One output value is special:
+Some output values are special:
 
 | Value | Meaning |
 |---|---|
 | `decisions` | The model is a native decision model. Serve it with [`/v1/systemone`](#post-v1systemone-typesafe-compatible-system-one-api). |
+| `audio` | The model can generate speech. Serve it with [`/tts`](#post-tts-generate-speech-audio-from-text). A TTS-only model has `["audio"]` without `text`. |
 
 A language model that classifies with prompts does not get `decisions`. Only native decision models do.
 
@@ -1320,7 +1429,7 @@ Example usage with `openai` python library:
 import openai
 
 client = openai.OpenAI(
-    base_url="http://localhost:8080/v1", # "http://<Your api-server IP>:port"
+    base_url="http://localhost:9931/v1", # "http://<Your api-server IP>:port"
     api_key = "sk-no-key-required"
 )
 
@@ -1351,10 +1460,6 @@ The `response_format` parameter supports both plain JSON output (e.g. `{"type": 
 
 `reasoning_control`: Arms realtime reasoning control for this completion so it can be ended early via `/v1/chat/completions/control`. Defaults to `false`.
 
-`generation_prompt`: The generation prompt that was prefilled in by the template. Prepended to model output before parsing.
-
-`parse_tool_calls`: Whether to parse the generated tool call.
-
 `parallel_tool_calls` : Whether to enable parallel/multiple tool calls (only supported on some models, verification is based on jinja template).
 
 For multimodal input (typed content, `messages[i].content[j]`):
@@ -1368,6 +1473,7 @@ For multimodal input (typed content, `messages[i].content[j]`):
 - If `type == "input_video"`:
     - Either `input_video.data` or `input_video.url` can be specified, can be a remote URL, raw base64 or path to local file
     - Accepts formats supported by `ffmpeg`
+    - Models that hear their video (LFM3-Omni) also get its soundtrack, the audio of each group of frames follows them
 - Note: for local file, make sure to set `--media-path`. File path must be prefixed by `file://`
 
 *Examples:*
@@ -1378,7 +1484,7 @@ You can use either Python `openai` library with appropriate checkpoints:
 import openai
 
 client = openai.OpenAI(
-    base_url="http://localhost:8080/v1", # "http://<Your api-server IP>:port"
+    base_url="http://localhost:9931/v1", # "http://<Your api-server IP>:port"
     api_key = "sk-no-key-required"
 )
 
@@ -1396,7 +1502,7 @@ print(completion.choices[0].message)
 ... or raw HTTP requests:
 
 ```shell
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:9931/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer no-key" \
 -d '{
@@ -1486,11 +1592,77 @@ Acts on an in-flight completion identified by its `id` (the `id` field streamed 
 
 Returns a JSON object with a boolean `success` field, and an optional `message` field describing the reason when `success` is `false`.
 
+### WebSocket `/v1/realtime`: Realtime transcription
+
+Transcribes streamed audio, for models with a streaming audio encoder. Compatible with OAI `/v1/realtime` schema.
+
+Models that write the text while they listen use this endpoint: Voxtral Realtime, and live ASR models, which carry the prompt of their transcription in a chat template named `asr` (e.g. the LFM3-Audio live ASR checkpoints, the text of every 0.96 s of audio follows it). A live ASR model restarts its context at a pause after 15 s and always after 30 s, the transcript then goes on in a new line. A commit completes the audio with silence, so that its text comes out.
+
+Live ASR models can also hold a conversation, so they transcribe live only in sessions opened with `/v1/realtime?intent=transcription`, as OpenAI transcription sessions are; other sessions are a [realtime conversation](#realtime-conversation).
+
+Audio must be PCM16, mono, at the model sample rate. The sample rate is returned in `session.created` as `audio.input.format.rate`. Each `input_audio_buffer.append` carries a base64-encoded chunk of PCM16 samples.
+
+*Client events:*
+
+- `session.update`: accepted for compatibility, the server replies with `session.updated`
+- `input_audio_buffer.append`: `audio` holds base64 PCM16 samples
+- `input_audio_buffer.commit`: flushes the audio received so far, so the words still held back by the model's delay are produced. The server replies with `input_audio_buffer.committed` and starts a new item. With `"final": true`, the input ends instead and the last item is completed once the stream drains.
+- `input_audio_buffer.clear`: accepted for compatibility, audio already sent cannot be discarded
+
+Closing the websocket also ends the input.
+
+*Server events:*
+
+- `session.created` and `session.updated`: carry the `session` object
+- `conversation.item.input_audio_transcription.delta`: `delta` holds the new text for `item_id`
+- `conversation.item.input_audio_transcription.completed`: `transcript` holds the full text of `item_id`
+- `input_audio_buffer.committed`: `item_id` of the committed item, `previous_item_id` of the item committed before it (`null` for the first one)
+- `error`: `error.message` describes the problem
+
+Note that words held back by the model's delay at the time of a commit are attributed to the next item.
+
+#### Realtime conversation
+
+Models that answer after the audio, like LFM3-Audio and LFM3-Omni, hold a conversation on the same endpoint (with an `asr` template, unless the session is opened with `?intent=transcription`). The audio is prefilled as it arrives, so the response starts right after the last chunk. Audio input is PCM16 mono at the model sample rate (`audio.input.format.rate` of `session.created`), audio output is PCM16 mono at `audio.output.format.rate`.
+
+`session.type` selects the session, it can be changed with `session.update` before the first audio or message:
+
+- `realtime` (default): a conversation, every response stays in context for the next turns
+- `transcription`: each committed audio buffer is transcribed on its own, `audio.input.transcription.language` picks the language
+
+*Client events:*
+
+- `session.update`: `type`, `instructions` (the system prompt, before the first audio or message), `output_modalities`, `max_output_tokens` (an integer or `"inf"`, the default), `tools` (functions with `name`, `description` and `parameters`, before the first audio or message) and `tool_choice` (`"auto"`, the default, `"none"` or `"required"`)
+- `input_audio_buffer.append`: `audio` holds base64 PCM16 samples
+- `input_audio_buffer.commit`: ends the audio of the user turn, in a transcription session the transcript follows
+- `conversation.item.create`: a user message with `input_text` content, or a `function_call_output` with the `call_id` and `output` of a tool call of the last response
+- `response.create`: ends the user turn and generates the response, `response.output_modalities`, `response.max_output_tokens` and `response.tool_choice` override the session
+- `response.cancel`: stops the response being generated
+
+LFM3-Omni is not trained to reason, run it with `--reasoning off` so that its turns open with an empty think block.
+
+`output_modalities` picks the mode of the responses: left out, the model switches between text and audio on its own; `["text"]` keeps the response in text, `["audio"]` makes it speech and `["text", "audio"]` interleaves text with the speech.
+
+*Server events:*
+
+- `session.created` and `session.updated`: carry the `session` object
+- `input_audio_buffer.committed`, `conversation.item.added`, `conversation.item.done`: the user item
+- `response.created`, `response.output_item.added`, `response.content_part.added`, then `response.output_text.delta` and `response.output_audio.delta` (base64 PCM16) as they are generated, then the `.done` events and `response.done`
+- `response.output_item.added` with a `function_call` item, `response.function_call_arguments.delta` and `.done`: a tool call of the response, its arguments are a JSON string
+- `conversation.item.input_audio_transcription.delta` and `.completed`: in a transcription session
+- `error`: `error.message` describes the problem
+
+Tools go into the system prompt with the chat template, and the tool calls are parsed as in `/v1/chat/completions`. The client runs the calls of a response, sends their results as `function_call_output` items, then asks for the next response.
+
+See [examples/realtime_client.py](../../examples/realtime_client.py) for a client with the `openai` library.
+
 ### POST `/v1/responses`: OpenAI-compatible Responses API
 
 *Options:*
 
 See [OpenAI Responses API documentation](https://platform.openai.com/docs/api-reference/responses).
+
+`extra_params`: llama.cpp parameters that the Responses API has no field for, such as `seed`, `min_p` or `repeat_penalty`, as an object (e.g. `{"seed": 42, "min_p": 0.05}`). Its keys are merged into the converted request and behave as on `/v1/chat/completions`.
 
 *Examples:*
 
@@ -1500,7 +1672,7 @@ You can use either Python `openai` library with appropriate checkpoints:
 import openai
 
 client = openai.OpenAI(
-    base_url="http://localhost:8080/v1", # "http://<Your api-server IP>:port"
+    base_url="http://localhost:9931/v1", # "http://<Your api-server IP>:port"
     api_key = "sk-no-key-required"
 )
 
@@ -1516,13 +1688,14 @@ print(response.output_text)
 ... or raw HTTP requests:
 
 ```shell
-curl http://localhost:8080/v1/responses \
+curl http://localhost:9931/v1/responses \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer no-key" \
 -d '{
 "model": "gpt-4.1",
 "instructions": "You are ChatGPT, an AI assistant. Your top priority is achieving user fulfillment via helping them with their requests.",
-"input": "Write a limerick about python exceptions"
+"input": "Write a limerick about python exceptions",
+"extra_params": {"seed": 42, "min_p": 0.05}
 }'
 ```
 
@@ -1549,7 +1722,7 @@ Each object gives one embedding. This input shape is not part of the OpenAI Embe
 - input as string
 
   ```shell
-  curl http://localhost:8080/v1/embeddings \
+  curl http://localhost:9931/v1/embeddings \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer no-key" \
   -d '{
@@ -1562,7 +1735,7 @@ Each object gives one embedding. This input shape is not part of the OpenAI Embe
 - `input` as string array
 
   ```shell
-  curl http://localhost:8080/v1/embeddings \
+  curl http://localhost:9931/v1/embeddings \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer no-key" \
   -d '{
@@ -1575,7 +1748,7 @@ Each object gives one embedding. This input shape is not part of the OpenAI Embe
 - `input` as multimodal content
 
   ```shell
-  curl http://localhost:8080/v1/embeddings \
+  curl http://localhost:9931/v1/embeddings \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer no-key" \
   -d '{
@@ -1644,6 +1817,8 @@ See [Anthropic Messages API documentation](https://docs.anthropic.com/en/api/mes
 
 `top_k`: Top-k sampling
 
+`extra_params`: llama.cpp parameters that the Anthropic API has no field for, such as `seed`, `min_p` or `repeat_penalty`, as an object (e.g. `{"seed": 42, "min_p": 0.05}`). Its keys are merged into the converted request and behave as on `/v1/chat/completions`.
+
 `stop_sequences`: Array of stop sequences
 
 `stream`: Enable streaming (default: false)
@@ -1655,7 +1830,7 @@ See [Anthropic Messages API documentation](https://docs.anthropic.com/en/api/mes
 *Examples:*
 
 ```shell
-curl http://localhost:8080/v1/messages \
+curl http://localhost:9931/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: your-api-key" \
   -d '{
@@ -1664,7 +1839,8 @@ curl http://localhost:8080/v1/messages \
     "system": "You are a helpful assistant.",
     "messages": [
       {"role": "user", "content": "Hello!"}
-    ]
+    ],
+    "extra_params": {"seed": 42, "min_p": 0.05}
   }'
 ```
 
@@ -1677,7 +1853,7 @@ Accepts the same parameters as `/v1/messages`. The `max_tokens` parameter is not
 *Example:*
 
 ```shell
-curl http://localhost:8080/v1/messages/count_tokens \
+curl http://localhost:9931/v1/messages/count_tokens \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4",
@@ -1703,9 +1879,11 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 *Options:*
 
-`state`: The content to evaluate. Can be a string, an object or an array. A value that is not a string is given to the model as JSON text.
+`state`: The content to evaluate. Can be a string, an object or an array. A value that is not a string is given to the model as JSON text. For lfm2-d1 and lfm2-d1-omni, it can be `null`, for example to ask about images only.
 
-`images`: Optional. An array of images, the maximum number may be limited depending on the model. Each one is a data URL (`data:image/...;base64,...`). See the image input section below.
+`files`: Optional. An array of input files, the maximum number may be limited depending on the model. Each one is a data URL (`data:image/...;base64,...`). For audio-capable models, it can be audio clips (`data:audio/...;base64,...`). See the image input section below.
+
+`images`: Optional. An alias of `files`.
 
 `questions`: An object that maps a question id to a question. Each question has these fields:
 
@@ -1718,20 +1896,24 @@ Follows the [TypeSafe API](https://docs.typesafe.ai/api), streaming is not suppo
 
 The questions of a request are answered independently, an answer does not depend on the other questions. The exception is clef: it reads all the questions in one prompt and decides them jointly.
 
-The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for laya and clef. For laya, long questions and options are truncated to the token budget the model was trained with.
+The number of options of a `choice` question is limited by the model, for example: 52 for openjev, 255 for granite-switch, laya, clef, pplx-decider, vllm-decision2, vllm-d3, lfm2-d1, lfm2-d1-omni and h2o-lightning, 2 for openbmb-minicpm-ocr-jev. For laya, long questions and options are truncated to the token budget the model was trained with.
 
-For laya and clef, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. A server that runs clef only serves this endpoint, text generation is not available.
+For laya, clef, vllm-d3 and lfm2-d1-omni, the whole prompt is evaluated in one batch: it must fit in `--ubatch-size`. An lfm2-d1-omni prompt is cut to 16384 tokens. For vllm-decision2, the options of a question and the end of the prompt must fit in one batch. An h2o-lightning state longer than 32000 tokens keeps its first and last 16000 tokens. A server that runs clef only serves this endpoint, text generation is not available. A decision model that is also a text model, such as granite-switch, serves both and reports `["text", "decisions"]`.
+
+openbmb-minicpm-ocr-jev answers one fixed question: is an OCR text, rendered as an image, consistent with the original image? `state` is the OCR text, as a string, special tokens written in it are escaped. `files` (or `images`) has exactly 2 images: the original, then the rendered one, both are required. The request has one question and no `instructions`: the task is part of the prompt of the model, so a request that sends one is rejected. It is either a `choice` with the `criteria` `{"0": null, "1": null}`, where `1` means consistent, or a `noul` without `criteria`, which returns the probability of `1`. The model has no LM head, so text generation is not available.
+
+Its prompt carries two images, so it is much longer than a text-only one: size the context with `-c` and the batch with `--batch-size`/`--ubatch-size` accordingly. The prompt of a request is evaluated in batches like a normal causal model, the class scores are read from the pooled output of its last token.
 
 *Image input:*
 
-Image input needs a model that supports it (for example: openjev, clef) and its multimodal projector, see `--mmproj`.
+Image input needs a model that supports it (for example: openjev, clef, pplx-decider, vllm-d3, lfm2-d1, lfm2-d1-omni, h2o-lightning, openbmb-minicpm-ocr-jev) and its multimodal projector, see `--mmproj`.
 
 Images can be given in two ways, and both can be used in the same request:
 
-- The `images` field.
-- A `state` made of chat messages, either an array of messages or an object with a `messages` array. An `image_url` part in the `content` of a message is taken as an image, in the same format as chat completions. Only data URLs are accepted.
+- The `files` field, or its alias `images`.
+- A `state` made of chat messages, either an array of messages or an object with a `messages` array. An `image_url` part in the `content` of a message is taken as an image, in the same format as chat completions. Only data URLs are accepted. For lfm2-d1-omni, an `input_audio` part is taken as an audio clip, as base64 data.
 
-All the images are placed before the state in the prompt, the ones from `images` first. The image parts are removed from the state.
+All the images are placed before the state in the prompt, the ones from `files` and `images` first. The image parts are removed from the state.
 
 *Response:*
 
@@ -1753,10 +1935,12 @@ All the images are placed before the state in the prompt, the ones from `images`
 
 The probabilities are scaled with the temperatures stored in the model file. They are not guaranteed to be calibrated for your data.
 
+For h2o-lightning, `score` questions can have 1 to 255 levels, and the `instructions` and `type` of a question can be left out (`choice` by default; `"instructions": null` is written as `null`).
+
 *Examples:*
 
 ```shell
-curl http://127.0.0.1:8080/v1/systemone \
+curl http://127.0.0.1:9931/v1/systemone \
     -H "Content-Type: application/json" \
     -d '{
         "state": "Customer message: I was charged twice for my order last week and nobody has replied.",
@@ -1813,7 +1997,7 @@ Response (values are shortened):
 Example with an image:
 
 ```shell
-curl http://127.0.0.1:8080/v1/systemone \
+curl http://127.0.0.1:9931/v1/systemone \
     -H "Content-Type: application/json" \
     -d '{
         "state": "The document was received by the accounting team this morning.",
@@ -1839,12 +2023,12 @@ For further documentation about this endpoint, please refer to [server internal 
 
 ## Using multiple models
 
-`bel-server` can be launched in a **router mode** that exposes an API for dynamically loading and unloading models. The main process (the "router") automatically forwards each request to the appropriate model instance. This general mode is not a certified configuration for the single-context Betelgeuse paged bundle.
+`llama-server` can be launched in a **router mode** that exposes an API for dynamically loading and unloading models. The main process (the "router") automatically forwards each request to the appropriate model instance.
 
-To start in router mode, launch `bel-server` **without specifying any model**:
+To start in router mode, launch `llama-server` **without specifying any model**:
 
 ```sh
-bel-server
+llama-server
 ```
 
 ### Model sources
@@ -1857,7 +2041,7 @@ There are 3 possible sources for model files:
 By default, the router looks for models in the cache. You can add Hugging Face models to the cache with:
 
 ```sh
-bel-server -hf <user>/<model>:<tag>
+llama-server -hf <user>/<model>:<tag>
 ```
 
 *The server must be restarted after adding a new model.*
@@ -1865,7 +2049,7 @@ bel-server -hf <user>/<model>:<tag>
 Alternatively, you can point the router to a local directory containing your GGUF files using `--models-dir`. Example command:
 
 ```sh
-bel-server --models-dir ./models_directory
+llama-server --models-dir ./models_directory
 ```
 
 If the model contains multiple GGUF (for multimodal or multi-shard), files should be put into a subdirectory. The directory structure should look like this:
@@ -1893,7 +2077,7 @@ models_directory
 You may also specify default arguments that will be passed to every model instance:
 
 ```sh
-bel-server -ctx 8192 -n 1024 -np 2
+llama-server -ctx 8192 -n 1024 -np 2
 ```
 
 Note: model instances inherit both command line arguments and environment variables from the router server.
@@ -1905,7 +2089,7 @@ Alternatively, you can also add GGUF based preset (see next section)
 Model presets allow advanced users to define custom configurations using an `.ini` file:
 
 ```sh
-bel-server --models-preset ./my-models.ini
+llama-server --models-preset ./my-models.ini
 ```
 
 Each section in the file defines a new preset. Keys within a section correspond to command-line arguments (without leading dashes). For example, the argument `--n-gpu-layers 123` is written as `n-gpu-layers = 123`.
@@ -1950,7 +2134,7 @@ model = /Users/abc/my-awesome-model-Q4_K_M.gguf
 Note: some arguments are controlled by router (e.g., host, port, API key, HF repo, model alias). They will be removed or overwritten upon loading.
 
 The precedence rule for preset options is as follows:
-1. **Command-line arguments** passed to `bel-server` (highest priority)
+1. **Command-line arguments** passed to `llama-server` (highest priority)
 2. **Model-specific options** defined in the preset file (e.g. `[ggml-org/MY-MODEL...]`)
 3. **Global options** defined in the preset file (`[*]`)
 
@@ -1983,7 +2167,43 @@ For **GET** endpoints (`/props`, `/metrics`, etc.) The router uses the `model` q
 GET /props?model=ggml-org%2Fgemma-3-4b-it-GGUF%3AQ4_K_M
 ```
 
+For the **WebSocket** endpoint (`/v1/realtime`) The router also uses the `model` query parameter.
+
 By default, the model will be loaded automatically if it's not loaded. To disable this, add `--no-models-autoload` when starting the server. Additionally, you can include `?autoload=true|false` in the query param to control this behavior per-request.
+
+### Memory-based unloading
+
+By default, the router only limits the *number* of loaded models (`--models-max`, least recently used first). With `--models-memory-margin N`, it also keeps track of device memory and unloads models (LRU) until the model being loaded fits, while leaving `N` MiB free on each device.
+
+How it works:
+- On startup, and whenever a model is added or its preset changes, the router spawns one short-lived `llama-server` child per model (one at a time, in the background) that reads the model metadata without allocating memory and reports two measurements:
+  - `min`: the memory the model needs at the smallest context that `--fit` may pick, i.e. `--fit-ctx` (default 4096) times the number of sequences, with the device placement from its preset. If the preset pins the context with `-c`, or sets `--fit off`, this is the memory at that context.
+  - `max`: the memory it needs at the largest context that `--fit` picks given the device memory free at that moment. This is a snapshot: it changes as other models load and unload.
+- When an instance is loaded, it reports the memory it actually allocated (`effective`). With `--fit` on (the default) an instance takes the largest context that fits at load time, so it typically ends up close to `max`. Pin the context with `-c` in the preset of a model if you want it to leave room for other models.
+- Before spawning an instance, the router unloads idle models (LRU) until the `min` of the new model fits in the free memory of every device minus the margin. A model that is serving requests is never unloaded. If nothing is left to unload and the model still does not fit, it is loaded anyway and `--fit` in the instance decides.
+- A load request for a model whose measurement has not finished yet waits for it (the model is moved to the front of the measurement queue).
+
+Notes:
+- The router itself never touches a GPU, all device memory figures come from the child processes.
+- Host (CPU) memory is assumed to be unlimited, as with `--fit`. On a build without GPU devices the memory limit has no effect.
+- A model whose measurement fails (for example a broken GGUF, or an `-hf` model that is not downloaded yet) is loaded without memory checks; the measurement is retried once the model has been loaded successfully.
+- Multimodal projectors (`mmproj`) are not included in the measurements yet, such a model needs more than its `min` reports.
+- The measurements are exposed in the `memory` field of each model in `GET /models` (sizes in bytes), and a `model_memory` event is sent on `/models/sse` when a measurement completes:
+
+```js
+"memory": {
+  "status": "measured", // unmeasured | measuring | measured | failed
+  "min": {
+    "n_ctx": 4096,
+    "devices": [
+      { "kind": "device", "name": "CUDA0", "total": 25757220864, "free": 24387584000, "model": 4986635264, "context": 536870912, "compute": 301989888 },
+      { "kind": "host",   "name": "Host", "model": 263454720, "context": 0, "compute": 16793600 }
+    ]
+  },
+  "max":       { "n_ctx": 131072, "devices": [ /* ... */ ] },
+  "effective": { "n_ctx": 131072, "devices": [ /* ... */ ] } // null unless the model is loaded
+}
+```
 
 ### GET `/models`: List available models
 
@@ -1996,7 +2216,7 @@ Listing all models in cache. The model metadata will also include a field to ind
     "path": "/Users/REDACTED/Library/Caches/llama.cpp/ggml-org_gemma-3-4b-it-GGUF_gemma-3-4b-it-Q4_K_M.gguf",
     "status": {
       "value": "loaded",
-      "args": ["bel-server", "-ctx", "4096"]
+      "args": ["llama-server", "-ctx", "4096"]
     },
     "architecture": {
       "input_modalities": [
@@ -2018,7 +2238,7 @@ Note:
     - If a model is not running, it will be added or updated according to the source
 2. When the model is loaded, the info from `/v1/models` is forwarded to router's `/v1/models`. This includes metadata about the model and the runtime instance.
 
-Each object in `data` has the same `architecture` object as [`GET /v1/models`](#get-v1models-openai-compatible-model-info-api) of a direct server. The server computes both arrays offline. It does not load the model, download files, or run inference. `output_modalities` comes from the GGUF metadata. `input_modalities` comes from the projector file. A native decision model shows `decisions` before its first load, after unload, and while it sleeps:
+Each object in `data` has the same `architecture` object as [`GET /v1/models`](#get-v1models-openai-compatible-model-info-api) of a direct server. The server computes both arrays offline. It does not load the model, download files, or run inference. `output_modalities` comes from the GGUF metadata, plus `audio` when the projector file can generate speech. `input_modalities` comes from the projector file. A native decision model shows `decisions` before its first load, after unload, and while it sleeps:
 
 ```json
 {
@@ -2060,14 +2280,14 @@ The `status` object can be:
 ```json
 "status": {
   "value": "loading",
-  "args": ["bel-server", "-ctx", "4096"]
+  "args": ["llama-server", "-ctx", "4096"]
 }
 ```
 
 ```json
 "status": {
   "value": "unloaded",
-  "args": ["bel-server", "-ctx", "4096"],
+  "args": ["llama-server", "-ctx", "4096"],
   "failed": true,
   "exit_code": 1
 }
@@ -2099,6 +2319,32 @@ Note: for "downloading" state, there can be multiple files be downloading in par
     }
   }
 }
+```
+
+A download that never finished (paused or interrupted) is listed under a separate
+"incomplete" status, without an instance: posting the model to `/models` again resumes it
+from the files already on disk, and `DELETE /models` drops its partial files.
+
+```json
+"status": {
+  "value": "incomplete",
+  "args": []
+}
+```
+
+Cached models and incomplete downloads carry the sidecar kinds they have on disk
+(`mmproj`, `mtp`, `dflash`, `eagle3`, `dspark`), resolved the way `-hf` loads them:
+
+```json
+"sidecars": ["mmproj", "mtp"]
+```
+
+A cached model whose download of more sidecars never finished also lists the kinds not on
+disk yet: posting the model with them resumes them, and `DELETE /models` with `&sidecar={kind}`
+drops their partial files.
+
+```json
+"incomplete_sidecars": ["mtp"]
 ```
 
 ### POST `/models/load`: Load a model
@@ -2209,6 +2455,18 @@ Example events:
   "event": "model_remove"
 }
 
+// only with --models-memory-margin, when the measurement of a model completes (see "Memory-based unloading")
+{
+  "model": "...",
+  "event": "model_memory",
+  "data": {
+    "status": "measured",
+    "min": { /* ... */ },
+    "max": { /* ... */ },
+    "effective": null
+  }
+}
+
 // special event: reload of the list of all models
 {
   "model": "*",
@@ -2220,7 +2478,7 @@ Example events:
 
 Trigger a new download (non-blocking), the progress can be tracked via SSE endpoint `/models/sse`
 
-To cancel model downloading, send an event to `/models/unload`
+To pause a download, send an event to `/models/unload`: it keeps its partial files and is listed as "incomplete" until it is posted again. To cancel it and drop its files, use `DELETE /models`.
 
 Download procedure:
 - Send POST request to `/models`
@@ -2233,8 +2491,13 @@ Payload:
 ```json
 {
   "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+  "sidecars": ["mmproj", "mtp"]
 }
 ```
+
+`sidecars` lists the sidecar kinds pulled with the model, picked by the server the way `-hf` picks them: `mmproj`, and the draft heads `mtp`, `dflash`, `eagle3` and `dspark`. It defaults to `["mmproj"]`, as `-hf` does.
+
+Posting a model that is already in the cache and not running downloads the sidecars it lacks and keeps the files already on disk.
 
 Response (download is started in the background):
 
@@ -2261,6 +2524,10 @@ Response (error, cannot start the download):
 IMPORTANT: only model stored in cache can be deleted. You cannot delete models in a preset.
 
 Model name must be passed via query param: `?model={name}`
+
+To remove one sidecar of a cached model and keep the model, add `&sidecar={kind}` (`mmproj`, `mtp`, `dflash`, `eagle3` or `dspark`); the model must not be running.
+
+Deleting a model keeps the files another cached quant of the repo still loads, such as an mmproj named after the deleted quant, and the partial files another download still writes. A sidecar deleted on its own goes for every quant that shares it.
 
 If delete success, it will send an SSE event of type `model_remove`
 

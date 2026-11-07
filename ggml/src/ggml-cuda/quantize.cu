@@ -133,8 +133,21 @@ static __global__ void quantize_mmq_nvfp4(
 
     int64_t base_idx;
     if constexpr (scatter) {
+        bool any_valid = false;
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            if (ids[(int64_t) blockIdx.x * n_expert_used + slot] >= 0) {
+                any_valid = true;
+                break;
+            }
+        }
+        if (!any_valid) {
+            return;
+        }
         base_idx = (int64_t) blockIdx.x * s02; // one physical row per token
     } else {
+        if (ids && ids[blockIdx.x] < 0) {
+            return;
+        }
         const int64_t i2  = blockIdx.y % ne2;
         const int64_t i3  = blockIdx.y / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
@@ -182,12 +195,14 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
                 for (int slot = 0; slot < n_expert_used; ++slot) {
                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+                    if (i < 0) {
+                        continue;
+                    }
                     scale[i] = warp_amax[0];
                 }
             } else {
                 scale[blockIdx.y * ne1 + blockIdx.x] = warp_amax[0];
             }
-        }
     }
     __syncthreads();
 
@@ -308,6 +323,9 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
             for (int slot = 0; slot < n_expert_used; ++slot) {
                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+                if (i < 0) {
+                    continue;
+                }
                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
                 yqs[2 * sub + 0] = q0;
@@ -370,8 +388,21 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
     ggml_cuda_pdl_sync();
     int64_t base_pos;
     if constexpr (scatter) {
+        bool any_valid = false;
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            if (ids[(int64_t) blockIdx.x * n_expert_used + slot] >= 0) {
+                any_valid = true;
+                break;
+            }
+        }
+        if (!any_valid) {
+            return;
+        }
         base_pos = (int64_t) blockIdx.x * s02; // one physical row per token
     } else {
+        if (ids && ids[blockIdx.x] < 0) {
+            return;
+        }
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
@@ -427,6 +458,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 #pragma unroll
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) {
+                continue;
+            }
             block_fp4_mmq * yb = y + (k_block * ne1 + i);
             char2 * yqs2 = (char2 *) yb->qs;
             if (lane_in_group == 0) {
@@ -473,8 +507,21 @@ static __global__ void quantize_mmq_q8_1(
 
     int64_t base_idx;
     if constexpr (scatter) {
+        bool any_valid = false;
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            if (ids[(int64_t) blockIdx.x * n_expert_used + slot] >= 0) {
+                any_valid = true;
+                break;
+            }
+        }
+        if (!any_valid) {
+            return;
+        }
         base_idx = (int64_t) blockIdx.x * s02; // one physical row per token
     } else {
+        if (ids && ids[blockIdx.x] < 0) {
+            return;
+        }
         const int64_t i2  = blockIdx.z % ne2;
         const int64_t i3  = blockIdx.z / ne2;
         const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
@@ -526,6 +573,9 @@ static __global__ void quantize_mmq_q8_1(
         int64_t ib;
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) {
+                continue;
+            }
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
@@ -597,7 +647,6 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -627,7 +676,6 @@ void quantize_scatter_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 

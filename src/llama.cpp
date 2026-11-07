@@ -324,6 +324,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
 
         ml.lazy.mode = params.lazy_mode;
+        ml.moe_direct_io = params.moe_direct_io;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -349,7 +350,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->t_start_us = tm.t_start_us;
 
         model->hparams.vocab_only = params.vocab_only;
-        model->hparams.no_alloc   = params.no_alloc;
 
         try {
             model->load_hparams(ml);

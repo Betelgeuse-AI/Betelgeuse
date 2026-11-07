@@ -48,12 +48,16 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_top_k_mask;   // use fused top-k sparse attention mask
+    bool auto_ftkm;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
+
+    size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
@@ -63,6 +67,13 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+    bool         moe_direct_io = false;
+    int32_t      moe_slots     = 4096;
+    const char * moe_pack_dir  = nullptr;
+    const char * moe_gguf_path = nullptr;
+    const char * moe_profile_path = nullptr;
+    int32_t      moe_chunk_max = 64;
+
 
     bool         moe_direct_io = false;
     bool         moe_stripped_experts = false;

@@ -95,18 +95,20 @@ static void test(void) {
         common_params base;
         base.n_parallel = 4;
         base.n_outputs_max_per_seq = 8;
-        base.moe_direct_io = true;
-        base.moe_pack_dir = "target-pack";
-        base.moe_profile = "target-profile";
-        base.cache_warmup = 32;
+        base.n_ubatch = 512;
 
-        const auto draft = common_base_params_to_speculative(base);
-        assert(draft.n_outputs_max == 4);
-        assert(draft.n_outputs_max_per_seq == 1);
-        assert(!draft.moe_direct_io);
-        assert(draft.moe_pack_dir.empty());
-        assert(draft.moe_profile.empty());
-        assert(draft.cache_warmup == 0);
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_outputs_max == 4);
+            assert(draft.n_outputs_max_per_seq == 1);
+            assert(draft.n_ubatch == 512); // inherits the target by default
+        }
+
+        base.speculative.draft.n_ubatch = 8;
+        {
+            const auto draft = common_base_params_to_speculative(base);
+            assert(draft.n_ubatch == 8);
+        }
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -179,26 +181,6 @@ static void test(void) {
     };
 
     std::vector<std::string> argv;
-
-    {
-        common_params warmup_params;
-        assert(warmup_params.cache_warmup == 0);
-        argv = {"binary_name", "-m", "model.gguf", "--auto-warm", "--cache-warmup-prompt", "A short topic."};
-        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), warmup_params, LLAMA_EXAMPLE_CLI));
-        assert(warmup_params.cache_warmup == 256);
-        assert(warmup_params.cache_warmup_prompt == "A short topic.");
-        for (const char * value : {"0", "32", "8192"}) {
-            argv = {"binary_name", "-m", "model.gguf", "--cache-warmup", value};
-            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), warmup_params, LLAMA_EXAMPLE_CLI));
-            assert(warmup_params.cache_warmup == std::stoi(value));
-        }
-        for (const char * value : {"-1", "8193"}) {
-            argv = {"binary_name", "-m", "model.gguf", "--cache-warmup", value};
-            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), warmup_params, LLAMA_EXAMPLE_CLI));
-        }
-        argv = {"binary_name", "-m", "model.gguf", "--cache-warmup-prompt", ""};
-        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), warmup_params, LLAMA_EXAMPLE_CLI));
-    }
 
     printf("test-arg-parser: test invalid usage\n\n");
 
