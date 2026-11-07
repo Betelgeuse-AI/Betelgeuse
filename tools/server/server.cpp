@@ -14,6 +14,7 @@
 #include "log.h"
 
 #include "betelgeuse-splash.h"
+#include <filesystem>
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -788,10 +789,39 @@ int llama_server(int argc, char ** argv) {
     // start the stream session manager GC right after common init, before any HTTP route can
     // touch it. lifecycle is symmetric, stop_gc() runs in clean_up() before backend free
     server_stream_session_manager_start();
+    const char * default_model = "/home/zyxciss/Models/BIG-MOE/DeepSeek-V4.1-Flash-1017/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf";
+    const char * default_draft = "/home/zyxciss/Models/BIG-MOE/DeepSeek-V4.1-Flash-1017/dspark-DeepSeek-V4.1-Flash-1017-FLE-Q2K-Q8.gguf";
+    const bool has_default_model = std::filesystem::exists(default_model);
+    if (has_default_model) {
+        params.model.path = default_model;
+        if (std::filesystem::exists(default_draft)) {
+            params.speculative.draft.mparams.path = default_draft;
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+            params.speculative.draft.n_max = 5;
+            params.speculative.draft.p_min = 0.50f;
+        }
+        params.moe_direct_io = true;
+        params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        params.warmup = false;
+        params.fit_params = false;
+        params.cache_ram_mib = 0;
+    }
+
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
+    if (has_default_model && params.model.path == default_model) {
+        if (params.n_gpu_layers < 0) params.n_gpu_layers = 99;
+        if (params.speculative.draft.n_gpu_layers < 0) params.speculative.draft.n_gpu_layers = 99;
+        if (params.n_batch == 2048) params.n_batch = 64;
+        if (params.n_ubatch == 512) params.n_ubatch = 16;
+        if (params.n_ctx == 0) params.n_ctx = 512;
+        if (params.cpuparams.n_threads <= 0) params.cpuparams.n_threads = 6;
+        if (params.cpuparams_batch.n_threads <= 0) params.cpuparams_batch.n_threads = 6;
+    }
+
 
     betelgeuse_show_splash(params.use_color);
 
