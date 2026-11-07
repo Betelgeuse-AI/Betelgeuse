@@ -217,6 +217,7 @@ struct moe_execution_pool {
     int64_t publish_us = 0, d2d_submit_us = 0, h2d_submit_us = 0;
     char * learn_scratch = nullptr;
     size_t learn_scratch_bytes = 0;
+    std::vector<int32_t> core_hot_experts;
     std::vector<int32_t> core_sec_experts;
     std::vector<uint8_t> is_core_sec;
 
@@ -399,8 +400,9 @@ struct moe_execution_pool {
             bool active = false;
             for (size_t j = 0; j < count; ++j) if (selected[j] == key.expert) active = true;
             if (active) continue;
+            if (key.was_rank0) continue;
             if (is_core_sec[(size_t) il * n_exp + (size_t) key.expert]) continue;
-            if (!key.was_rank0) {
+            if (key.hit_count == 0) {
                 if (untouched < 0) untouched = (int) i;
             } else if (key.last_used_step < other_step) {
                 other = (int) i;
@@ -465,8 +467,10 @@ struct moe_execution_pool {
                 check(cudaMemcpyAsync(hot_data(hs), victim_data((size_t) host), bytes, cudaMemcpyHostToDevice, stream_h2d));
                 check(cudaStreamSynchronize(stream_h2d));
                 memcpy(victim_data((size_t) host), learn_scratch, bytes);
+                const bool displaced_was_rank0 = hot[hs].was_rank0;
                 set_entry(hot[hs], ctx, il, e);
-                set_victim((size_t) host, ctx, il, displaced, false);
+                hot[hs].was_rank0 = victim[(size_t) host].was_rank0;
+                set_victim((size_t) host, ctx, il, displaced, displaced_was_rank0);
                 victim[(size_t) host].hit_count = learn_hits[(size_t) il * n_exp + (size_t) displaced];
                 keep[next] = true;
                 ++next;
@@ -663,7 +667,7 @@ struct moe_execution_pool {
                 const size_t count = std::min(capacity, n_cold - first);
                 for (size_t i = first; i < first + count; ++i) {
                     const int slot = is_dsv41(ctx)
-                            ? learn_victim(ctx, il, selected.data(), n_selected)
+                            ? (ids && ids->learn ? learn_victim(ctx, il, selected.data(), n_selected) : -1)
                             : oldest_victim(ctx, il, selected.data(), n_selected);
                     if (slot < 0) {
                         ++direct;
@@ -1045,6 +1049,13 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
         }
         if (warm && !target && !cached(e)) state.enqueue_promotion(il, e);
     }
+    auto best_any_resident = [&](int64_t t, int64_t rank) {
+        const int hot_choice = best_resident(t, rank, true);
+        const int host_choice = best_resident(t, rank, false);
+        if (host_choice < 0) return hot_choice;
+        if (hot_choice < 0) return host_choice;
+        return score(t, hot_choice) > score(t, host_choice) ? hot_choice : host_choice;
+    };
     std::array<int, 8> gpu_slots;
     gpu_slots.fill(-1);
     if (target) {
@@ -1059,14 +1070,46 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
         // Step A: resolve every token's Rank 0 first
         for (int64_t t = 0; t < nt; ++t) {
             if (!active(t)) continue;
-            const int e = original[(size_t) (t * nk)];
+            int e = original[(size_t) (t * nk)];
+            if (state.frozen[(size_t) il] && pool.find_hot(ctx, il, e) < 0 && !cached(e)) {
+                const int alt = best_any_resident(t, 0);
+                if (alt >= 0) e = alt;
+            }
             state.ids[(size_t) (t * nk)] = e;
             pool_add(e);
         }
-        // Step B: fixed core secondary experts (initial 5 VRAM Hot + top 2 Host-RAM experts)
-        for (int s = 0; s < 7; ++s) {
-            pool_add(pool.core_sec_experts[(size_t) il * 7 + s]);
+        // Step B: fixed core hot experts (initial 5 VRAM Hot experts)
+        for (int s = 0; s < 5; ++s) {
+            pool_add(pool.core_hot_experts[(size_t) il * 5 + s]);
         }
+        // At most two extra resident experts by score across the batch
+        std::array<int32_t, 2> extra = {-1, -1};
+        std::array<float, 2> extra_score = {-INFINITY, -INFINITY};
+        auto consider = [&](int e) {
+            if (e < 0 || pool_has(e)) return;
+            float best = -INFINITY;
+            for (int64_t t = 0; t < nt; ++t) {
+                if (!active(t)) continue;
+                best = std::max(best, score(t, e));
+            }
+            if (!std::isfinite(best)) return;
+            if (best > extra_score[0]) {
+                extra_score[1] = extra_score[0]; extra[1] = extra[0];
+                extra_score[0] = best; extra[0] = e;
+            } else if (best > extra_score[1]) {
+                extra_score[1] = best; extra[1] = e;
+            }
+        };
+        for (size_t s = 0; s < hot_count; ++s) {
+            const auto & key = pool.hot[hot_first + s];
+            if (key.owner == ctx && key.layer == il) consider(key.expert);
+        }
+        for (size_t s = 0; s < MOE_TARGET_HOST; ++s) {
+            const auto & key = pool.victim[host_first + s];
+            if (key.owner == ctx && key.layer == il) consider(key.expert);
+        }
+        pool_add(extra[0]);
+        pool_add(extra[1]);
         // Padding rows reuse the allowed pool
         for (int64_t t = 0; t < nt; ++t) {
             if (active(t)) continue;
@@ -2844,6 +2887,7 @@ void llama_context::moe_init_ring() {
         std::vector<int> order((size_t) experts);
         moe_execution->core_sec_experts.resize((size_t) target_layers * 7);
         moe_execution->is_core_sec.assign((size_t) target_layers * experts, 0);
+        moe_execution->core_hot_experts.resize((size_t) target_layers * 5);
         for (int il = 0; il < target_layers; ++il) {
             for (int e = 0; e < experts; ++e) order[(size_t) e] = e;
             ggml_tensor * bias = model.layers[(size_t) il].ffn_exp_probs_b;
@@ -2851,6 +2895,9 @@ void llama_context::moe_init_ring() {
                 if (bias->type != GGML_TYPE_F32 || ggml_nelements(bias) != experts) throw std::runtime_error("invalid MoE router bias");
                 ggml_backend_tensor_get(bias, bias_data.data(), 0, (size_t) experts * sizeof(float));
                 std::sort(order.begin(), order.end(), [&](int a, int b) { return bias_data[(size_t) a] > bias_data[(size_t) b]; });
+            }
+            for (int s = 0; s < 5; ++s) {
+                moe_execution->core_hot_experts[(size_t) il * 5 + s] = order[(size_t) s];
             }
             for (int s = 0; s < 7; ++s) {
                 moe_execution->core_sec_experts[(size_t) il * 7 + s] = order[(size_t) s];
