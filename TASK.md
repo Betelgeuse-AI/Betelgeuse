@@ -574,4 +574,21 @@ The single five-pass session completed under `MemoryMax=12G`; it was not rerun. 
      ```
      Pass 3 restored clean iterative `binary_search` algorithm logic (`left, right = 0, len(arr) - 1; while left <= right: mid = ...; if arr[mid] == target: return mid; elif arr[mid] < target: left = mid + 1; else: right = mid`).
 
+
+### Overclocked System Re-measurement Evidence
+Following system overclocks (GPU power cap to 200W, boosted clocks and memory bandwidth), a re-measurement session was run under `MemoryMax=12G`:
+
+| Pass | Target `rank0_replaced` | Target PP ColdSSD | Target TG ColdSSD | Disk wait | Target VRAM hit | TG tok/s | PP tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 cold learn 68-token TG | **0** | 436/1680 = 25.95% | 1957/18720 = 10.45% | 5625.9 ms | 38.47% TG | 4.653 | 3.025 |
+| 2 warm 32-token TG | 395 | 0/1680 = **0.00%** | 0/8160 = **0.00%** | **0.0 ms** | 57.11% TG | **17.450** | 24.436 |
+| 3 warm 68-token TG | 1283 | 0/1680 = **0.00%** | 0/21360 = **0.00%** | **0.0 ms** | 58.06% TG | **15.301** | 24.889 |
+| 4a learning 64-token PP | **0** | 2076/15360 = 13.52% | - | 4310.7 ms | 50.43% PP | - | 6.398 |
+| 4b warm 64-token PP + 32 TG | 1640 | 0/15360 = **0.00%** | 0/9600 = **0.00%** | **0.0 ms** | 63.14% TG | 11.446 | **59.845** |
+
+- **Warm Pass 4b PP Throughput**: **`59.845 tok/s`** (new peak!).
+- **Warm Pass 2 TG Throughput**: **`17.450 tok/s`** (improved from 15.44 tok/s).
+- **Warm CPU Work**: **`cpu_rows = 0`** and **`cpu_ms = 0.0 ms`** across all warm passes.
+- **Warm ColdSSD**: Exactly **`0.00%`** across all warm passes with **`0.0 ms`** disk wait.
+- **Scope Memory Peak**: `MemoryPeak = 12,489,158,656 B` (11.63 GiB) < 12 GiB, `Result=success`, 0 OOM, 0 swap.
 The final implementation and this file were committed locally on `betelgeuse-ds41` with `moe: task 16 expand decode gpu_slots to 8 in 18-slot stage ring`. No push or PR; `fluxaeros-mtp` untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, and `/tmp/opencode/atomic_hot10_pass*.log`.
