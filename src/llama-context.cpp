@@ -1042,43 +1042,6 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
         }
         if (warm && !target && !cached(e)) state.enqueue_promotion(il, e);
     }
-    std::array<int, 2> gpu_slots = {-1, -1};
-    if (split) {
-        for (int64_t t = 0; t < nt; ++t) {
-            if (!active(t)) continue;
-            const int e0 = original[(size_t) (t * nk + 0)];
-            if (e0 >= 0 && pool.find_hot(ctx, il, e0) < 0 && cached(e0)) {
-                const int slot = pool.find_victim(ctx, il, e0) - (int) host_first;
-                if (slot >= 0 && slot < MOE_TARGET_HOST) {
-                    if (gpu_slots[0] < 0) gpu_slots[0] = slot;
-                    else if (gpu_slots[0] != slot && gpu_slots[1] < 0) { gpu_slots[1] = slot; break; }
-                }
-            }
-        }
-        std::array<int, MOE_TARGET_HOST> frequency = {};
-        std::array<float, MOE_TARGET_HOST> peak;
-        peak.fill(-INFINITY);
-        for (size_t i = 0; i < count; ++i) {
-            const int e = original[i];
-            const int64_t t = (int64_t) i / nk;
-            if (!active(t) || pool.find_hot(ctx, il, e) >= 0 || !cached(e)) continue;
-            const int slot = pool.find_victim(ctx, il, e) - (int) host_first;
-            if (slot >= 0 && slot < MOE_TARGET_HOST) {
-                ++frequency[(size_t) slot];
-                peak[(size_t) slot] = std::max(peak[(size_t) slot], score(t, e));
-            }
-        }
-        for (int & chosen : gpu_slots) {
-            if (chosen >= 0) continue;
-            int best = -1;
-            for (int slot = 0; slot < MOE_TARGET_HOST; ++slot) {
-                if (!frequency[(size_t) slot] || std::find(gpu_slots.begin(), gpu_slots.end(), slot) != gpu_slots.end()) continue;
-                if (best < 0 || frequency[(size_t) slot] > frequency[(size_t) best] ||
-                        (frequency[(size_t) slot] == frequency[(size_t) best] && peak[(size_t) slot] > peak[(size_t) best])) best = slot;
-            }
-            chosen = best;
-        }
-    }
     auto best_hot = [&](int64_t t, int64_t rank) {
         int best = -1;
         float best_score = -INFINITY;
@@ -1110,16 +1073,17 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     auto best_any_resident = [&](int64_t t, int64_t rank) {
         return best_of(t, rank, best_host(t, rank, MOE_TARGET_HOST));
     };
+    std::array<int, 2> gpu_slots = {-1, -1};
     if (target) {
-        std::array<int32_t, MOE_RING_SLOTS> sec_pool;
-        size_t n_pool = 0;
-        auto pool_has = [&](int e) {
-            return std::find(sec_pool.begin(), sec_pool.begin() + n_pool, e) != sec_pool.begin() + n_pool;
-        };
-        auto pool_add = [&](int e) {
-            if (e >= 0 && !pool_has(e) && n_pool < sec_pool.size()) sec_pool[n_pool++] = e;
-        };
         // Step A: resolve every token's Rank 0 first
+        std::array<int32_t, MOE_RING_SLOTS> r0_host;
+        size_t n_r0_host = 0;
+        auto r0_host_has = [&](int e) {
+            return std::find(r0_host.begin(), r0_host.begin() + n_r0_host, e) != r0_host.begin() + n_r0_host;
+        };
+        auto r0_host_add = [&](int e) {
+            if (e >= 0 && !r0_host_has(e) && n_r0_host < r0_host.size()) r0_host[n_r0_host++] = e;
+        };
         for (int64_t t = 0; t < nt; ++t) {
             if (!active(t)) continue;
             int e = original[(size_t) (t * nk)];
@@ -1128,55 +1092,111 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
                 if (alt >= 0) e = alt;
             }
             state.ids[(size_t) (t * nk)] = e;
-            pool_add(e);
-        }
-        // Step B pool: the 5 VRAM Hot slots, then at most two extra host experts
-        for (size_t k = 0; k < hot_count; ++k) {
-            const auto & key = pool.hot[hot_first + k];
-            if (key.owner == ctx) pool_add(key.expert);
-        }
-        std::array<int32_t, 2> extra = {-1, -1};
-        std::array<float, 2> extra_score = {-INFINITY, -INFINITY};
-        for (size_t s = 0; s < MOE_TARGET_HOST; ++s) {
-            const auto & key = pool.victim[host_first + s];
-            if (key.owner != ctx || key.layer != il || pool_has(key.expert)) continue;
-            float best = -INFINITY;
-            for (int64_t t = 0; t < nt; ++t) {
-                if (!active(t)) continue;
-                best = std::max(best, score(t, key.expert));
-            }
-            if (!std::isfinite(best)) continue;
-            if (best > extra_score[0]) {
-                extra_score[1] = extra_score[0]; extra[1] = extra[0];
-                extra_score[0] = best; extra[0] = key.expert;
-            } else if (best > extra_score[1]) {
-                extra_score[1] = best; extra[1] = key.expert;
+            if (pool.find_hot(ctx, il, e) < 0) {
+                r0_host_add(e);
             }
         }
-        pool_add(extra[0]);
-        pool_add(extra[1]);
-        // Padding rows reuse the allowed pool
+        // Step B: define shared secondary Host-RAM candidates h_sec1 and h_sec2 across the batch.
+        // Prioritize Host-RAM experts already selected by Rank 0 in this batch (S_{r0_host}).
+        int32_t h_sec1 = -1;
+        int32_t h_sec2 = -1;
+        if (n_r0_host > 0) h_sec1 = r0_host[0];
+        if (n_r0_host > 1) h_sec2 = r0_host[1];
+
+        // If we still need candidate(s), select the highest-scoring Host-RAM slot(s) across the batch
+        if (h_sec1 < 0 || h_sec2 < 0) {
+            std::array<int32_t, 2> extra = {-1, -1};
+            std::array<float, 2> extra_score = {-INFINITY, -INFINITY};
+            for (size_t s = 0; s < MOE_TARGET_HOST; ++s) {
+                const auto & key = pool.victim[host_first + s];
+                if (key.owner != ctx || key.layer != il || key.expert == h_sec1 || key.expert == h_sec2) continue;
+                float best = -INFINITY;
+                for (int64_t t = 0; t < nt; ++t) {
+                    if (!active(t)) continue;
+                    best = std::max(best, score(t, key.expert));
+                }
+                if (!std::isfinite(best)) continue;
+                if (best > extra_score[0]) {
+                    extra_score[1] = extra_score[0]; extra[1] = extra[0];
+                    extra_score[0] = best; extra[0] = key.expert;
+                } else if (best > extra_score[1]) {
+                    extra_score[1] = best; extra[1] = key.expert;
+                }
+            }
+            if (h_sec1 < 0) {
+                h_sec1 = extra[0];
+                if (h_sec2 < 0) h_sec2 = extra[1];
+            } else if (h_sec2 < 0) {
+                h_sec2 = extra[0];
+            }
+        }
+
+        // Padding rows reuse the 5 VRAM Hot slots
         for (int64_t t = 0; t < nt; ++t) {
             if (active(t)) continue;
             for (int64_t rank = 0; rank < nk; ++rank) {
-                state.ids[(size_t) (t * nk + rank)] = sec_pool[(size_t) rank % n_pool];
+                const auto & key = pool.hot[hot_first + (size_t) rank % hot_count];
+                state.ids[(size_t) (t * nk + rank)] = key.expert;
                 if (state.cpu && (size_t) rank >= hot_count) state.cpu_mask[(size_t) (t * nk + rank)] = 1;
             }
         }
-        // Step B: secondary ranks reuse the pooled experts
+
+        // Step B: per-token secondary selection r = 1..5 bounding Host-RAM experts to <= 2
         for (int64_t t = 0; t < nt; ++t) {
             if (!active(t)) continue;
+            const int e0 = state.ids[(size_t) (t * nk)];
+            const bool e0_in_host = (pool.find_hot(ctx, il, e0) < 0);
+
+            // Build token t's secondary pool
+            std::array<int32_t, 8> t_pool;
+            size_t n_t_pool = 0;
+            auto t_pool_has = [&](int e) {
+                return std::find(t_pool.begin(), t_pool.begin() + n_t_pool, e) != t_pool.begin() + n_t_pool;
+            };
+            auto t_pool_add = [&](int e) {
+                if (e >= 0 && !t_pool_has(e) && n_t_pool < t_pool.size()) t_pool[n_t_pool++] = e;
+            };
+
+            // 5 VRAM Hot slots
+            for (size_t k = 0; k < hot_count; ++k) {
+                const auto & key = pool.hot[hot_first + k];
+                if (key.owner == ctx) t_pool_add(key.expert);
+            }
+            // Host-RAM candidate(s)
+            if (e0_in_host) {
+                t_pool_add(h_sec1);
+            } else {
+                t_pool_add(h_sec1);
+                t_pool_add(h_sec2);
+            }
+
             for (int64_t rank = 1; rank < nk; ++rank) {
                 int best = -1;
                 float best_score = -INFINITY;
-                for (size_t j = 0; j < n_pool; ++j) {
-                    const int e = sec_pool[j];
+                for (size_t j = 0; j < n_t_pool; ++j) {
+                    const int e = t_pool[j];
                     if (used(t, rank, e)) continue;
                     const float val = score(t, e);
                     if (std::isfinite(val) && val > best_score) { best = e; best_score = val; }
                 }
                 if (best < 0) GGML_ABORT("MoE secondary pool cannot fill distinct experts");
                 state.ids[(size_t) (t * nk + rank)] = best;
+            }
+        }
+        if (split) {
+            for (size_t i = 0; i < count; ++i) {
+                if (!active((int64_t) i / nk)) continue;
+                const int e = state.ids[i];
+                if (e >= 0 && pool.find_hot(ctx, il, e) < 0 && cached(e)) {
+                    const int slot = pool.find_victim(ctx, il, e) - (int) host_first;
+                    if (slot >= 0 && slot < MOE_TARGET_HOST) {
+                        if (gpu_slots[0] < 0) {
+                            gpu_slots[0] = slot;
+                        } else if (gpu_slots[1] < 0 && gpu_slots[0] != slot) {
+                            gpu_slots[1] = slot;
+                        }
+                    }
+                }
             }
         }
     } else {
