@@ -68,7 +68,7 @@ export MODELS=/path/to/Models/BIG-MOE/DeepSeek-V4.1-Flash-1017
 
 systemd-run --user -p MemoryMax=12G -p MemorySwapMax=0 --unit=bel-ds41-srv \
   ./build/bin/bel-server \
-  -m  "$MODELS/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf" \
+  -m  "$MODELS/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00007.gguf" \
   -md "$MODELS/dspark-DeepSeek-V4.1-Flash-1017-FLE-Q2K-Q8.gguf" \
   --spec-type draft-dspark --spec-draft-n-max 5 --spec-draft-p-min 0.50 \
   --moe-direct-io \
