@@ -147,6 +147,8 @@ static llama_context * g_moe_resolve_ctx = nullptr;
 static constexpr int MOE_RING_SLOTS = 18;
 static constexpr int MOE_TARGET_HOT = 5;
 static constexpr int MOE_TARGET_HOST = 15;
+static constexpr int MOE_TARGET_ZONE_A = 9;
+static constexpr int MOE_TARGET_ZONE_B = MOE_TARGET_HOST - MOE_TARGET_ZONE_A;
 static constexpr int MOE_DRAFT_HOT = 12;
 static constexpr int MOE_DRAFT_HOST = 20;
 
@@ -376,6 +378,24 @@ struct moe_execution_pool {
         victim[slot].was_rank0 = was_rank0;
         ctx->moe.host_slot_of[(size_t) il * ctx->moe.n_expert + e] = (int32_t) slot;
     }
+    int zone_b_victim(llama_context * ctx, int il) {
+        const size_t bytes = ctx->pager.expert_role_bytes(il, 0) + ctx->pager.expert_role_bytes(il, 1) + ctx->pager.expert_role_bytes(il, 2);
+        const size_t first = (size_t) il * MOE_TARGET_HOST + MOE_TARGET_ZONE_A;
+        for (size_t i = first; i < first + MOE_TARGET_ZONE_B; ++i) {
+            const auto & key = victim[i];
+            if (key.bytes >= bytes && !key.owner) return (int) i;
+        }
+        return -1;
+    }
+    size_t zone_b_free(llama_context * ctx, int il) const {
+        const size_t bytes = ctx->pager.expert_role_bytes(il, 0) + ctx->pager.expert_role_bytes(il, 1) + ctx->pager.expert_role_bytes(il, 2);
+        const size_t first = (size_t) il * MOE_TARGET_HOST + MOE_TARGET_ZONE_A;
+        size_t count = 0;
+        for (size_t i = first; i < first + MOE_TARGET_ZONE_B; ++i) {
+            if (victim[i].bytes >= bytes && !victim[i].owner) ++count;
+        }
+        return count;
+    }
     bool promote_async(llama_context * ctx, int il, int e, char * scratch) {
         // Target experts are demand-filled by Rank 0 only; this path serves the draft model.
         if (is_dsv41(ctx)) return false;
@@ -567,7 +587,7 @@ struct moe_execution_pool {
                 for (size_t j = 0; j < n_rank0; ++j) selected[n_selected++] = rank0_selected[j];
                 for (size_t j = 0; j < count; ++j) selected[n_selected++] = cold_ids[first + j];
                 for (size_t i = first; i < first + count; ++i) {
-                    const int slot = oldest_victim(ctx, il, selected.data(), n_selected);
+                    const int slot = is_dsv41(ctx) ? zone_b_victim(ctx, il) : oldest_victim(ctx, il, selected.data(), n_selected);
                     if (slot < 0) {
                         ++direct;
                     } else {
@@ -903,7 +923,7 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     const bool target = pool.is_dsv41(ctx);
     const bool warm = state.warm[(size_t) il] != 0;
     const size_t count = (size_t) (nk * nt);
-    const bool split = target && warm && input && nk == MOE_TARGET_HOT + 1;
+    const bool split = target && warm && input && nk == MOE_TARGET_HOT + 1 && nt <= 6;
     if (split && !state.cpu) throw std::runtime_error("MoE CPU executor is unavailable");
     if (state.cpu) std::fill_n(state.cpu_mask.begin(), count, 0);
     const size_t token_offset = state.current_layer == il ? state.layer_tokens : 0;
@@ -983,7 +1003,7 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
             chosen = best;
         }
     }
-    auto best_gpu_resident = [&](int64_t t, int64_t rank) {
+    auto best_hot = [&](int64_t t, int64_t rank) {
         int best = -1;
         float best_score = -INFINITY;
         for (size_t s = hot_first; s < hot_first + hot_count; ++s) {
@@ -992,24 +1012,54 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
             const float val = score(t, key.expert);
             if (std::isfinite(val) && val > best_score) { best = key.expert; best_score = val; }
         }
-        if (split) {
-            for (int slot : gpu_slots) {
-                if (slot < 0) continue;
-                const auto & key = pool.victim[host_first + (size_t) slot];
-                if (key.owner != ctx || key.layer != il || used(t, rank, key.expert)) continue;
-                const float val = score(t, key.expert);
-                if (std::isfinite(val) && val > best_score) { best = key.expert; best_score = val; }
-            }
+        return best;
+    };
+    auto best_host = [&](int64_t t, int64_t rank, size_t count) {
+        int best = -1;
+        float best_score = -INFINITY;
+        for (size_t s = host_first; s < host_first + count; ++s) {
+            const auto & key = pool.victim[s];
+            if (key.owner != ctx || key.layer != il || used(t, rank, key.expert)) continue;
+            const float val = score(t, key.expert);
+            if (std::isfinite(val) && val > best_score) { best = key.expert; best_score = val; }
         }
         return best;
     };
-    auto best_any_resident = [&](int64_t t, int64_t rank) {
-        const int ram_choice = best_resident(t, rank, false);
-        const int hot_choice = best_gpu_resident(t, rank);
-        if (ram_choice < 0) return hot_choice;
-        if (hot_choice < 0) return ram_choice;
-        return score(t, hot_choice) > score(t, ram_choice) ? hot_choice : ram_choice;
+    auto best_of = [&](int64_t t, int64_t rank, int host_choice) {
+        const int hot_choice = best_hot(t, rank);
+        if (host_choice < 0) return hot_choice;
+        if (hot_choice < 0) return host_choice;
+        return score(t, hot_choice) > score(t, host_choice) ? hot_choice : host_choice;
     };
+    auto best_zone_a = [&](int64_t t, int64_t rank) {
+        return best_of(t, rank, best_host(t, rank, MOE_TARGET_ZONE_A));
+    };
+    auto best_any_resident = [&](int64_t t, int64_t rank) {
+        return best_of(t, rank, best_host(t, rank, MOE_TARGET_HOST));
+    };
+    auto best_with_pending = [&](int64_t t, int64_t rank, const int32_t * pending, size_t n) {
+        int best = best_any_resident(t, rank);
+        float best_score = best >= 0 ? score(t, best) : -INFINITY;
+        for (size_t j = 0; j < n; ++j) {
+            const int c = pending[j];
+            if (used(t, rank, c)) continue;
+            const float val = score(t, c);
+            if (std::isfinite(val) && val > best_score) { best = c; best_score = val; }
+        }
+        return best;
+    };
+    const size_t zone_b_slots = target ? pool.zone_b_free(ctx, il) : 0;
+    std::array<int32_t, 64> pending_rank0;
+    size_t n_pending = 0;
+    if (target && !warm && zone_b_slots > 0) {
+        for (int64_t t = 0; t < nt; ++t) {
+            if (!active(t)) continue;
+            const int e = original[(size_t) (t * nk)];
+            if (pool.find_hot(ctx, il, e) >= 0 || cached(e)) continue;
+            if (std::find(pending_rank0.begin(), pending_rank0.begin() + n_pending, e) != pending_rank0.begin() + n_pending) continue;
+            if (n_pending < zone_b_slots) pending_rank0[n_pending++] = e;
+        }
+    }
     for (int64_t t = 0; t < nt; ++t) {
         if (!active(t)) {
             for (int64_t rank = 0; rank < nk; ++rank) {
@@ -1023,8 +1073,16 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
         for (int64_t rank = 0; rank < nk; ++rank) {
             int e = original[(size_t) (t * nk + rank)];
             if (target) {
-                // Rank 0 keeps its routed expert so the layer can demand-fetch it. Secondary ranks are resident-only.
-                if (rank > 0) e = best_any_resident(t, rank);
+                if (rank > 0) {
+                    // Secondary ranks see only the immutable Zone A profile.
+                    e = best_zone_a(t, rank);
+                } else if (pool.find_hot(ctx, il, e) < 0 && !cached(e)) {
+                    if (std::find(pending_rank0.begin(), pending_rank0.begin() + n_pending, e) == pending_rank0.begin() + n_pending) {
+                        // No Zone B slot for this Rank 0; use the best Zone A or Zone B expert.
+                        const int alt = best_with_pending(t, rank, pending_rank0.data(), n_pending);
+                        if (alt >= 0) e = alt;
+                    }
+                }
             } else if (warm) {
                 if (!cached(e) || used(t, rank, e)) e = best_resident(t, rank, false);
             }
@@ -1107,11 +1165,6 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     }
     state.layer_tokens += (size_t) nt;
     if (state.layer_tokens >= ctx->moe.last_ntok) {
-        if (target && !ctx->moe.is_decode && state.prompt_reseed && state.prompt_complete) {
-            lock.unlock();
-            pool.refresh_hot(ctx, state.prompt_freq, il);
-            lock.lock();
-        }
         if ((target && ctx->moe.is_decode) || (!target && ctx->moe.last_ntok >= ctx->get_model().hparams.dflash_block_size)) state.warm[(size_t) il] = 1;
         state.prefetch(il + 1);
     }
@@ -2742,8 +2795,8 @@ void llama_context::moe_init_ring() {
                 ggml_backend_tensor_get(bias, bias_data.data(), 0, (size_t) experts * sizeof(float));
                 std::sort(order.begin(), order.end(), [&](int a, int b) { return bias_data[(size_t) a] > bias_data[(size_t) b]; });
             }
-            const int seed_count = std::min(experts, std::max(used, MOE_TARGET_HOT));
-            std::array<moe_batch_target, 6> seeds = {};
+            const int seed_count = std::min(experts, std::max(used, MOE_TARGET_ZONE_A));
+            std::array<moe_batch_target, MOE_TARGET_ZONE_A> seeds = {};
             for (int s = 0; s < seed_count; ++s) {
                 const size_t hot_slot = (size_t) il * MOE_TARGET_HOT + (size_t) s;
                 const size_t host_slot = (size_t) il * MOE_TARGET_HOST + (size_t) s;

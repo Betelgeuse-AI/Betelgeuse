@@ -164,3 +164,50 @@ Pass 3 output:
 ```
 
 The single five-pass session was not rerun. No commit, push, reset, stash restore, or PR was performed; `fluxaeros-mtp` is untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, `/tmp/opencode/atomic_hot10_pass*.log`.
+
+---
+
+## Atomic task 11: immutable Zone A, Rank-0 Zone B, single-pass PP
+
+### Objective
+Split each target layer's 15 Host-RAM slots into 9 immutable Zone A profile slots plus 6 append-only Zone B Rank-0 slots. Secondary ranks select only from Zone A (5 hot + 9 host). Rank 0 uses Zone A and Zone B, fetches only into a free Zone B slot on a cold pass, and falls back to the best Zone A or Zone B expert when no slot or when warm. Hot slots stay frozen after seeding. Remove the 3-token PP tiling and the PP CPU branch.
+
+### Implementation
+1. Seed 9 host entries per target layer (Zone A host 0..8) plus the 5 hot slots. The 14 Zone A slots hold the top-9 router-bias experts; hot duplicates host 0..4. Zone B host 9..14 starts empty and is never evicted.
+2. `zone_b_victim`/`zone_b_free` scan only host slots 9..14. Cold Rank-0 misses write-allocate into free Zone B slots; once all are full, the pass falls back to the best Zone A or Zone B expert. Warm misses always fall back.
+3. The active ubatch pre-scans its first `zone_b_free` distinct missing Rank-0 experts. Fallback selection sees Zone A, filled Zone B, and that pending set, so a cold ubatch and its warm repeat choose from the same candidate pool.
+4. Secondary ranks scan only host 0..8 and the 5 hot slots. They never see Zone B and never trigger a fetch.
+5. Remove the target `refresh_hot` call so Zone A hot slots are immutable. DFlash keeps its own promotion and 12+20 cache.
+6. Shared MoE tiles are disabled for the 6-expert target (`tile_size = 64`), so a 16-token PP ubatch runs one MoE pass per layer. The target CPU branch is limited to `nt <= 6`; PP stages all selected host experts into the 18-slot ring. The union is bounded by 9 Zone A host plus 6 Zone B experts.
+7. Pass 1 and Pass 3 use `n_predict = 96`; Pass 2 uses 32; Pass 4a/4b use the 64-token prompt.
+
+### Acceptance
+- Warm Pass 2/3/4b target `ColdSSD = 0.00%`, `disk_wait_ms = 0.0`.
+- Scope `MemoryPeak` inside `MemoryMax=12G`, zero OOM.
+- Warm Pass 4b PP about 50+ tok/s; Pass 2/3 TG 15-18+ tok/s.
+- Complete `binary_search` Python from Pass 3.
+- One benchmark session; then commit locally with `moe: task 11 zone A/B invariant routing and single-pass PP`. No push or PR.
+
+### Evidence
+The first launch completed Pass 1 but crashed in warm Pass 2: the graph still built the two-branch warm split while runtime routing disabled it for PP. Gating the graph split on `n_tokens <= 6` fixed the mismatch; the five-pass session below then ran once and was not rerun.
+
+Geometry was unchanged: `stage=2x18 554.41 MiB hot=236 2854.42 MiB inclusive_host=660 7922.02 MiB target_host=600 draft_host=60 draft_vram=36`. Protocol was valid: `prompt_n` 7/7/7/64/64 and `cache_n=0` on every pass.
+
+| Pass | Target `rank0_replaced` | Target PP ColdSSD | Target TG ColdSSD | Target disk wait | TG tok/s | PP tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 cold 96-token TG | 2760 | 274/1680 = 16.31% | 11/24960 = 0.044% | 633.0 ms | 12.796 | - |
+| 2 warm 32-token TG | 889 | 0/1680 = 0.00% | 0/8400 = 0.00% | 0.0 ms | 10.347 | - |
+| 3 warm 96-token TG | 2788 | 0/1680 = 0.00% | 0/23760 = 0.00% | 0.0 ms | 14.515 | - |
+| 4a 64-token PP | 1514 | 0/15360 = 0.00% | - | 0.0 ms | - | 44.401 |
+| 4b warm 64-token PP | 1514 | 0/15360 = 0.00% | - | 0.0 ms | - | 50.631 |
+
+Warm target ColdSSD was exactly `0.00%` and `disk_wait_ms = 0.0` on Pass 2, Pass 3, Pass 4a, and Pass 4b. There were zero `[moe_cold]` lines and zero target `promo_bg`. Pass 4a and 4b have identical counters, and the Pass 2 content is a prefix of Pass 3, so the frozen-cache trajectory invariant holds.
+
+Scope memory: peak `12,529,819,648 B` (11.67 GiB), `MemoryCurrent` 11,148,341,248 B before requests and 11,617,148,928 B after Pass 4b, `MemorySwapPeak=0`, `Result=success`, zero OOM, zero aborts. `hot_slots=200`, `host_slots=556`: Zone B is append-only and filled 196 of 240 slots during the cold phase.
+
+Misses:
+- Pass 2/3 TG were `10.347`/`14.515 tok/s`, below 15-18+.
+- Pass 3 Python is degenerate and invalid: `if (len(array) > 0) < 0: 0: 0: ...` for 96 tokens. The immutable Zone A profile leaves only 9 distinct experts for ranks 1..5, so output quality collapsed even though the warm-cache invariant is exact.
+- The first launch was an implementation failure, not a benchmark rerun; the five-pass session was run once after the graph fix.
+
+The final implementation and this file were committed locally on `betelgeuse-ds41` with `moe: task 11 zone A/B invariant routing and single-pass PP`. No push or PR; `fluxaeros-mtp` untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, and `/tmp/opencode/atomic_hot10_pass*.log`.

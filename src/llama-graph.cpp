@@ -2174,7 +2174,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
-    const int64_t tile_size = moe_shared ? std::max<int64_t>(1, 18 / n_expert_used) : 6;
+    const int64_t tile_size = moe_shared ? (n_expert_used == 6 ? 64 : std::max<int64_t>(1, 18 / n_expert_used)) : 6;
     if (moe_shared && n_tokens > tile_size) {
         ggml_tensor * output = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_tensor * prev_tile = nullptr;
@@ -2409,7 +2409,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 if (scores->type != GGML_TYPE_F32) {
                     scores = ggml_cast(ctx0, scores, GGML_TYPE_F32);
                 }
-                const bool warm_split_moe = moe_resident && is_eligible_cpu_moe && n_expert_used == 6;
+                const bool warm_split_moe = moe_resident && is_eligible_cpu_moe && n_expert_used == 6 && n_tokens <= 6;
                 if (warm_split_moe) {
                     kick = ggml_moe_slot_resolve_kick(ctx0, sel_c, const_cast<ggml_tensor *>(moe_table[il]), scores, cur, (int32_t) il, sentinel);
                     if (moe_kick_dep) {
