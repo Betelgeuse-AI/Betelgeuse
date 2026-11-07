@@ -1,6 +1,6 @@
 <p align="center">
   <!-- Hero GIF: assets/betelgeuse.gif (leave ~240px of vertical space above the title) -->
-  <img src="assets/betelgeuse.gif" alt="Betelgeuse: a deep-red block star with an amber core" width="320">
+  <img src="assets/betelgeuse-splash.gif" alt="Betelgeuse: a deep-red block star with an amber core" width="320">
 </p>
 
 <h1 align="center">Betelgeuse <sub><i>Alpha-Orionis</i></sub></h1>
