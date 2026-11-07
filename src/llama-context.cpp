@@ -147,7 +147,7 @@ static llama_context * g_moe_resolve_ctx = nullptr;
 static constexpr int MOE_RING_SLOTS = 18;
 static constexpr int MOE_TARGET_HOT = 5;
 static constexpr int MOE_TARGET_HOST = 15;
-static constexpr int MOE_TARGET_SEED = 9;
+static constexpr int MOE_TARGET_PROFILE = MOE_TARGET_HOT + MOE_TARGET_HOST;
 static constexpr int MOE_DRAFT_HOT = 12;
 static constexpr int MOE_DRAFT_HOST = 20;
 
@@ -197,6 +197,8 @@ struct moe_execution_pool {
     size_t stage_bytes = 0, host_bytes = 0;
     int target_layers = 0, cuda_device = 0;
     char * host = nullptr;
+    char * learn_scratch = nullptr;
+    size_t learn_scratch_bytes = 0;
     std::vector<entry> hot, victim;
     std::array<entry, MOE_RING_SLOTS> bank[2];
     entry zero[2];
@@ -242,6 +244,7 @@ struct moe_execution_pool {
             cudaHostUnregister(host);
             munmap(host, host_bytes);
         }
+        if (learn_scratch) cudaFreeHost(learn_scratch);
     }
     void reserve_timers(size_t resolves) {
         const size_t counts[TIMER_COUNT] = {4 * resolves + 1, 2 * resolves + hot.size() + 1, resolves, 3 * resolves, resolves, resolves, resolves};
@@ -383,8 +386,8 @@ struct moe_execution_pool {
     int learn_victim(llama_context * ctx, int il, const int32_t * selected, size_t count) {
         const size_t first = (size_t) il * MOE_TARGET_HOST;
         const size_t bytes = ctx->pager.expert_role_bytes(il, 0) + ctx->pager.expert_role_bytes(il, 1) + ctx->pager.expert_role_bytes(il, 2);
-        int untouched = -1, other = -1, rank0 = -1;
-        uint64_t other_step = UINT64_MAX, rank0_step = UINT64_MAX;
+        int untouched = -1, other = -1;
+        uint64_t other_step = UINT64_MAX;
         for (size_t i = first; i < first + MOE_TARGET_HOST; ++i) {
             const auto & key = victim[i];
             if (key.bytes < bytes) continue;
@@ -393,17 +396,16 @@ struct moe_execution_pool {
             bool active = false;
             for (size_t j = 0; j < count; ++j) if (selected[j] == key.expert) active = true;
             if (active) continue;
-            if (!key.was_rank0 && key.hit_count == 0) {
+            if (key.was_rank0) continue;
+            if (key.hit_count == 0) {
                 if (untouched < 0) untouched = (int) i;
-            } else if (key.was_rank0) {
-                if (key.last_used_step < rank0_step) { rank0 = (int) i; rank0_step = key.last_used_step; }
-            } else {
-                if (key.last_used_step < other_step) { other = (int) i; other_step = key.last_used_step; }
+            } else if (key.last_used_step < other_step) {
+                other = (int) i;
+                other_step = key.last_used_step;
             }
         }
         if (untouched >= 0) return untouched;
-        if (other >= 0) return other;
-        return rank0;
+        return other;
     }
     void consolidate(llama_context * ctx, const std::vector<uint32_t> & learn_hits, std::vector<uint8_t> & frozen) {
         std::lock_guard<std::mutex> lock(cache_mutex);
@@ -414,10 +416,15 @@ struct moe_execution_pool {
             const size_t host_first = (size_t) il * MOE_TARGET_HOST;
             const size_t hot_first = (size_t) il * MOE_TARGET_HOT;
             struct cand { int e; uint32_t hits; };
-            std::array<cand, MOE_TARGET_HOST> cands;
+            std::array<cand, MOE_TARGET_PROFILE> cands;
             size_t n = 0;
-            for (size_t s = host_first; s < host_first + MOE_TARGET_HOST; ++s) {
-                const auto & key = victim[s];
+            for (size_t k = 0; k < MOE_TARGET_HOT; ++k) {
+                const auto & key = hot[hot_first + k];
+                if (key.owner != ctx || key.layer != il) continue;
+                cands[n++] = {key.expert, learn_hits[(size_t) il * n_exp + (size_t) key.expert]};
+            }
+            for (size_t s = 0; s < MOE_TARGET_HOST; ++s) {
+                const auto & key = victim[host_first + s];
                 if (key.owner != ctx || key.layer != il) continue;
                 cands[n++] = {key.expert, learn_hits[(size_t) il * n_exp + (size_t) key.expert]};
             }
@@ -427,27 +434,38 @@ struct moe_execution_pool {
             std::array<int, MOE_TARGET_HOT> chosen;
             chosen.fill(-1);
             for (size_t k = 0; k < chosen.size() && k < n; ++k) chosen[k] = cands[k].e;
-            std::array<bool, MOE_TARGET_HOT> occupied;
-            occupied.fill(false);
+            std::array<bool, MOE_TARGET_HOT> keep;
+            keep.fill(false);
             for (size_t k = 0; k < chosen.size(); ++k) {
                 if (chosen[k] < 0) continue;
                 const int h = find_hot(ctx, il, chosen[k]);
-                if (h >= 0) occupied[(size_t) (h - (int) hot_first)] = true;
+                if (h >= 0) keep[(size_t) (h - (int) hot_first)] = true;
             }
             const size_t bytes = ctx->pager.expert_role_bytes(il, 0) + ctx->pager.expert_role_bytes(il, 1) + ctx->pager.expert_role_bytes(il, 2);
+            if (!learn_scratch || learn_scratch_bytes < bytes) {
+                if (learn_scratch) cudaFreeHost(learn_scratch);
+                check(cudaHostAlloc(&learn_scratch, bytes, cudaHostAllocDefault));
+                learn_scratch_bytes = bytes;
+            }
             size_t next = 0;
             for (size_t k = 0; k < chosen.size(); ++k) {
                 const int e = chosen[k];
                 if (e < 0 || find_hot(ctx, il, e) >= 0) continue;
                 const int host = find_victim(ctx, il, e);
                 if (host < 0) continue;
-                while (next < occupied.size() && occupied[next]) ++next;
-                if (next == occupied.size()) break;
+                while (next < keep.size() && keep[next]) ++next;
+                if (next == keep.size()) break;
                 const size_t hs = hot_first + next;
-                if (bytes > hot[hs].bytes) throw std::runtime_error("MoE consolidation geometry mismatch");
+                if (bytes > hot[hs].bytes || bytes > victim[(size_t) host].bytes) throw std::runtime_error("MoE consolidation geometry mismatch");
+                const int displaced = hot[hs].expert;
+                check(cudaMemcpyAsync(learn_scratch, hot_data(hs), bytes, cudaMemcpyDeviceToHost, stream_h2d));
                 check(cudaMemcpyAsync(hot_data(hs), victim_data((size_t) host), bytes, cudaMemcpyHostToDevice, stream_h2d));
+                check(cudaStreamSynchronize(stream_h2d));
+                memcpy(victim_data((size_t) host), learn_scratch, bytes);
                 set_entry(hot[hs], ctx, il, e);
-                occupied[next] = true;
+                set_victim((size_t) host, ctx, il, displaced, false);
+                victim[(size_t) host].hit_count = learn_hits[(size_t) il * n_exp + (size_t) displaced];
+                keep[next] = true;
                 ++next;
             }
             frozen[(size_t) il] = 1;
@@ -1092,6 +1110,33 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
     auto best_any_resident = [&](int64_t t, int64_t rank) {
         return best_of(t, rank, best_host(t, rank, MOE_TARGET_HOST));
     };
+    const bool frozen_layer = target && state.frozen[(size_t) il];
+    std::array<int32_t, MOE_RING_SLOTS> resident_union;
+    size_t n_union = 0;
+    auto union_has = [&](int e) {
+        return std::find(resident_union.begin(), resident_union.begin() + n_union, e) != resident_union.begin() + n_union;
+    };
+    auto union_add = [&](int e) {
+        if (!union_has(e) && n_union < resident_union.size()) resident_union[n_union++] = e;
+    };
+    auto union_best = [&](int64_t t, int64_t rank) {
+        int best = -1;
+        float best_score = -INFINITY;
+        for (size_t j = 0; j < n_union; ++j) {
+            const int c = resident_union[j];
+            if (used(t, rank, c)) continue;
+            const float val = score(t, c);
+            if (std::isfinite(val) && val > best_score) { best = c; best_score = val; }
+        }
+        return best;
+    };
+    if (frozen_layer) {
+        for (int64_t t = 0; t < nt; ++t) {
+            if (!active(t)) continue;
+            const int e = original[(size_t) (t * nk)];
+            if (pool.find_hot(ctx, il, e) >= 0 || cached(e)) union_add(e);
+        }
+    }
     for (int64_t t = 0; t < nt; ++t) {
         if (!active(t)) {
             for (int64_t rank = 0; rank < nk; ++rank) {
@@ -1105,12 +1150,14 @@ static void moe_resolve_ring(llama_context * ctx, void * stream, const int32_t *
         for (int64_t rank = 0; rank < nk; ++rank) {
             int e = original[(size_t) (t * nk + rank)];
             if (target) {
+                const bool resident = pool.find_hot(ctx, il, e) >= 0 || cached(e);
                 if (rank > 0) {
-                    e = best_any_resident(t, rank);
-                } else if (state.frozen[(size_t) il] && pool.find_hot(ctx, il, e) < 0 && !cached(e)) {
-                    const int alt = best_any_resident(t, rank);
+                    e = frozen_layer && n_union == resident_union.size() ? union_best(t, rank) : best_any_resident(t, rank);
+                } else if (frozen_layer && !resident) {
+                    const int alt = n_union == resident_union.size() ? union_best(t, 0) : best_any_resident(t, 0);
                     if (alt >= 0) e = alt;
                 }
+                if (frozen_layer && e >= 0) union_add(e);
             } else if (warm) {
                 if (!cached(e) || used(t, rank, e)) e = best_resident(t, rank, false);
             }
@@ -2839,19 +2886,28 @@ void llama_context::moe_init_ring() {
                 ggml_backend_tensor_get(bias, bias_data.data(), 0, (size_t) experts * sizeof(float));
                 std::sort(order.begin(), order.end(), [&](int a, int b) { return bias_data[(size_t) a] > bias_data[(size_t) b]; });
             }
-            const int seed_count = std::min(experts, std::max(used, MOE_TARGET_SEED));
-            std::array<moe_batch_target, MOE_TARGET_SEED> seeds = {};
+            const int seed_count = std::min(experts, MOE_TARGET_PROFILE);
+            std::array<moe_batch_target, MOE_TARGET_PROFILE> seeds = {};
             for (int s = 0; s < seed_count; ++s) {
+                const bool hot_seed = s < MOE_TARGET_HOT;
                 const size_t hot_slot = (size_t) il * MOE_TARGET_HOT + (size_t) s;
-                const size_t host_slot = (size_t) il * MOE_TARGET_HOST + (size_t) s;
+                const size_t host_slot = hot_seed ? 0 : (size_t) il * MOE_TARGET_HOST + (size_t) (s - MOE_TARGET_HOT);
                 const size_t gate = weights[(size_t) il][0]->nb[2], up = weights[(size_t) il][1]->nb[2], down = weights[(size_t) il][2]->nb[2];
-                char * dst = s < MOE_TARGET_HOT ? moe_execution->hot_data(hot_slot) : nullptr;
-                seeds[(size_t) s] = {order[(size_t) s], dst, gate, dst ? dst + gate : nullptr, up, dst ? dst + gate + up : nullptr, down, moe_execution->victim_data(host_slot), moe_execution->victim[host_slot].bytes};
+                char * dst = hot_seed ? moe_execution->hot_data(hot_slot) : nullptr;
+                char * host = hot_seed ? nullptr : moe_execution->victim_data(host_slot);
+                seeds[(size_t) s] = {order[(size_t) s], dst, gate, dst ? dst + gate : nullptr, up, dst ? dst + gate + up : nullptr, down, host,
+                        host ? moe_execution->victim[host_slot].bytes : 0};
             }
-            if (!pager.fetch_batch(il, seeds.data(), seed_count, moe_execution->stream_h2d)) throw std::runtime_error("MoE hot cache seed read failed");
+            for (int first = 0; first < seed_count; first += MOE_RING_SLOTS) {
+                const int count = std::min(seed_count - first, MOE_RING_SLOTS);
+                if (!pager.fetch_batch(il, seeds.data() + first, count, moe_execution->stream_h2d)) throw std::runtime_error("MoE hot cache seed read failed");
+            }
             for (int s = 0; s < seed_count; ++s) {
-                if (s < MOE_TARGET_HOT) moe_execution->set_entry(moe_execution->hot[(size_t) il * MOE_TARGET_HOT + (size_t) s], this, il, order[(size_t) s]);
-                moe_execution->set_victim((size_t) il * MOE_TARGET_HOST + (size_t) s, this, il, order[(size_t) s]);
+                if (s < MOE_TARGET_HOT) {
+                    moe_execution->set_entry(moe_execution->hot[(size_t) il * MOE_TARGET_HOT + (size_t) s], this, il, order[(size_t) s]);
+                } else {
+                    moe_execution->set_victim((size_t) il * MOE_TARGET_HOST + (size_t) (s - MOE_TARGET_HOT), this, il, order[(size_t) s]);
+                }
             }
         }
         g_moe_execution_pool = moe_execution;
@@ -4489,6 +4545,17 @@ static void moe_ring_phase(moe_ring_state & state, const llama_ubatch & ubatch, 
         std::fill(state.frozen.begin(), state.frozen.end(), 0);
         std::fill(state.learn_hits.begin(), state.learn_hits.end(), 0);
     }
+}
+
+void llama_moe_finish_pass(llama_context * ctx) {
+    if (!ctx || !ctx->moe_ring || ctx->get_model().arch != LLM_ARCH_DEEPSEEK41) return;
+    auto & state = *ctx->moe_ring;
+    if (!state.learning || !(state.learn_decoded || state.learn_prompted)) return;
+    std::lock_guard<std::mutex> execution(ctx->moe_execution->compute_mutex);
+    ctx->moe_execution->consolidate(ctx, state.learn_hits, state.frozen);
+    state.learning = false;
+    state.learn_decoded = false;
+    state.learn_prompted = false;
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {

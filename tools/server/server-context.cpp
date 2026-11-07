@@ -677,6 +677,10 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
+            if (ctx_tgt) {
+                llama_moe_finish_pass(ctx_tgt);
+            }
+
             // do not keep context of the child slots - the parent's context is enough
             // nor of the stateless slots - no task ever reuses it
             if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {

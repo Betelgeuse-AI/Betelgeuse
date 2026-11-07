@@ -784,6 +784,9 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Finish the current paged-MoE learning pass: consolidate and freeze the target cache.
+    LLAMA_API void llama_moe_finish_pass(struct llama_context * ctx);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

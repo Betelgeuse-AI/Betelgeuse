@@ -277,3 +277,63 @@ Misses:
 - Warm VRAM hit was `50.28%` (Pass 2 TG) and `48.13%` (Pass 3 TG), below the expected 75%.
 
 The first launch was not rerun; this is the single five-pass session. The final implementation and this file were committed locally on `betelgeuse-ds41` with `moe: task 12 learn on pass 1 and freeze consolidated 5+15 cache`. No push or PR; `fluxaeros-mtp` untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, and `/tmp/opencode/atomic_hot10_pass*.log`.
+
+---
+
+## Atomic task 13: disjoint 20 slots and end-of-pass consolidation
+
+### Objective
+Make each target layer hold 20 distinct experts: 5 VRAM Hot plus 15 Host-RAM, with no duplication. During a cold learning pass, keep every routed Rank 0, cache the first 15 distinct learned Rank-0 experts, and evict only non-Rank-0 profile slots. At the end of the cold pass, move the top five most-used experts into the hot slots and the five displaced hot experts into the freed host slots. Consolidate at request release so warm passes pay no copy cost. Use 56 tokens on Pass 1 and Pass 3.
+
+### Implementation
+1. Seed 20 experts per target layer by router bias: order 0..4 into the 5 hot slots, order 5..19 into the 15 host slots. The two sets are disjoint. Seed reads are split into batches of at most 18 to fit the pager staging pool.
+2. `learn_victim` only evicts `was_rank0 == false` slots: untouched profile slots first, then the least-recent touched profile slot. Once all 15 host slots hold Rank-0 experts, further cold misses fetch directly into the ring without eviction, so early function-body Rank 0 experts are never displaced.
+3. `consolidate` ranks the 20 residents by `learn_hits`, takes the top five, and swaps each host-resident top expert into a hot slot using a pinned scratch buffer: D2H the displaced hot expert, H2D the promoted expert, then copy the scratch into the promoted expert's old host slot. The result is again 5+15 disjoint slots.
+4. Consolidation runs from `llama_moe_finish_pass`, called by `server_slot::release` at the end of a request. It is therefore outside the next warm request's timing. The first-prompt-ubatch hook remains as a fallback.
+5. Frozen routing caps the per-ubatch resident union at the 18-slot execution ring. Resident Rank-0 experts are pre-added, secondary ranks reuse union experts once it is full, and a non-resident Rank-0 fallback also picks from the union when full. This keeps the 20-slot frozen cache compatible with the 18-slot ring and single-pass PP.
+6. Pass 1 and Pass 3 use `n_predict = 56`; Pass 2 stays 32. The harness prints both generations.
+
+### Acceptance
+- Pass 1/2/3 target `rank0_replaced = 0`.
+- Warm Pass 2/3/4b target `ColdSSD = 0.00%`, `disk_wait_ms = 0.0`.
+- Scope `MemoryPeak` inside `MemoryMax=12G`, zero OOM.
+- Warm Pass 4b PP about 50+ tok/s; Pass 2/3 TG 15-18+ tok/s.
+- Pass 3 reproduces Pass 1's complete `binary_search` through `return -1`.
+- One benchmark session; then commit locally with `moe: task 13 disjoint 20 slots per layer and end-of-pass consolidation`. No push or PR.
+
+### Evidence
+The single five-pass session completed under `MemoryMax=12G`; it was not rerun. Geometry was unchanged: `stage=2x18 554.41 MiB hot=236 2854.42 MiB inclusive_host=660 7922.02 MiB target_host=600 draft_host=60 draft_vram=36`. The 20-expert profile is visible as `hot_slots=200` and `host_slots=600`, with 20 distinct experts per target layer. Protocol was valid: `prompt_n` 7/7/7/64/64 and `cache_n=0` on every pass.
+
+| Pass | Target `rank0_replaced` | Target PP ColdSSD | Target TG ColdSSD | Disk wait | VRAM hit | TG tok/s | PP tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 cold learn 56-token TG | **0** | 207/1680 = 12.32% | 689/13200 = 5.22% | 3599.0 ms | 11.84% TG | 4.824 | - |
+| 2 warm 32-token TG | 246 | 0/1680 = 0.00% | 0/9360 = 0.00% | 0.0 ms | 53.53% TG | 12.111 | - |
+| 3 warm 56-token TG | 481 | 0/1680 = 0.00% | 0/15120 = 0.00% | 0.0 ms | 53.46% TG | 13.662 | - |
+| 4a learning 64-token PP | **0** | 693/15360 = 4.51% | - | 2748.1 ms | 42.40% PP | - | 6.670 |
+| 4b warm 64-token PP | 529 | 0/15360 = 0.00% | - | 0.0 ms | 53.21% PP | - | 33.393 |
+
+Pass 1 target `rank0_replaced` is `0`, and Pass 4a is also `0`. Warm target ColdSSD is exactly `0.00%` with `disk_wait_ms = 0.0` on Pass 2, Pass 3, and Pass 4b, with zero `[moe_cold]` lines on warm passes.
+
+Scope memory: peak `12,619,038,720 B` (11.75 GiB), `MemoryCurrent` 12,128,194,560 B before requests and 12,053,110,784 B after Pass 4b, `MemorySwapPeak=0`, `Result=success`, zero OOM, zero aborts.
+
+Consolidation ran from the server release hook: Pass 4b's first and second PP steps were `483.146 ms` and `470.260 ms`, so no consolidation is billed to the warm request. The warm PP cost is the disjoint staging: `6,000,906,240 B` H2D per 16-token ubatch (`335.8 ms` of H2D) against Task 12's 4.45 GB.
+
+Pass 1 and Pass 3 produced byte-identical output, truncated at 56 tokens:
+
+```python
+    left, right = 0, len(arr) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            left =
+```
+
+Misses:
+- Pass 2/3 Rank-0 replacements are `246`/`481`, not zero. The 56-token generation still touched more than 15 distinct Rank-0 experts per layer; the first-wins host cache kept only the first 15, and the rest were fetched directly (`214`/`282` `[moe_cold]` lines). The warm repeats therefore fall back for those experts. ColdSSD stays zero because the replacements are resident.
+- Pass 4b PP is `33.393 tok/s`, below 50+. The disjoint 20-slot cache and the 18-slot union cap stage up to 18 host experts per layer (`6.0 GB` per 16-token ubatch) versus 15 duplicated slots in Task 12.
+- Pass 2/3 TG are `12.111`/`13.662 tok/s`, below 15-18. Warm VRAM hit rose to 53.5% but remains below 75%.
+- The 56-token cap truncates the function at `left =`. Both Pass 1 and Pass 3 are incomplete and invalid; Pass 3 does reproduce Pass 1 exactly.
+
+The final implementation and this file were committed locally on `betelgeuse-ds41` with `moe: task 13 disjoint 20 slots per layer and end-of-pass consolidation`. No push or PR; `fluxaeros-mtp` untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, and `/tmp/opencode/atomic_hot10_pass*.log`.
