@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "log.h"
+#include "betelgeuse-splash.h"
 
 #include "cli-context.h"
 
@@ -40,6 +41,8 @@ int llama_cli(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
     }
+    betelgeuse_show_splash(params.use_color);
+
 
     llama_backend_init();
     llama_numa_init(params.numa);

@@ -13,6 +13,7 @@
 #include "llama.h"
 #include "log.h"
 
+#include "betelgeuse-splash.h"
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -791,6 +792,8 @@ int llama_server(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
+
+    betelgeuse_show_splash(params.use_color);
 
     SRV_INF("%s", "initializing ...\n");
 

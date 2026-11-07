@@ -5,6 +5,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "betelgeuse-terminal-logo.h"
+#include "betelgeuse-splash.h"
 
 #include "../src/llama-ext.h"
 
@@ -1551,6 +1552,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.moe_direct_io) {
+        betelgeuse_show_splash(params.use_color && !params.simple_io);
         if (params.use_color && !params.simple_io) {
             LOG_INF("\n%s\nBetelgeuse (Alpha-Orionis) | demand-paged MoE\n\n", betelgeuse_terminal_logo);
         } else {
