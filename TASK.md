@@ -92,3 +92,75 @@
 - **DO NOT** hardcode column wrapping in code comments or use non-ASCII characters (`—`, `→`, `…`).
 - **DO NOT** drop or stub real model computation. CPU and GPU expert outputs must remain mathematically valid.
 - **DO NOT** disable CUDA graphs globally.
+
+---
+
+## Atomic task 10: Rank-0-only SSD fetches and a real decode warm-up
+
+### Objective
+Keep the exact per-layer Target `5 VRAM Hot + 15 Host-RAM` and DFlash `12 + 20` packing. Only target Rank 0 (`r == 0`) may fetch a non-resident expert from SSD on any cold or warm PP/TG pass. Ranks 1..5 always resolve the top five resident experts by unbiased `sqrtsoftplus` score. Never replace Rank 0. Run one supervised session under `MemoryMax=12G`, report, and stop.
+
+### Implementation
+1. Host entries carry `was_rank0` and `last_used_step`. Eviction within the layer prefers empty slots, then the least-recently-used non-Rank-0 slot, then the least-recently-used non-active Rank-0 slot.
+2. A cold Rank 0 miss is fetched from SSD, its page-aligned range gets `POSIX_FADV_DONTNEED`, and it is write-allocated into the layer's 15 Host-RAM slots when an eligible slot exists. A non-Rank-0 cold miss throws.
+3. Host hits update `last_used_step`; Rank-0 hits set `was_rank0`. Secondary ranks never write-allocate and never read SSD.
+4. `refresh_hot` promotes only host-resident experts. Target background promotion is disabled; the demand path is the only target SSD reader. DFlash keeps its own promotion path and 12+20 cache.
+5. The startup GGUF drop is applied to all pager shard descriptors after seeding.
+6. The router receives unbiased `probs`; the biased `selection_probs` stays selection-only for native top-k.
+7. Shared MoE tiles are bounded to `18 / n_expert_used` tokens so the Rank-0 union plus resident picks fit the 18-slot ring. All 18 entries have a zero-sentinel row for the CPU branch.
+
+### Single-session protocol
+`MemorySwapMax=0`, `MemoryHigh=12032M`, `MemoryMax=12G`. Same model paths and server flags as Task 9, with `--no-cache-prompt --cache-ram 0` and request `cache_prompt=false` so every pass reprocesses its full prompt.
+
+| Pass | Prompt | Output | Purpose |
+| --- | --- | ---: | --- |
+| 1 | `def binary_search(arr, target):\n` | 64 | Cold TG warm-up with real decode |
+| 2 | same prompt | 32 | Warm TG |
+| 3 | same prompt | 64 | Warm TG and generated Python |
+| 4a | first 64 tokens of the long text | 1 | Cold 64-token PP warm-up |
+| 4b | same 64-token prompt | 1 | Warm 64-token PP |
+
+### Acceptance and stop rule
+- Every target pass: `rank0_replaced = 0`; no `[moe_cold]` direct lines on warm passes.
+- Warm Pass 2/3/4b: `ColdSSD = 0.00%`, `disk_wait_ms = 0.0`.
+- Scope `MemoryPeak < 10.6 GiB`, zero OOM, zero aborts.
+- Warm Pass 4b PP about `50+ tok/s`; Pass 2/3 TG `15-18+ tok/s`; complete Pass 3 Python.
+- One session only. Report every miss; do not rerun. No commit, push, reset, stash restore, or PR; leave `fluxaeros-mtp` untouched.
+
+### Evidence
+The first launch failed during initialization, before any request: the kick op rejected the reshaped 3D score tensor, and the scope hit its 12G cap during startup. Two fixes were applied without changing the protocol: pass the pre-reshape 2D unbiased score tensor, and drop the GGUF page cache before the host arena is pinned (the existing post-seed drop remains). The single five-pass session then ran to completion; it was not rerun.
+
+Geometry was unchanged: `stage=2x18 554.41 MiB hot=236 2854.42 MiB inclusive_host=660 7922.02 MiB target_host=600 draft_host=60 draft_vram=36`.
+
+Protocol: `prompt_n` was 7/7/7/64/64 with `cache_n=0` on every pass, so each pass processed its full prompt.
+
+| Pass | `rank0_replaced` (target) | Target PP ColdSSD | Target TG ColdSSD | Target disk wait | TG tok/s | PP tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 cold 64-token TG | 0 | 217/1680 = 12.92% | 752/16560 = 4.54% | 4176.6 ms | 4.701 | - |
+| 2 warm 32-token TG | 0 | 58/1680 = 3.45% | 343/8400 = 4.08% | 1837.2 ms | 4.991 | - |
+| 3 warm 64-token TG | 0 | 46/1680 = 2.74% | 583/15600 = 3.74% | 2785.5 ms | 5.664 | - |
+| 4a cold 64-token PP | 0 | 693/15360 = 4.51% | - | 2924.2 ms | - | 5.800 |
+| 4b warm 64-token PP | 0 | 559/15360 = 3.64% | - | 2343.2 ms | - | 6.777 |
+
+`rank0_replaced` is zero for the target on every pass, and no target background promotion ran (`promo_bg=0`). DFlash still reports its own warm fallback: `rank0_replaced` 47/10/12 and `promo_bg` 14/8/16 on Passes 1/2/3; DFlash TG ColdSSD was 6.67%/0.00%/0.00%.
+
+Failures:
+- Warm ColdSSD is not zero on Pass 2, Pass 3, or Pass 4b. The resident-only secondary routing changes the cache state seen by each pass, so the decoded token sequence and its Rank-0 experts differ between passes; the layer's 20 slots do not cover the union. Six `[moe_cold]` direct lines occurred (3/0/2/1/0 per pass), all `host full`: during split PP, CPU-staged host slots are in flight and cannot be evicted.
+- Throughput missed: Pass 2/3 TG 4.991/5.664 tok/s versus 15-18+; Pass 4b PP 6.777 tok/s versus 50+. Each 16-token PP ubatch splits into six 3-token MoE tiles with host synchronization, and the CPU branch evaluated about 1050 rows per layer step (`cpu_ms` about 830 ms per PP ubatch).
+- Scope `MemoryPeak = 12,616,167,424 B` (11.75 GiB), above 10.6 GiB. `MemoryCurrent` was 12,074,496,000 B before requests and 11,962,888,192 B after Pass 4b. `MemorySwapPeak = 0`, `Result=success`, zero OOM, zero aborts.
+- Pass 3 generated 64 tokens and stopped at `else:`; the function is incomplete and not valid Python (`PASS3_VALID_PYTHON=False`).
+
+Pass 3 output:
+
+```python
+    left, right = 0, len(arr) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if arr[mid] == target:
+            return mid
+        elif arr[mid] < target:
+            left = mid + 1
+        else:
+```
+
+The single five-pass session was not rerun. No commit, push, reset, stash restore, or PR was performed; `fluxaeros-mtp` is untouched. Evidence: `/tmp/opencode/atomic-hot10.log`, `/tmp/opencode/atomic_hot10_results.json`, `/tmp/opencode/atomic_hot10_bench.out`, `/tmp/opencode/atomic_hot10_mem.txt`, `/tmp/opencode/atomic_hot10_pass*.log`.

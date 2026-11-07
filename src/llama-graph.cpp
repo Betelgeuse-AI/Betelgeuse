@@ -2174,7 +2174,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
-    const int64_t tile_size = moe_shared ? (moe_resident ? 64 : std::max<int64_t>(1, 18 / n_expert_used)) : 6;
+    const int64_t tile_size = moe_shared ? std::max<int64_t>(1, 18 / n_expert_used) : 6;
     if (moe_shared && n_tokens > tile_size) {
         ggml_tensor * output = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_tensor * prev_tile = nullptr;
@@ -2235,6 +2235,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
     cb(probs, "ffn_moe_probs", il);
+    ggml_tensor * unbiased_scores = probs;
 
     // add experts selection bias - introduced in DeepSeek V3
     // leave probs unbiased as it's later used to get expert weights
@@ -2404,7 +2405,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
             ggml_tensor * sel_c = ggml_cont(ctx0, selected_experts);
             if (moe_shared) {
-                ggml_tensor * scores = selection_probs;
+                ggml_tensor * scores = unbiased_scores;
                 if (scores->type != GGML_TYPE_F32) {
                     scores = ggml_cast(ctx0, scores, GGML_TYPE_F32);
                 }
