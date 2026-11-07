@@ -197,8 +197,6 @@ struct moe_execution_pool {
     size_t stage_bytes = 0, host_bytes = 0;
     int target_layers = 0, cuda_device = 0;
     char * host = nullptr;
-    char * learn_scratch = nullptr;
-    size_t learn_scratch_bytes = 0;
     std::vector<entry> hot, victim;
     std::array<entry, MOE_RING_SLOTS> bank[2];
     entry zero[2];
@@ -244,7 +242,6 @@ struct moe_execution_pool {
             cudaHostUnregister(host);
             munmap(host, host_bytes);
         }
-        if (learn_scratch) cudaFreeHost(learn_scratch);
     }
     void reserve_timers(size_t resolves) {
         const size_t counts[TIMER_COUNT] = {4 * resolves + 1, 2 * resolves + hot.size() + 1, resolves, 3 * resolves, resolves, resolves, resolves};
@@ -408,66 +405,11 @@ struct moe_execution_pool {
         return other;
     }
     void consolidate(llama_context * ctx, const std::vector<uint32_t> & learn_hits, std::vector<uint8_t> & frozen) {
+        (void) learn_hits;
         std::lock_guard<std::mutex> lock(cache_mutex);
         check(cudaStreamSynchronize(stream_h2d));
         busy[0] = busy[1] = false;
-        const size_t n_exp = (size_t) ctx->moe.n_expert;
         for (int il = 0; il < ctx->moe.n_layer; ++il) {
-            const size_t host_first = (size_t) il * MOE_TARGET_HOST;
-            const size_t hot_first = (size_t) il * MOE_TARGET_HOT;
-            struct cand { int e; uint32_t hits; };
-            std::array<cand, MOE_TARGET_PROFILE> cands;
-            size_t n = 0;
-            for (size_t k = 0; k < MOE_TARGET_HOT; ++k) {
-                const auto & key = hot[hot_first + k];
-                if (key.owner != ctx || key.layer != il) continue;
-                cands[n++] = {key.expert, learn_hits[(size_t) il * n_exp + (size_t) key.expert]};
-            }
-            for (size_t s = 0; s < MOE_TARGET_HOST; ++s) {
-                const auto & key = victim[host_first + s];
-                if (key.owner != ctx || key.layer != il) continue;
-                cands[n++] = {key.expert, learn_hits[(size_t) il * n_exp + (size_t) key.expert]};
-            }
-            std::sort(cands.begin(), cands.begin() + n, [](const cand & a, const cand & b) {
-                return a.hits != b.hits ? a.hits > b.hits : a.e < b.e;
-            });
-            std::array<int, MOE_TARGET_HOT> chosen;
-            chosen.fill(-1);
-            for (size_t k = 0; k < chosen.size() && k < n; ++k) chosen[k] = cands[k].e;
-            std::array<bool, MOE_TARGET_HOT> keep;
-            keep.fill(false);
-            for (size_t k = 0; k < chosen.size(); ++k) {
-                if (chosen[k] < 0) continue;
-                const int h = find_hot(ctx, il, chosen[k]);
-                if (h >= 0) keep[(size_t) (h - (int) hot_first)] = true;
-            }
-            const size_t bytes = ctx->pager.expert_role_bytes(il, 0) + ctx->pager.expert_role_bytes(il, 1) + ctx->pager.expert_role_bytes(il, 2);
-            if (!learn_scratch || learn_scratch_bytes < bytes) {
-                if (learn_scratch) cudaFreeHost(learn_scratch);
-                check(cudaHostAlloc(&learn_scratch, bytes, cudaHostAllocDefault));
-                learn_scratch_bytes = bytes;
-            }
-            size_t next = 0;
-            for (size_t k = 0; k < chosen.size(); ++k) {
-                const int e = chosen[k];
-                if (e < 0 || find_hot(ctx, il, e) >= 0) continue;
-                const int host = find_victim(ctx, il, e);
-                if (host < 0) continue;
-                while (next < keep.size() && keep[next]) ++next;
-                if (next == keep.size()) break;
-                const size_t hs = hot_first + next;
-                if (bytes > hot[hs].bytes || bytes > victim[(size_t) host].bytes) throw std::runtime_error("MoE consolidation geometry mismatch");
-                const int displaced = hot[hs].expert;
-                check(cudaMemcpyAsync(learn_scratch, hot_data(hs), bytes, cudaMemcpyDeviceToHost, stream_h2d));
-                check(cudaMemcpyAsync(hot_data(hs), victim_data((size_t) host), bytes, cudaMemcpyHostToDevice, stream_h2d));
-                check(cudaStreamSynchronize(stream_h2d));
-                memcpy(victim_data((size_t) host), learn_scratch, bytes);
-                set_entry(hot[hs], ctx, il, e);
-                set_victim((size_t) host, ctx, il, displaced, false);
-                victim[(size_t) host].hit_count = learn_hits[(size_t) il * n_exp + (size_t) displaced];
-                keep[next] = true;
-                ++next;
-            }
             frozen[(size_t) il] = 1;
         }
         check(cudaStreamSynchronize(stream_h2d));
