@@ -492,18 +492,12 @@ bool moe_pager::reserve_staging_split(int n_total, int n_demand) {
 bool moe_pager::init_cache(size_t bytes) {
     if (bytes == 0) return true;
     if (stage_bytes_ == 0) return false;                  // need the expert size
-    // the arena must hold a WHOLE expert (gate+up+down), not one role: sizing
-    // it by the largest role makes every fill overrun its slot into the next
+    // must hold a WHOLE expert (gate+up+down) for the LARGEST layer, not layer 0
     size_t per = 0;
-    if (pack_mode_) {
-        for (int il = 0; il < n_layer_; il++) {
-            per = std::max(per, role_bytes_[(size_t) il * 3 + 0]
-                              + role_bytes_[(size_t) il * 3 + 1]
-                              + role_bytes_[(size_t) il * 3 + 2]);
-        }
-    } else {
-        const moe_expert_slice * s = slices(0, 0);
-        per = s[0].len + s[1].len + s[2].len;
+    for (int il = 0; il < n_layer_; il++) {
+        per = std::max(per, role_bytes_[(size_t) il * 3 + 0]
+                          + role_bytes_[(size_t) il * 3 + 1]
+                          + role_bytes_[(size_t) il * 3 + 2]);
     }
     if (per == 0) return false;
     const size_t slots = bytes / per;

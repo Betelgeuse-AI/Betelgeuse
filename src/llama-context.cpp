@@ -354,7 +354,25 @@ static void start_doorbell_worker(llama_context * ctx) {
                     if (victim_cache && moe_doorbell_dma_enabled() && pl->pad0 && old_key >= 0) {
                         char * destination = ctx->pager.cache_reserve(il, old_key % n_exp, sel.data(), (size_t) n);
                         if (destination) {
-                            if (!moe_doorbell_dma_store(il, (int) (v - (size_t) base), destination)) GGML_ABORT("victim DMA submission failed");
+                            // copy the evicted slot synchronously; a background DMA store
+                            // can race the next H2D rewrite of the slot and poison the arena
+                            const uint64_t srcs[3] = {
+                                pl->dst_gate + (uint64_t) (v - (size_t) base) * pl->gate_bytes,
+                                pl->dst_up   + (uint64_t) (v - (size_t) base) * pl->up_bytes,
+                                pl->dst_down + (uint64_t) (v - (size_t) base) * pl->down_bytes,
+                            };
+                            const uint32_t len[3] = { pl->gate_bytes, pl->up_bytes, pl->down_bytes };
+                            size_t at = 0;
+                            for (int r = 0; r < 3; r++) {
+                                cudaError_t derr = cudaMemcpy(destination + at,
+                                        (const void *) (uintptr_t) srcs[r], len[r], cudaMemcpyDeviceToHost);
+                                if (derr != cudaSuccess) {
+                                    fprintf(stderr, "[moe_victim_cache] synchronous store failed: %s\n",
+                                            cudaGetErrorString(derr));
+                                    GGML_ABORT("victim cache store failed");
+                                }
+                                at += len[r];
+                            }
                             victim_saved++;
                         }
                     }

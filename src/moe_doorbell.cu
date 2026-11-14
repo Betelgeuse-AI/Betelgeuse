@@ -575,6 +575,9 @@ bool moe_doorbell_dma_store(int il, int slot, char * destination) {
         error = cudaMemcpyAsync(destination + offset, source, lengths[role], cudaMemcpyDeviceToHost, g_stream_h2d);
         offset += lengths[role];
     }
+    // the arena slot is visible to CPU readers and to later DMA submissions as soon as
+    // cache_reserve marks it used; without a stream sync a cache hit can read it mid-copy
+    if (error == cudaSuccess) error = cudaStreamSynchronize(g_stream_h2d);
     if (error != cudaSuccess) fprintf(stderr, "[moe_dma] cache store failed: %s\n", cudaGetErrorString(error));
     return error == cudaSuccess;
 }
