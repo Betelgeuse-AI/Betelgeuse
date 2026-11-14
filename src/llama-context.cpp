@@ -190,7 +190,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         const bool io_diag = io_diag_env && atoi(io_diag_env) != 0;
         const char * victim_env = getenv("MOE_VICTIM_CACHE");
         const char * predictor_env = getenv("MOE_PRED");
-        const bool victim_cache = (!victim_env || atoi(victim_env) != 0) && ctx->pager.pack_mode() && ctx->pager.cache_bytes() > 0 && (!predictor_env || atoi(predictor_env) == 0);
+        const bool victim_cache = (!victim_env || atoi(victim_env) != 0) && ctx->pager.cache_bytes() > 0 && (!predictor_env || atoi(predictor_env) == 0);
         uint64_t victim_saved = 0, victim_hits = 0, victim_bytes = 0;
         const char * spec_async_env = getenv("MOE_PREKICK_ASYNC");
         const bool spec_async = !spec_async_env || atoi(spec_async_env) != 0;
@@ -2102,7 +2102,7 @@ llama_context::llama_context(
                         const bool demand_only = pager.pack_mode() && (!doorbell_env || atoi(doorbell_env) != 0) && (!predictor_env || atoi(predictor_env) == 0);
                         const char * victim_env = getenv("MOE_VICTIM_CACHE");
                         const char * dma_env = getenv("MOE_DMA");
-                        const bool victim_cache = demand_only && (!victim_env || atoi(victim_env) != 0) && (!dma_env || atoi(dma_env) != 0) && !getenv("GGML_CUDA_DISABLE_GRAPHS");
+                        const bool victim_cache = (!victim_env || atoi(victim_env) != 0) && (!dma_env || atoi(dma_env) != 0) && !getenv("GGML_CUDA_DISABLE_GRAPHS");
                         const char * cm = getenv("MOE_CACHE_MIB");
                         const int cache_mib = cm ? std::max(0, atoi(cm)) : (victim_cache ? 8192 : 0);
                         const size_t cache_bytes = (size_t) cache_mib * 1048576u;
