@@ -2962,6 +2962,8 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
             embd0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
             ggml_set_input(embd0);
             ggml_backend_sched_set_tensor_backend(sched, embd0, backend);
+            // keep the token leaf live so the scheduler assigns it a buffer
+            ggml_build_forward_expand(gf, inp->tokens);
             ggml_build_forward_order(gf, embd0);
             inp->staged_tokens = embd0;
         } else {
@@ -2976,6 +2978,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
                 embd2 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tok_rows);
                 ggml_set_input(embd2);
                 ggml_backend_sched_set_tensor_backend(sched, embd2, backend);
+                ggml_build_forward_expand(gf, inp->mixed_tokens);
                 ggml_build_forward_order(gf, embd2);
                 inp->staged_mixed_tokens = embd2;
             } else {
