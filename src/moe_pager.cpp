@@ -773,10 +773,12 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
             }
         } else {
             const moe_expert_slice * cs = slices(il, e);
+            size_t coff = 0;
             for (int k = 0; k < 3; k++) {
                 const size_t nb = (size_t) cs[k].len - cs[k].pre;
-                memcpy(cdst + at, csrc + cs[k].pre, nb);
+                memcpy(cdst + at, csrc + coff + cs[k].pre, nb);
                 at += nb;
+                coff += cs[k].len;
             }
         }
         cache_used_[(size_t) cslot] = 1;
