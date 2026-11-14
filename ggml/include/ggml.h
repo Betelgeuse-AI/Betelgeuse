@@ -2544,10 +2544,11 @@ extern "C" {
 
     GGML_API struct ggml_tensor * ggml_moe_slot_prekick(
             struct ggml_context * ctx,
-            struct ggml_tensor  * topk,
+            struct ggml_tensor  * logits,
             struct ggml_tensor  * table,
             int32_t               il,
-            int32_t               sentinel);
+            int32_t               sentinel,
+            int32_t               count);
 
     // custom operators
 

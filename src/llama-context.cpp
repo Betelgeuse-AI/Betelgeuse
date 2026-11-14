@@ -170,7 +170,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         const char * prekick_env = getenv("MOE_PREKICK");
         const char * split_env = getenv("MOE_SPLIT");
         struct io_uring spec_ring;
-        bool spec_ok = ring_ok && prekick_env && atoi(prekick_env) != 0 && ctx->pager.pack_mode() &&
+        bool spec_ok = ring_ok && prekick_env && atoi(prekick_env) != 0 &&
             (!split_env || atoi(split_env) != 0) &&
             io_uring_queue_init(16, &spec_ring, 0) == 0;
         char * spec_stage = nullptr;
@@ -184,8 +184,9 @@ static void start_doorbell_worker(llama_context * ctx) {
         bool spec_cancel_pending = false;
         int32_t spec_experts[8] = {};
         uint32_t spec_lengths[8] = {};
+        uint32_t spec_got_bytes[8] = {}, spec_got_roles[8] = {}, spec_got_cancel[8] = {};
         bool spec_ready[8] = {};
-        long spec_submitted = 0, spec_reused = 0;
+        long spec_submitted = 0, spec_reused = 0, spec_cache_hits = 0;
         const char * io_diag_env = getenv("MOE_IO_DIAG");
         const bool io_diag = io_diag_env && atoi(io_diag_env) != 0;
         const char * victim_env = getenv("MOE_VICTIM_CACHE");
@@ -221,21 +222,34 @@ static void start_doorbell_worker(llama_context * ctx) {
                 const uint64_t tag = completion->user_data;
                 if (tag == UINT64_MAX) {
                     spec_cancel_pending = false;
-                } else if (tag >= 1 && tag <= 8) {
-                    const int selected = (int) tag - 1;
-                    spec_ready[selected] = completion->res == (int) spec_lengths[selected];
-                    if (io_diag) {
-                        if (spec_ready[selected]) {
-                            spec_completed++;
-                            spec_elapsed_ms += std::chrono::duration<double, std::milli>(
-                                    std::chrono::steady_clock::now() - spec_started).count();
-                        } else if (completion->res == -ECANCELED) {
-                            spec_cancelled++;
-                        } else {
-                            spec_short++;
+                } else if (tag >= 1 && tag <= 40) {
+                    // per-role tag: selected*4 + role + 1 (roles 4+ unused); pack
+                    // mode sends role 0 read of the blob, non-pack sends 3 reads
+                    const uint64_t t = tag - 1;
+                    const int selected = (int) (t / 4);
+                    const int role = (int) (t % 4);
+                    if (selected >= 0 && selected < 8 && role < 3) {
+                        const int res = completion->res;
+                        if (res > 0) spec_got_bytes[selected] += (uint32_t) res;
+                        if (res == -ECANCELED) spec_got_cancel[selected] += 1;
+                        spec_got_roles[selected] += 1;
+                        const int need = ctx->pager.pack_mode() ? 1 : 3;
+                        if (spec_got_roles[selected] >= (uint32_t) need) {
+                            spec_ready[selected] = spec_got_bytes[selected] == spec_lengths[selected];
+                            if (io_diag) {
+                                if (spec_ready[selected]) {
+                                    spec_completed++;
+                                    spec_elapsed_ms += std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - spec_started).count();
+                                } else if (spec_got_cancel[selected] >= (uint32_t) need) {
+                                    spec_cancelled++;
+                                } else {
+                                    spec_short++;
+                                }
+                            }
+                            spec_pending = -1;
                         }
                     }
-                    spec_pending = -1;
                 }
                 io_uring_cqe_seen(&spec_ring, completion);
             }
@@ -243,12 +257,19 @@ static void start_doorbell_worker(llama_context * ctx) {
 
         auto cancel_spec = [&]() {
             if (!spec_ok || spec_pending < 0 || spec_cancel_pending) return;
-            struct io_uring_sqe * cancellation = io_uring_get_sqe(&spec_ring);
-            if (!cancellation) return;
-            io_uring_prep_cancel64(cancellation, (uint64_t) spec_pending + 1, 0);
-            cancellation->user_data = UINT64_MAX;
-            spec_cancel_pending = io_uring_submit(&spec_ring) > 0;
-            if (spec_cancel_pending) cancel_requested++;
+            // pack: 1 SQE per selected expert; non-pack: 3 (gate/up/down)
+            const int need = ctx->pager.pack_mode() ? 1 : 3;
+            bool ok = true;
+            for (int r = 0; r < need && ok; r++) {
+                struct io_uring_sqe * cancellation = io_uring_get_sqe(&spec_ring);
+                if (!cancellation) { ok = false; break; }
+                io_uring_prep_cancel64(cancellation, (uint64_t) spec_pending * 4 + r + 1, 0);
+                cancellation->user_data = UINT64_MAX;
+            }
+            if (ok) {
+                spec_cancel_pending = io_uring_submit(&spec_ring) > 0;
+                if (spec_cancel_pending) cancel_requested++;
+            }
         };
 
         while (g_doorbell_running.load(std::memory_order_relaxed)) {
@@ -516,9 +537,13 @@ static void start_doorbell_worker(llama_context * ctx) {
                 if (spec_ok && spec_layer == il && prediction && prediction->generation == spec_generation) {
                     for (int ci = 0; ci < ncopy; ++ci) {
                         if (read_fail[(size_t) ci]) continue;
+                        // pack: loc.len is the aligned blob; direct-GGUF: compact role sum
+                        const size_t demand_blob = ctx->pager.pack_mode()
+                                ? (size_t) locs[(size_t) ci].len
+                                : (size_t) gb + (size_t) ub + (size_t) db;
                         for (int selected = 0; selected < spec_count; ++selected) {
                             if (spec_experts[selected] != misses[(size_t) ci] ||
-                                spec_lengths[selected] != locs[(size_t) ci].len) continue;
+                                spec_lengths[selected] != demand_blob) continue;
                             if (!spec_ready[selected]) {
                                 if (join_spec && spec_pending == selected) {
                                     spec_copy = ci;
@@ -575,37 +600,52 @@ static void start_doorbell_worker(llama_context * ctx) {
                         else { read_fail[(size_t) ci] = 1; fail_ci(ci); }
                     }
                 } else {
-                    int n_sqe = 0;
-                    bool submit_ok = true;
-                    for (int ci = 0; ci < ncopy && submit_ok; ++ci) {
+                    // collect all reads, then issue them in monotonically
+                    // increasing file offset order (NVMe-friendly) as one batch
+                    struct DemandSqeItem { int fd; uint64_t off; uint32_t len; char * dst; uint64_t tag; };
+                    std::vector<DemandSqeItem> sqe_items;
+                    sqe_items.reserve((size_t) ncopy * 3);
+                    for (int ci = 0; ci < ncopy; ++ci) {
                         if (left[(size_t) ci] == 0) continue;
                         char * dst = stage_host + (size_t) ci * stride;
                         if (ctx->pager.pack_mode()) {
                             const moe_pager::moe_pack_loc & loc = locs[(size_t) ci];
-                            struct io_uring_sqe * sqe = io_uring_get_sqe(&ring);
-                            if (!sqe) { submit_ok = false; break; }
-                            io_uring_prep_read(sqe, rfd[(size_t) ci], dst, loc.len, (off_t) loc.off);
-                            io_uring_sqe_set_data(sqe, (void *) (uintptr_t) ((size_t) ci * 3));
+                            sqe_items.push_back({ rfd[(size_t) ci], (uint64_t) loc.off, loc.len,
+                                dst, (uint64_t) (size_t) ci * 3 });
                             if (io_diag) {
                                 demand_queued++;
                                 demand_bytes += loc.len;
                                 if (spec_pending >= 0 && spec_layer == il &&
                                     spec_experts[spec_pending] == misses[(size_t) ci]) duplicate_submissions++;
                             }
-                            n_sqe++;
                         } else {
                             const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) ci]);
                             const size_t want[3] = { gb, ub, db };
                             const size_t off[3] = { 0, gb, gb + ub };
                             for (int r = 0; r < 3; ++r) {
-                                struct io_uring_sqe * sqe = io_uring_get_sqe(&ring);
-                                if (!sqe) { submit_ok = false; break; }
-                                io_uring_prep_read(sqe, s[r].fd >= 0 ? s[r].fd : fd_gguf, dst + off[r], want[r],
-                                        (off_t) (s[r].off + s[r].pre));
-                                io_uring_sqe_set_data(sqe, (void *) (uintptr_t) ((size_t) ci * 3 + (size_t) r));
-                                n_sqe++;
+                                sqe_items.push_back({ s[r].fd >= 0 ? s[r].fd : fd_gguf,
+                                    (uint64_t) (s[r].off + s[r].pre), (uint32_t) want[r], dst + off[r],
+                                    (uint64_t) (size_t) ci * 3 + (uint64_t) r });
+                            }
+                            if (io_diag) {
+                                demand_queued += 3;
+                                demand_bytes += gb + ub + db;
                             }
                         }
+                    }
+                    std::stable_sort(sqe_items.begin(), sqe_items.end(),
+                            [](const DemandSqeItem & a, const DemandSqeItem & b) {
+                                if (a.fd != b.fd) return a.fd < b.fd;
+                                return a.off < b.off;
+                            });
+                    int n_sqe = 0;
+                    bool submit_ok = true;
+                    for (const DemandSqeItem & it : sqe_items) {
+                        struct io_uring_sqe * sqe = io_uring_get_sqe(&ring);
+                        if (!sqe) { submit_ok = false; break; }
+                        io_uring_prep_read(sqe, it.fd, it.dst, it.len, (off_t) it.off);
+                        io_uring_sqe_set_data(sqe, (void *) (uintptr_t) it.tag);
+                        n_sqe++;
                     }
                     bool submit_fail = !submit_ok;
                     if (!submit_fail && n_sqe > 0) {
@@ -645,17 +685,40 @@ static void start_doorbell_worker(llama_context * ctx) {
                                     spec_reused++;
                                 } else {
                                     join_retries++;
-                                    const auto location = locs[(size_t) spec_copy];
-                                    size_t got = 0;
-                                    while (got < location.len) {
-                                        const ssize_t result = pread(rfd[(size_t) spec_copy],
-                                                stage_host + (size_t) spec_copy * stride + got,
-                                                location.len - got, (off_t) (location.off + got));
-                                        if (result < 0 && errno == EINTR) continue;
-                                        if (result <= 0) break;
-                                        got += (size_t) result;
+                                    bool ok = false;
+                                    if (ctx->pager.pack_mode()) {
+                                        const auto location = locs[(size_t) spec_copy];
+                                        size_t got = 0;
+                                        while (got < location.len) {
+                                            const ssize_t result = pread(rfd[(size_t) spec_copy],
+                                                    stage_host + (size_t) spec_copy * stride + got,
+                                                    location.len - got, (off_t) (location.off + got));
+                                            if (result < 0 && errno == EINTR) continue;
+                                            if (result <= 0) break;
+                                            got += (size_t) result;
+                                        }
+                                        ok = got == location.len;
+                                    } else {
+                                        // fall back to a synchronous shard read for the predicted expert
+                                        const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) spec_copy]);
+                                        const size_t want[3] = { gb, ub, db };
+                                        const size_t off[3] = { 0, gb, gb + ub };
+                                        ok = true;
+                                        for (int r = 0; r < 3 && ok; r++) {
+                                            const int kfd = s[r].fd >= 0 ? s[r].fd : fd_gguf;
+                                            size_t got = 0;
+                                            while (got < want[r]) {
+                                                const ssize_t result = pread(kfd,
+                                                        stage_host + (size_t) spec_copy * stride + off[r] + got,
+                                                        want[r] - got, (off_t) (s[r].off + s[r].pre + got));
+                                                if (result < 0 && errno == EINTR) continue;
+                                                if (result <= 0) break;
+                                                got += (size_t) result;
+                                            }
+                                            ok = got == want[r];
+                                        }
                                     }
-                                    if (got == location.len) publish_ready(spec_copy);
+                                    if (ok) publish_ready(spec_copy);
                                     else fail_ci(spec_copy);
                                 }
                                 spec_copy = -1;
@@ -761,9 +824,9 @@ static void start_doorbell_worker(llama_context * ctx) {
                             compared += prediction->compared;
                             overlap += prediction->overlap;
                         }
-                        fprintf(stderr, "[prekick] pre_attn_topk/post_attn_topk overlap=%.2f%% matched=%llu compared=%llu submitted=%ld reused=%ld\n",
+                        fprintf(stderr, "[prekick] pre_attn_topk/post_attn_topk overlap=%.2f%% matched=%llu compared=%llu submitted=%ld reused=%ld spec_cache_hits=%ld\n",
                                 compared ? 100.0 * (double) overlap / compared : 0.0,
-                                (unsigned long long) overlap, (unsigned long long) compared, spec_submitted, spec_reused);
+                                (unsigned long long) overlap, (unsigned long long) compared, spec_submitted, spec_reused, spec_cache_hits);
                     }
                 }
             }
@@ -786,7 +849,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                         spec_next = 0;
                         for (int selected = 0; selected < spec_count; ++selected) {
                             spec_experts[selected] = prediction->experts[selected];
+                            spec_lengths[selected] = 0;
                             spec_ready[selected] = false;
+                            spec_got_bytes[selected] = 0;
+                            spec_got_roles[selected] = 0;
+                            spec_got_cancel[selected] = 0;
                         }
                         break;
                     }
@@ -796,31 +863,81 @@ static void start_doorbell_worker(llama_context * ctx) {
                             const int expert = spec_experts[selected];
                             if (expert < 0 || expert >= n_exp ||
                                 ctx->moe.slot_of[(size_t) spec_layer * n_exp + expert] >= 0) continue;
-                            const auto location = ctx->pager.pack_loc(spec_layer, expert);
-                            if (location.fd < 0 || location.len > stride) continue;
+                            // predicted expert is arena-resident: no NVMe spec read; the
+                            // KICK demand path will DMA it arena -> pool without touching NVMe
+                            if (ctx->pager.cache_has(spec_layer, expert)) {
+                                spec_cache_hits++;
+                                continue;
+                            }
                             bool demand_arrived = false;
                             for (int layer = 0; layer < n_layer; ++layer) {
                                 if (dbs[layer].state == 1) demand_arrived = true;
                             }
                             if (demand_arrived || moe_doorbell_prekick_host(spec_layer)->state != 2) break;
-                            struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
-                            if (!read) break;
-                            io_uring_prep_read(read, location.fd, spec_stage + (size_t) selected * stride,
-                                    location.len, (off_t) location.off);
-                            read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
-                            if (spec_async) read->flags |= IOSQE_ASYNC;
-                            read->user_data = (uint64_t) selected + 1;
-                            spec_lengths[selected] = location.len;
+                            char * dst = spec_stage + (size_t) selected * stride;
                             const auto submit_started = std::chrono::steady_clock::now();
-                            if (io_uring_submit(&spec_ring) > 0) {
+                            int n_sqe = 0;
+                            if (ctx->pager.pack_mode()) {
+                                const auto location = ctx->pager.pack_loc(spec_layer, expert);
+                                if (location.fd < 0 || location.len > stride) continue;
+                                struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
+                                if (!read) break;
+                                io_uring_prep_read(read, location.fd, dst,
+                                        location.len, (off_t) location.off);
+                                read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+                                if (spec_async) read->flags |= IOSQE_ASYNC;
+                                read->user_data = (uint64_t) selected * 4 + 1;
+                                n_sqe = 1;
+                                spec_lengths[selected] = location.len;
+                            } else {
+                                const moe_expert_slice * s = ctx->pager.slices(spec_layer, expert);
+                                const size_t gb = ctx->moe.host_gate[spec_layer];
+                                const size_t ub = ctx->moe.host_up[spec_layer];
+                                const size_t db = ctx->moe.host_down[spec_layer];
+                                if (gb + ub + db > stride) continue;
+                                const size_t want[3] = { gb, ub, db };
+                                struct SpecSqeItem { int fd; uint64_t off; uint32_t len; char * dst; };
+                                SpecSqeItem items[3];
+                                size_t pos = 0;
+                                for (int r = 0; r < 3; ++r) {
+                                    items[r].fd = s[r].fd >= 0 ? s[r].fd : fd_gguf;
+                                    items[r].off = (uint64_t) (s[r].off + s[r].pre);
+                                    items[r].len = (uint32_t) want[r];
+                                    items[r].dst = dst + pos;
+                                    pos += want[r];
+                                }
+                                // monotonically increasing offsets within the selected fd(s)
+                                int order[3] = { 0, 1, 2 };
+                                std::sort(order, order + 3, [&](int a, int b) {
+                                    if (items[a].fd != items[b].fd) return items[a].fd < items[b].fd;
+                                    return items[a].off < items[b].off;
+                                });
+                                bool ok = true;
+                                for (int oi = 0; oi < 3 && ok; oi++) {
+                                    const int r = order[oi];
+                                    struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
+                                    if (!read) { ok = false; break; }
+                                    io_uring_prep_read(read, items[r].fd, items[r].dst, items[r].len,
+                                            (off_t) items[r].off);
+                                    read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+                                    if (spec_async) read->flags |= IOSQE_ASYNC;
+                                    read->user_data = (uint64_t) selected * 4 + r + 1;
+                                    n_sqe++;
+                                }
+                                if (!ok) break;
+                                spec_lengths[selected] = (uint32_t) (gb + ub + db);
+                            }
+                            if (n_sqe > 0 && io_uring_submit(&spec_ring) == n_sqe) {
                                 spec_pending = selected;
                                 spec_submitted++;
                                 if (io_diag) {
-                                    spec_bytes += location.len;
+                                    spec_bytes += spec_lengths[selected];
                                     spec_started = submit_started;
                                     spec_submit_ms += std::chrono::duration<double, std::milli>(
                                             std::chrono::steady_clock::now() - submit_started).count();
                                 }
+                            } else {
+                                break;
                             }
                         }
                     }
@@ -876,7 +993,8 @@ static void moe_slot_resolve_sync(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op);
+    int32_t op,
+    int32_t count);
 
 static void moe_slot_resolve_register_ctx(llama_context * ctx) {
     g_moe_resolve_ctx = ctx;
@@ -904,12 +1022,19 @@ static void moe_slot_resolve_sync(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op) {
+    int32_t op,
+    int32_t count) {
     (void) op;
     (void) table;
     (void) table_nb0;
     (void) out_nb0;
     (void) out_nb1;
+    (void) count;
+    if (op == GGML_OP_MOE_SLOT_PREKICK) {
+        // the CUDA doorbell path runs PREKICK on device; when this fallback is
+        // active no PREKICK nodes are emitted, so there is nothing to do
+        return;
+    }
     llama_context * ctx = g_moe_resolve_ctx;
     const int64_t total = nk * nt;
     if (!ctx || !ctx->moe_enabled() || il < 0 || il >= ctx->moe.n_layer || total <= 0 || total > 80) {

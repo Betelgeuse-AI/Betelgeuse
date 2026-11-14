@@ -68,7 +68,8 @@ void moe_doorbell_resolve_launch(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op
+    int32_t op,
+    int32_t count
 );
 
 #ifdef __cplusplus

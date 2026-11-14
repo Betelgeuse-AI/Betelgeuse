@@ -1217,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "moe_slot_resolve(topk, table)",
     "moe_slot_resolve_kick(topk, table)",
     "moe_slot_resolve_wait(kick, dependency)",
-    "moe_slot_prekick(topk, table)",
+    "moe_slot_prekick(logits, table)",
 
     "unary(x)",
 
@@ -6650,15 +6650,26 @@ struct ggml_tensor * ggml_moe_slot_resolve_wait(
     return result;
 }
 
+// PREKICK takes the raw router logits and the slot map and does the
+// resident-expert mask + top-K selection on device (Rule A). out is I32 [count, 1].
 struct ggml_tensor * ggml_moe_slot_prekick(
         struct ggml_context * ctx,
-        struct ggml_tensor  * topk,
+        struct ggml_tensor  * logits,
         struct ggml_tensor  * table,
         int32_t               il,
-        int32_t               sentinel) {
-    GGML_ASSERT(topk->ne[1] == 1 && topk->ne[0] <= 8);
-    struct ggml_tensor * result = ggml_moe_slot_resolve(ctx, topk, table, NULL, NULL, il, sentinel);
-    result->op = GGML_OP_MOE_SLOT_PREKICK;
+        int32_t               sentinel,
+        int32_t               count) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->ne[1] == 1 && logits->ne[0] == (int64_t) table->ne[0] * table->ne[1]);
+    GGML_ASSERT(logits->nb[0] == sizeof(float) && table->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(count >= 1 && count <= 8);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, count, 1);
+    ggml_set_op_params_i32(result, 0, il);
+    ggml_set_op_params_i32(result, 1, sentinel);
+    ggml_set_op_params_i32(result, 2, count);
+    result->op     = GGML_OP_MOE_SLOT_PREKICK;
+    result->src[0] = logits;
+    result->src[1] = table;
     return result;
 }
 

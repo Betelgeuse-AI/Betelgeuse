@@ -329,21 +329,77 @@ __global__ void moe_resolve_slots_kernel(
     }
 }
 
+// PREKICK (Rule A + Rule B): one lane per expert. VRAM-resident experts (slot
+// assigned in the slot map) are masked to -1e9f before the top-K selection, so
+// the plan holds only cold misses, ranked by the pre-attention logits. One
+// block, 512 lanes (16 warps); 512 candidates fit in shared memory, and a
+// 64-block split would need a global merge for nothing at this size.
+// (Rule B removed the single-warp <<<1, 32>>> kernel.)
 static __global__ void moe_prekick_kernel(
-        const char * topk, char * out, DoorbellPrekick * plans,
-        int layer, int count, size_t topk_nb0, size_t out_nb0) {
-    if (threadIdx.x != 0) return;
-    DoorbellPrekick & plan = plans[layer];
-    plan.generation++;
-    plan.n = (uint32_t) count;
-    for (int selected = 0; selected < count; ++selected) {
-        const int32_t expert = *(const int32_t *) (topk + (size_t) selected * topk_nb0);
-        plan.experts[selected] = expert;
-        *(int32_t *) (out + (size_t) selected * out_nb0) = expert;
+        const float * __restrict__ logits,
+        const int32_t * __restrict__ table,
+        int32_t * __restrict__ out,
+        DoorbellPrekick * __restrict__ plans,
+        int layer, int count, int n_exp, int sentinel,
+        size_t logits_nb0, size_t table_nb0, size_t out_nb0) {
+    const int tid = threadIdx.x;
+    const int e = tid;
+    const int lane = tid & 31, warp = tid >> 5;
+    const unsigned full = 0xffffffffu;
+    __shared__ float s_val[512];
+    __shared__ float r_val[16];
+    __shared__ int32_t r_idx[16];
+
+    if (e < n_exp) {
+        const int32_t slot = table[(size_t) e * table_nb0];
+        const bool resident = slot >= 0 && slot < sentinel; // assigned pool slot: never prefetch
+        s_val[e] = resident ? -1e9f : logits[(size_t) e * logits_nb0];
+    } else {
+        s_val[e] = -1e9f;
     }
-    __threadfence_system();
-    pci_st_u32(&plan.state, 1);
-    __threadfence_system();
+    if (tid == 0) {
+        DoorbellPrekick & plan = plans[layer];
+        plan.generation++;
+        plan.n = (uint32_t) count;
+    }
+    const int n_warp = (n_exp + 31) >> 5;
+    __syncthreads();
+
+    for (int selected = 0; selected < count; selected++) {
+        float v = e < n_exp ? s_val[e] : -1e9f;
+        int32_t idx = e;
+        // ballot-free max reduction: highest value wins, smallest index wins ties
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(full, v, off);
+            const int32_t oi = __shfl_down_sync(full, idx, off);
+            if (ov > v || (ov == v && oi < idx)) { v = ov; idx = oi; }
+        }
+        if (lane == 0) { r_val[warp] = v; r_idx[warp] = idx; }
+        __syncthreads();
+        if (warp == 0) {
+            float vv = tid < n_warp ? r_val[tid] : -1e9f;
+            int32_t ii = tid < n_warp ? r_idx[tid] : 0x7fffffff;
+            for (int off = 8; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(full, vv, off);
+                const int32_t oi = __shfl_down_sync(full, ii, off);
+                if (ov > vv || (ov == vv && oi < ii)) { vv = ov; ii = oi; }
+            }
+            if (tid == 0) {
+                int32_t picked = -1;
+                if (vv > -1e9f + 1e-3f) picked = ii;
+                out[(size_t) selected * out_nb0] = picked;
+                plans[layer].experts[selected] = picked;
+                if (picked >= 0) s_val[picked] = -1e9f; // consume winner
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        __threadfence_system();
+        pci_st_u32(&plans[layer].state, 1);
+        __threadfence_system();
+    }
 }
 
 DoorbellPrekick * moe_doorbell_prekick_host(int il) {
@@ -405,9 +461,9 @@ void moe_doorbell_resolve_launch(
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
-    int32_t op
+    int32_t op,
+    int32_t count
 ) {
-    (void) table_nb0;
     (void) full; (void) fnk; (void) fnt; (void) full_nb1; (void) look; (void) lnk;
 
     if (!g_active || !g_doorbells_dev || !g_plans_dev) return;
@@ -420,8 +476,12 @@ void moe_doorbell_resolve_launch(
     if (g_dma_done) GGML_ASSERT(cudaStreamIsCapturing(s, &capture_status) == cudaSuccess);
     const bool use_dma = g_dma_done && capture_status == cudaStreamCaptureStatusActive;
     if (op == GGML_OP_MOE_SLOT_PREKICK) {
-        moe_prekick_kernel<<<1, 32, 0, s>>>(
-            (const char *) topk, (char *) out, g_prekick_dev, il, (int) nk, topk_nb0, out_nb0);
+        // src[0] is F32 logits (passed as topk for the shared signature), src[1]
+        // is the slot map; both tensors are dense I32/F32 rows, strides 1 element
+        moe_prekick_kernel<<<1, 512, 0, s>>>(
+            (const float *) topk, (const int32_t *) table, out, g_prekick_dev,
+            il, count, n_exp, sentinel,
+            topk_nb0 / sizeof(float), table_nb0 / sizeof(int32_t), out_nb0 / sizeof(int32_t));
         return;
     }
     if (!g_stage_dev) {

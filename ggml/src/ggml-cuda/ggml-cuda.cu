@@ -3062,7 +3062,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     look ? (const int32_t *) look->data : nullptr,
                     look ? look->ne[0] * look->ne[1] : 0,
                     ggml_get_op_params_i32(dst, 0), (int32_t) (table->ne[0] * table->ne[1]),
-                    ggml_get_op_params_i32(dst, 1), dst->op);
+                    ggml_get_op_params_i32(dst, 1), dst->op, ggml_get_op_params_i32(dst, 2));
             } break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -6777,9 +6777,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_I32;
         case GGML_OP_MOE_SLOT_RESOLVE_KICK:
         case GGML_OP_MOE_SLOT_RESOLVE_WAIT:
-        case GGML_OP_MOE_SLOT_PREKICK:
             return ggml_cuda_moe_slot_resolve_fn != nullptr &&
                 op->src[0]->type == GGML_TYPE_I32 && op->src[0]->ne[1] == 1 &&
+                op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
+        case GGML_OP_MOE_SLOT_PREKICK:
+            return ggml_cuda_moe_slot_resolve_fn != nullptr &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[1] == 1 &&
                 op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);

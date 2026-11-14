@@ -517,13 +517,15 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                     model.layers[il].hc_ffn_norm, model.layers[il].hc_ffn_down,
                     model.layers[il].hc_ffn_up, nullptr, nullptr, il);
             ggml_tensor * pre_logits = build_lora_mm(model.layers[il].ffn_gate_inp, pre_mix.cur);
-            const char * count_env = getenv("MOE_PREKICK_M");
-            const int count = count_env && atoi(count_env) == 4 ? 4 : 8;
-            ggml_tensor * pre_topk = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, pre_logits, count));
-            cb(pre_topk, "pre_attn_topk", il);
+            cb(pre_logits, "pre_attn_logits", il);
             const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
-            ggml_tensor * prekick = ggml_moe_slot_prekick(ctx0, pre_topk,
-                    (ggml_tensor *) moe_table[il], il, sentinel);
+            // Rule A: the kernel masks VRAM-resident experts on device before
+            // the top-K selection, so the plan holds only cold misses
+            const char * count_env = getenv("MOE_PREKICK_M");
+            int count = count_env ? atoi(count_env) : 2;
+            if (count < 2 || count > 3) count = 2;
+            ggml_tensor * prekick = ggml_moe_slot_prekick(ctx0, pre_logits,
+                    (ggml_tensor *) moe_table[il], il, sentinel, count);
             cb(prekick, "ffn_moe_prekick", il);
             ggml_build_forward_expand(gf, prekick);
         }

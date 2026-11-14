@@ -74,8 +74,10 @@ public:
                                   void * dst_up,     size_t up_bytes,
                                   void * dst_down,   size_t down_bytes);
     // Batched fetch: submit all n_targets in one io_uring_submit (QD = n_targets).
-    // DMAs each expert as its CQE arrives and synchronizes stream once at the end.
-    bool fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream = nullptr, bool sync_gpu = true);
+    // DMAs each expert as its CQE arrives; slots are recycled via the stage_ev_
+    // event FIFO, so the host never blocks on ws mid-batch. sync_gpu defaults
+    // off; pass true to keep the old mid-batch stream synchronize.
+    bool fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream = nullptr, bool sync_gpu = false);
 
     bool fetch_direct_io(int il, int e, void * dst_gate, size_t gate_bytes,
                          void * dst_up, size_t up_bytes,
@@ -108,6 +110,7 @@ public:
     // PCIe (~20 GB/s) instead of the NVMe (~2.8 GB/s). Sized by `bytes`; 0 off.
     bool init_cache(size_t bytes);
     const char * cache_find(int il, int expert);
+    bool cache_has(int il, int expert); // side-effect free probe (no LFU stamp, no hit count)
     char * cache_reserve(int il, int expert, const int32_t * selected, size_t count);
     void cache_remove(int il, int expert);
     size_t cache_bytes() const { return cache_ ? cache_bytes_ : 0; }
@@ -138,6 +141,7 @@ public:
     long stats_warm_reads() const { return n_warm_reads_; }
     long stats_gguf_reads() const { return n_gguf_reads_; }
     long stats_pack_reads() const { return n_pack_reads_; }
+    long stats_sync_stage_wait_us() const { return sync_stage_wait_us_; }
     bool drop_gguf_pages();
     long warm_pack_ranges(const uint64_t * offs, const size_t * lens, size_t n);
 
@@ -186,6 +190,10 @@ private:
     std::vector<Req> reqs_;
     std::vector<int> free_stage_;    // prefetch-eligible staging slots
     std::vector<int> free_demand_;   // demand-only staging slots
+    // one CUDA event per staging slot: recorded on ws after the H2D DMA that
+    // drained the slot; a slot is not reused until the event fires
+    void *             stage_ev_[NSTAGE] = {};
+    long               sync_stage_wait_us_ = 0;
     long              demand_stages_ = 0;
 
     // Tier 1: pinned host arena holding whole experts, indexed by (il,e)
@@ -210,6 +218,8 @@ private:
     int find_(int key) const;
     double wait_(int r);
     bool wait_ok_(int r); // true when all 3 roles moved their full length
+    void ensure_stage_events();
+    void sync_stage(int st); // wait for the DMA that drained staging slot `st`
     bool commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
         void * dst_up, size_t up_bytes, void * dst_down, size_t down_bytes);
 };

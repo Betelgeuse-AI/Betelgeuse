@@ -32,6 +32,12 @@ static double now_s() {
 
 moe_pager::~moe_pager() {
     if (ring_) { io_uring_queue_exit((struct io_uring *) ring_); ring_ = nullptr; }
+    for (int k = 0; k < NSTAGE; k++) {
+        if (stage_ev_[k]) {
+            cudaEventDestroy(static_cast<cudaEvent_t>(stage_ev_[k]));
+            stage_ev_[k] = nullptr;
+        }
+    }
     if (stage_) { cudaFreeHost(stage_); stage_ = nullptr; }
     if (cache_) {
         if (cache_registered_) {
@@ -51,6 +57,33 @@ moe_pager::~moe_pager() {
     if (fd_pack_ >= 0) { close(fd_pack_); fd_pack_ = -1; }
     if (fd_pack_buf_ >= 0) { close(fd_pack_buf_); fd_pack_buf_ = -1; }
     if (fd_warm_ >= 0) { close(fd_warm_); fd_warm_ = -1; }
+}
+
+void moe_pager::ensure_stage_events() {
+    if (stage_ev_[0] != nullptr) return;
+    for (int i = 0; i < NSTAGE; ++i) {
+        cudaEvent_t created = nullptr;
+        const cudaError_t error = cudaEventCreateWithFlags(&created, cudaEventDisableTiming);
+        if (error != cudaSuccess) {
+            for (int k = 0; k < i; ++k) {
+                cudaEventDestroy(static_cast<cudaEvent_t>(stage_ev_[k]));
+                stage_ev_[k] = nullptr;
+            }
+            fprintf(stderr, "moe_pager: stage event create failed: %s\n", cudaGetErrorString(error));
+            return;
+        }
+        stage_ev_[i] = created;
+    }
+}
+
+// the stage slot is reusable once the DMA that drained it completes; event
+// sync is cheap when the copy already drained (the common case)
+void moe_pager::sync_stage(int st) {
+    if (st >= 0 && st < NSTAGE && stage_ev_[st]) {
+        const double t0 = now_s();
+        cudaEventSynchronize(static_cast<cudaEvent_t>(stage_ev_[st]));
+        sync_stage_wait_us_ += (long) ((now_s() - t0) * 1e6);
+    }
 }
 
 int moe_pager::pack_fd_buf() {
@@ -366,13 +399,29 @@ int moe_pager::submit_(int key, bool demand) {
     const moe_expert_slice * s = slices(il, e);
 
     const int st = pool.back(); pool.pop_back();
+    ensure_stage_events();
+    sync_stage(st);
     const int ridx = (int) reqs_.size();
     int pending = 0;
     long got_self[3] = { -1, -1, -1 };
-    size_t boff = 0;
+    size_t boff[3] = { 0, 0, 0 };
+    boff[1] = s[0].len;
+    boff[2] = s[0].len + s[1].len;
+    // submit SQEs in file-offset order so the NVMe gets monotonic reads; the
+    // stage layout stays [gate][up][down]
+    int order[3] = { 0, 1, 2 };
+    if (!pack_mode_) {
+        std::sort(order, order + 3, [&](int a, int b) {
+            const int fa = s[a].fd >= 0 ? s[a].fd : fd_;
+            const int fb = s[b].fd >= 0 ? s[b].fd : fd_;
+            if (fa != fb) return fa < fb;
+            return s[a].off < s[b].off;
+        });
+    }
     // pack mode: the whole expert is one blob, so one read covers all roles
     const int nread = pack_mode_ ? 1 : 3;
-    for (int r = 0; r < nread; r++) {
+    for (int oi = 0; oi < nread; oi++) {
+        const int r = pack_mode_ ? 0 : order[oi];
         struct io_uring_sqe * sqe = io_uring_get_sqe((struct io_uring *) ring_);
         while (!sqe) {
             io_uring_submit((struct io_uring *) ring_);
@@ -392,18 +441,18 @@ int moe_pager::submit_(int key, bool demand) {
             sqe = io_uring_get_sqe((struct io_uring *) ring_);
         }
         io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : (s[r].fd >= 0 ? s[r].fd : fd_),
-                           stage_ + (size_t) st * stage_bytes_ + boff,
+                           stage_ + (size_t) st * stage_bytes_ + boff[r],
                            s[r].len, (off_t) s[r].off);
         sqe->user_data = (uint64_t)((ridx * 4) + r);
-        boff += s[r].len;
     }
+    const size_t boff_total = pack_mode_ ? s[0].len : boff[2] + s[2].len;
     Req q; q.il = il; q.e = e; q.stage = st; q.done = pending; q.used = true; q.demand = demand;
     q.got[0] = got_self[0]; q.got[1] = got_self[1]; q.got[2] = got_self[2];
     reqs_.push_back(q);
     int nsub = io_uring_submit((struct io_uring *) ring_);
     if (nsub <= 0) { fprintf(stderr, "pager submit failed il=%d e=%d nsub=%d\n", il, e, nsub); }
-    if (pack_mode_) { io_ops_ += 1; io_bytes_ += (long) boff; n_pack_reads_ += 1; }
-    else            { io_ops_ += 3; io_bytes_ += (long) boff; n_gguf_reads_ += 3; }
+    if (pack_mode_) { io_ops_ += 1; io_bytes_ += (long) boff_total; n_pack_reads_ += 1; }
+    else            { io_ops_ += 3; io_bytes_ += (long) boff_total; n_gguf_reads_ += 3; }
     return (int) reqs_.size() - 1;
 }
 
@@ -606,6 +655,12 @@ const char * moe_pager::cache_find(int il, int expert) {
     cache_stamp_[(size_t) slot] = ++cache_tick_;
     n_cache_hit_++;
     return cache_ + cache_off_[(size_t) slot];
+}
+
+bool moe_pager::cache_has(int il, int expert) {
+    if (!cache_ || il < 0 || il >= n_layer_ || expert < 0 || expert >= n_expert_) return false;
+    std::lock_guard<std::mutex> lock(mtx_);
+    return cache_idx_[(size_t) il * n_expert_ + expert] >= 0;
 }
 
 char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, size_t count) {
@@ -1031,6 +1086,8 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
                                        std::min(want[k], avail), cudaMemcpyHostToDevice, ws);
                         if (!pack_mode_) off += s[k].len;
                     }
+                    ensure_stage_events();
+                    cudaEventRecord(static_cast<cudaEvent_t>(stage_ev_[(size_t) reqs_[r].stage]), ws);
                 } else {
                     n_io_fail_++;
                 }
@@ -1066,24 +1123,40 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
         }
 
         const int st = pool.back(); pool.pop_back();
+        ensure_stage_events();
+        sync_stage(st);
         const int ridx = (int) reqs_.size();
         const int e = targets[i].expert;
         const moe_expert_slice * s = slices(il, e);
 
-        size_t boff = 0;
+        size_t boff[3] = { 0, 0, 0 };
+        boff[1] = s[0].len;
+        boff[2] = s[0].len + s[1].len;
+        // submit in file-offset order so the NVMe gets monotonic reads; the
+        // stage layout stays [gate][up][down]
+        int order[3] = { 0, 1, 2 };
+        if (!pack_mode_) {
+            std::sort(order, order + 3, [&](int a, int b) {
+                const int fa = s[a].fd >= 0 ? s[a].fd : fd_;
+                const int fb = s[b].fd >= 0 ? s[b].fd : fd_;
+                if (fa != fb) return fa < fb;
+                return s[a].off < s[b].off;
+            });
+        }
         const int nread = pack_mode_ ? 1 : 3;
-        for (int r = 0; r < nread; r++) {
+        for (int oi = 0; oi < nread; oi++) {
+            const int r = pack_mode_ ? 0 : order[oi];
             struct io_uring_sqe * sqe = io_uring_get_sqe((struct io_uring *) ring_);
             while (!sqe) {
                 io_uring_submit((struct io_uring *) ring_);
                 sqe = io_uring_get_sqe((struct io_uring *) ring_);
             }
             io_uring_prep_read(sqe, pack_mode_ ? fd_pack_ : (s[r].fd >= 0 ? s[r].fd : fd_),
-                               stage_ + (size_t) st * stage_bytes_ + boff,
+                               stage_ + (size_t) st * stage_bytes_ + boff[r],
                                s[r].len, (off_t) s[r].off);
             sqe->user_data = (uint64_t)((ridx * 4) + r);
-            boff += s[r].len;
         }
+        const size_t boff_total = pack_mode_ ? s[0].len : boff[2] + s[2].len;
 
         Req q{};
         q.il = il; q.e = e; q.stage = st; q.done = 0; q.used = true; q.demand = true;
@@ -1092,8 +1165,8 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
         fprintf(stderr, "[fetch_batch] PREP sqe i=%d exp=%d ridx=%d st=%d\n", i, e, ridx, st);
         items[i].req_idx = ridx;
         pending_indices.push_back(i);
-        if (pack_mode_) { io_ops_ += 1; io_bytes_ += (long) boff; n_pack_reads_ += 1; }
-        else            { io_ops_ += 3; io_bytes_ += (long) boff; n_gguf_reads_ += 3; }
+        if (pack_mode_) { io_ops_ += 1; io_bytes_ += (long) boff_total; n_pack_reads_ += 1; }
+        else            { io_ops_ += 3; io_bytes_ += (long) boff_total; n_gguf_reads_ += 3; }
     }
 
     // 3. Submit ALL queued SQEs in ONE io_uring_submit call!
@@ -1151,6 +1224,8 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
                                                std::min(want[k], avail), cudaMemcpyHostToDevice, ws);
                                 if (!pack_mode_) off += s[k].len;
                             }
+                            ensure_stage_events();
+                            cudaEventRecord(static_cast<cudaEvent_t>(stage_ev_[(size_t) reqs_[rr].stage]), ws);
                         } else {
                             n_io_fail_++;
                         }
@@ -1164,7 +1239,9 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
         }
     }
 
-    // 5. Synchronize the stream if requested
+    // stream ordering for the caller is via WAIT(ready[]) events; stages go
+    // back to the pool here and are recycled only after their stage_ev_ fires
+    // at the next pop, so the host never blocks on ws mid-batch
     if (sync_gpu) {
         cudaError_t se = cudaStreamSynchronize(ws);
         if (se != cudaSuccess) {
