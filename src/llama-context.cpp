@@ -545,7 +545,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                             for (int r = 0; r < 3 && ok; ++r) {
                                 size_t got = 0;
                                 while (got < want[r]) {
-                                    const ssize_t rr = pread(fd_gguf, dst + off[r] + got,
+                                    const ssize_t rr = pread(s[r].fd >= 0 ? s[r].fd : fd_gguf, dst + off[r] + got,
                                             want[r] - got, (off_t) (s[r].off + s[r].pre + got));
                                     if (rr <= 0) break;
                                     got += (size_t) rr;
@@ -582,7 +582,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                             for (int r = 0; r < 3; ++r) {
                                 struct io_uring_sqe * sqe = io_uring_get_sqe(&ring);
                                 if (!sqe) { submit_ok = false; break; }
-                                io_uring_prep_read(sqe, fd_gguf, dst + off[r], want[r],
+                                io_uring_prep_read(sqe, s[r].fd >= 0 ? s[r].fd : fd_gguf, dst + off[r], want[r],
                                         (off_t) (s[r].off + s[r].pre));
                                 io_uring_sqe_set_data(sqe, (void *) (uintptr_t) ((size_t) ci * 3 + (size_t) r));
                                 n_sqe++;
@@ -675,7 +675,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 const size_t off[3] = { 0, gb, gb + ub };
                                 size_t got = 0;
                                 while (got < want) {
-                                    const ssize_t rr = pread(fd_gguf, dst + off[r] + got, want - got,
+                                    const ssize_t rr = pread(s[r].fd >= 0 ? s[r].fd : fd_gguf, dst + off[r] + got, want - got,
                                             (off_t) (s[r].off + s[r].pre + got));
                                     if (rr <= 0) break;
                                     got += (size_t) rr;
@@ -1389,6 +1389,7 @@ void llama_context::moe_hot_cycle(int fd) {
         } else {
             const moe_expert_slice * s = pager.slices(il, e);
             roff = (off_t) s->off; rlen = (size_t) s->len;
+            rfd = s->fd >= 0 ? s->fd : fd;
         }
         // skip experts that are already in the page cache: re-issuing
         // readahead for resident data only churns the cache
