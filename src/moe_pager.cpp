@@ -772,10 +772,13 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
                 at += nb;
             }
         } else {
+            // compact layout: copy exactly role_bytes_ per role, not the
+            // 4 KiB-rounded slice lengths (which include the O_DIRECT pad)
             const moe_expert_slice * cs = slices(il, e);
+            const size_t * rb = &role_bytes_[(size_t) il * 3];
             size_t coff = 0;
             for (int k = 0; k < 3; k++) {
-                const size_t nb = (size_t) cs[k].len - cs[k].pre;
+                const size_t nb = rb[k];
                 memcpy(cdst + at, csrc + coff + cs[k].pre, nb);
                 at += nb;
                 coff += cs[k].len;
