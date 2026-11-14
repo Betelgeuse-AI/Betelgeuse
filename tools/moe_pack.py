@@ -47,17 +47,18 @@ def expert_layout(model):
         blob = sum(sizes)
         if blob <= 0 or blob > 256 * 1024 * 1024:
             raise ValueError(f"layer {layer}: unsupported expert byte size {blob}")
-        layout.append({"layer": layer, "offset": offset, "blob": blob, "sizes": sizes,
+        stride = (blob + 4095) // 4096 * 4096
+        layout.append({"layer": layer, "offset": offset, "blob": blob, "stride": stride, "sizes": sizes,
                        "source_offsets": [tensor.data_offset for tensor in roles],
                        "types": [int(tensor.tensor_type) for tensor in roles]})
-        offset += count * blob
+        offset += count * stride
     return layout, experts, offset
 
 
 def index_text(layout):
-    header = "# native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off\n"
+    header = "# native experts v4: layer gu_type d_type offset stride blob_bytes gate_off up_off down_off\n"
     return header + "".join(" ".join(str(value) for value in (
-        row["layer"], row["types"][0], row["types"][2], row["offset"], row["blob"], *row["source_offsets"]
+        row["layer"], row["types"][0], row["types"][2], row["offset"], row["stride"], row["blob"], *row["source_offsets"]
     )) + "\n" for row in layout)
 
 
@@ -88,8 +89,12 @@ def create_pack(model, output):
             for row in layout:
                 for expert in range(experts):
                     data = read_expert(source, row, expert)
+                    pad = row["stride"] - row["blob"]
                     target.write(data)
                     digest.update(data)
+                    if pad:
+                        target.write(bytes(pad))
+                        digest.update(bytes(pad))
                 print(f"packed layer {row['layer'] + 1}/{len(layout)}", flush=True)
             padding = bytes(padded - total)
             target.write(padding)
@@ -97,7 +102,7 @@ def create_pack(model, output):
             target.flush()
             os.fsync(target.fileno())
         (temporary / "native_experts.txt").write_text(index_text(layout), encoding="ascii")
-        metadata = {"format": "native-experts-v3", "source": model.name, "source_bytes": model.stat().st_size,
+        metadata = {"format": "native-experts-v4", "source": model.name, "source_bytes": model.stat().st_size,
                     "layers": len(layout), "experts_per_layer": experts, "bytes": padded,
                     "sha256": digest.hexdigest(), "weights": "unaltered source bytes"}
         (temporary / "expert-pack.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -118,7 +123,7 @@ def verify_pack(model, output, verify_all=False):
     layout, experts, total = expert_layout(model)
     if (output / "experts.bin").stat().st_size != (total + 4095) // 4096 * 4096:
         raise ValueError("pack byte size does not match the model")
-    actual = [line.split()[:8] for line in (output / "native_experts.txt").read_text().splitlines()
+    actual = [line.split()[:9] for line in (output / "native_experts.txt").read_text().splitlines()
               if line.strip() and not line.lstrip().startswith("#")]
     expected = [line.split() for line in index_text(layout).splitlines()[1:]]
     if actual != expected:
@@ -128,7 +133,7 @@ def verify_pack(model, output, verify_all=False):
     with model.open("rb") as source, (output / "experts.bin").open("rb") as packed:
         for row in layout:
             for expert in selected:
-                packed.seek(row["offset"] + expert * row["blob"])
+                packed.seek(row["offset"] + expert * row["stride"])
                 if packed.read(row["blob"]) != read_expert(source, row, expert):
                     raise ValueError(f"weight mismatch: layer {row['layer']}, expert {expert}")
                 checked += 1

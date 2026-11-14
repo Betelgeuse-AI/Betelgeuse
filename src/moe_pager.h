@@ -191,8 +191,12 @@ private:
     // Tier 1: pinned host arena holding whole experts, indexed by (il,e)
     char * cache_ = nullptr;
     bool cache_registered_ = false;
-    size_t cache_bytes_ = 0;             // per-expert bytes in the arena
+    size_t cache_bytes_ = 0;             // total arena bytes
     int    cache_slots_ = 0;
+    std::vector<uint64_t> cache_off_;    // per-slot offset into cache_
+    std::vector<int> layer_slot_base_;   // first arena slot of layer il
+    std::vector<int> layer_slot_count_;  // arena slots per layer
+    std::vector<int> cache_slot_key_;    // slot -> il*n_expert+e, -1 = empty
     std::vector<int>  cache_idx_;        // il*n_expert+e -> slot, -1 = absent
     std::vector<char> cache_used_;       // slot occupied
     std::vector<long> cache_stamp_;      // slot last-use tick (LFU)

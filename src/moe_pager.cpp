@@ -36,7 +36,7 @@ moe_pager::~moe_pager() {
     if (cache_) {
         if (cache_registered_) {
             cudaHostUnregister(cache_);
-            munmap(cache_, cache_bytes_ * (size_t) cache_slots_);
+            munmap(cache_, cache_bytes_);
         } else {
             cudaFreeHost(cache_);
         }
@@ -264,6 +264,17 @@ bool moe_pager::use_pack(const char * experts_bin, const char * index_txt, std::
         if (fd_pack_ < 0) { err = "open experts.bin O_DIRECT failed"; return false; }
         pack_path_ = experts_bin;
     }
+    // detect the index format: v4 carries a 4 KiB-aligned per-expert stride;
+    // v3 packs are read the same way with stride == blob
+    bool v4 = false;
+    {
+        std::ifstream hf(index_txt);
+        std::string first;
+        if (hf && std::getline(hf, first)) {
+            v4 = first.find("v4") != std::string::npos;
+        }
+    }
+
     bsrc_.assign((size_t) n_layer_ * n_expert_ * 3, 0);
     // build into temporaries: a rejected pack must leave the GGUF index intact
     std::vector<moe_expert_slice> new_idx = idx_;
@@ -275,9 +286,15 @@ bool moe_pager::use_pack(const char * experts_bin, const char * index_txt, std::
         if (line.empty() || line[0] == '#') continue;
         std::istringstream is(line);
         int il, gu, dt;
-        long long base = 0, blob = 0;
-        if (!(is >> il >> gu >> dt >> base >> blob)) { err = "bad pack index line"; return false; }
-        if (base < 0 || blob <= 0) { err = "bad pack index offsets"; return false; }
+        long long base = 0, stride = 0, blob = 0;
+        if (v4) {
+            if (!(is >> il >> gu >> dt >> base >> stride >> blob)) { err = "bad pack index line"; return false; }
+        } else {
+            stride = 0;
+            if (!(is >> il >> gu >> dt >> base >> blob)) { err = "bad pack index line"; return false; }
+            stride = blob;
+        }
+        if (base < 0 || stride <= 0 || blob <= 0) { err = "bad pack index offsets"; return false; }
         if (il < 0 || il >= n_layer_) { err = "pack index layer out of range"; return false; }
         const size_t g = role_bytes_[(size_t) il * 3 + 0];
         const size_t u = role_bytes_[(size_t) il * 3 + 1];
@@ -287,7 +304,7 @@ bool moe_pager::use_pack(const char * experts_bin, const char * index_txt, std::
             return false;
         }
         for (int e = 0; e < n_expert_; e++) {
-            const uint64_t fbo  = (uint64_t) base + (uint64_t) e * (uint64_t) blob;
+            const uint64_t fbo  = (uint64_t) base + (uint64_t) e * (uint64_t) stride;
             const uint64_t pre  = (ALIGN - (fbo % ALIGN)) % ALIGN;
             const size_t   alen = (size_t) (((blob + pre + ALIGN - 1) / ALIGN) * ALIGN);
             moe_expert_slice * s = &new_idx[((size_t) il * n_expert_ + e) * 3];
@@ -491,20 +508,62 @@ bool moe_pager::reserve_staging_split(int n_total, int n_demand) {
 // ---- Tier 1: pinned host RAM cache --------------------------------------
 bool moe_pager::init_cache(size_t bytes) {
     if (bytes == 0) return true;
-    if (stage_bytes_ == 0) return false;                  // need the expert size
-    // must hold a WHOLE expert (gate+up+down) for the LARGEST layer, not layer 0
-    size_t per = 0;
+    if (stage_bytes_ == 0 || n_layer_ <= 0) return false;
+    // per-layer arena: slot size is the layer's exact gate|up|down bytes, so
+    // small layers stop paying blk.4's stride; find/insert/evict stay O(1)
+    // within a layer's slot range
+    std::vector<size_t> per_layer((size_t) n_layer_, 0);
+    size_t max_layer = 0;
     for (int il = 0; il < n_layer_; il++) {
-        per = std::max(per, role_bytes_[(size_t) il * 3 + 0]
-                          + role_bytes_[(size_t) il * 3 + 1]
-                          + role_bytes_[(size_t) il * 3 + 2]);
+        per_layer[il] = role_bytes_[(size_t) il * 3 + 0]
+                      + role_bytes_[(size_t) il * 3 + 1]
+                      + role_bytes_[(size_t) il * 3 + 2];
+        max_layer = std::max(max_layer, per_layer[il]);
     }
-    if (per == 0) return false;
-    const size_t slots = bytes / per;
-    if (slots == 0 || slots > (size_t) std::numeric_limits<int>::max()) return false;
-    cache_bytes_ = per;
-    cache_slots_ = (int) slots;
-    const size_t total_bytes = cache_bytes_ * (size_t) cache_slots_;
+    if (max_layer == 0) return false;
+    // equal share per layer, then round-robin so no layer is starved
+    std::vector<int> slots_per_layer((size_t) n_layer_, 0);
+    for (int il = 0; il < n_layer_; il++) {
+        slots_per_layer[il] = (int) ((bytes / (size_t) n_layer_) / per_layer[il]);
+    }
+    size_t remaining = bytes;
+    for (int il = 0; il < n_layer_; il++) {
+        remaining -= (size_t) slots_per_layer[il] * per_layer[il];
+    }
+    for (;;) {
+        bool any = false;
+        for (int il = 0; il < n_layer_ && remaining > 0; il++) {
+            if (remaining >= per_layer[il]) {
+                slots_per_layer[il]++;
+                remaining -= per_layer[il];
+                any = true;
+            }
+        }
+        if (!any) break;
+    }
+    int total_slots = 0;
+    for (int il = 0; il < n_layer_; il++) {
+        total_slots += slots_per_layer[il];
+    }
+    if (total_slots == 0 || total_slots > std::numeric_limits<int>::max()) return false;
+    cache_off_.resize((size_t) total_slots);
+    layer_slot_base_.assign((size_t) n_layer_, 0);
+    layer_slot_count_.assign((size_t) n_layer_, 0);
+    cache_slot_key_.assign((size_t) total_slots, -1);
+    {
+        size_t off = 0, slot = 0;
+        for (int il = 0; il < n_layer_; il++) {
+            layer_slot_base_[il] = (int) slot;
+            layer_slot_count_[il] = slots_per_layer[il];
+            for (int s = 0; s < slots_per_layer[il]; s++, slot++) {
+                cache_off_[slot] = off;
+                off += per_layer[il];
+            }
+        }
+        cache_bytes_ = off;
+        cache_slots_ = total_slots;
+    }
+    const size_t total_bytes = cache_bytes_;
     const char * anonymous_env = getenv("MOE_CACHE_ANON");
     const char * victim_env = getenv("MOE_VICTIM_CACHE");
     const bool anonymous = anonymous_env ? atoi(anonymous_env) != 0 : (!victim_env || atoi(victim_env) != 0);
@@ -528,8 +587,8 @@ bool moe_pager::init_cache(size_t bytes) {
         return false;
     }
     fprintf(stderr, "moe_pager: host cache anonymous=%d\n", anonymous ? 1 : 0);
-    fprintf(stderr, "moe_pager: Tier 1 host cache %.2f GiB, %d slots x %zu B\n",
-            (double) bytes / (1024.0*1024.0*1024.0), cache_slots_, cache_bytes_);
+    fprintf(stderr, "moe_pager: Tier 1 host cache %.2f GiB, %d slots (per-layer stride, largest %zu B)\n",
+            (double) bytes / (1024.0*1024.0*1024.0), cache_slots_, max_layer);
     cache_idx_.assign((size_t) n_layer_ * n_expert_, -1);
     cache_used_.assign((size_t) cache_slots_, 0);
     cache_stamp_.assign((size_t) cache_slots_, 0);
@@ -546,7 +605,7 @@ const char * moe_pager::cache_find(int il, int expert) {
     }
     cache_stamp_[(size_t) slot] = ++cache_tick_;
     n_cache_hit_++;
-    return cache_ + (size_t) slot * cache_bytes_;
+    return cache_ + cache_off_[(size_t) slot];
 }
 
 char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, size_t count) {
@@ -555,41 +614,43 @@ char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, si
     const size_t key = (size_t) il * n_expert_ + expert;
     int slot = cache_idx_[key];
     if (slot < 0) {
-        std::vector<char> pinned((size_t) cache_slots_, 0);
+        const int base_slot = layer_slot_base_[(size_t) il];
+        const int n_slots = layer_slot_count_[(size_t) il];
+        std::vector<char> pinned((size_t) n_slots, 0);
         for (size_t index = 0; index < count; ++index) {
             const int current = selected[index];
             if (current < 0 || current >= n_expert_) continue;
             const int cached = cache_idx_[(size_t) il * n_expert_ + current];
-            if (cached >= 0) pinned[(size_t) cached] = 1;
+            if (cached >= base_slot && cached < base_slot + n_slots) {
+                pinned[(size_t) cached - (size_t) base_slot] = 1;
+            }
         }
         long oldest = std::numeric_limits<long>::max();
-        for (int current = 0; current < cache_slots_; ++current) {
+        for (int current = 0; current < n_slots; ++current) {
+            const int gs = base_slot + current;
             if (pinned[(size_t) current]) continue;
-            if (!cache_used_[(size_t) current]) {
-                slot = current;
+            if (!cache_used_[(size_t) gs]) {
+                slot = gs;
                 break;
             }
-            if (cache_stamp_[(size_t) current] < oldest) {
-                oldest = cache_stamp_[(size_t) current];
-                slot = current;
+            if (cache_stamp_[(size_t) gs] < oldest) {
+                oldest = cache_stamp_[(size_t) gs];
+                slot = gs;
             }
         }
         if (slot < 0) return nullptr;
         if (cache_used_[(size_t) slot]) {
-            for (int & cached : cache_idx_) {
-                if (cached == slot) {
-                    cached = -1;
-                    break;
-                }
-            }
+            const int old_key = cache_slot_key_[(size_t) slot];
+            if (old_key >= 0) cache_idx_[(size_t) old_key] = -1;
             n_cache_evict_++;
         }
+        cache_slot_key_[(size_t) slot] = (int) key;
         cache_idx_[key] = slot;
         cache_used_[(size_t) slot] = 1;
         n_cache_fill_++;
     }
     cache_stamp_[(size_t) slot] = ++cache_tick_;
-    return cache_ + (size_t) slot * cache_bytes_;
+    return cache_ + cache_off_[(size_t) slot];
 }
 
 void moe_pager::cache_remove(int il, int expert) {
@@ -599,6 +660,7 @@ void moe_pager::cache_remove(int il, int expert) {
     const int slot = cache_idx_[key];
     if (slot < 0) return;
     cache_idx_[key] = -1;
+    cache_slot_key_[(size_t) slot] = -1;
     cache_used_[(size_t) slot] = 0;
     cache_stamp_[(size_t) slot] = 0;
 }
@@ -683,7 +745,7 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
         const int cslot = cache_idx_[(size_t) key];
         if (cslot >= 0) {
             const moe_expert_slice * cs = slices(il, e);
-            const char * csrc = cache_ + (size_t) cslot * cache_bytes_;
+            const char * csrc = cache_ + cache_off_[(size_t) cslot];
             // the cache holds the expert COMPACT (gate|up|down, no O_DIRECT
             // pre-pad), so the offsets are the role sizes, not bsrc_[], which
             // index the aligned staging read
@@ -739,24 +801,24 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
     // keep a host copy so the next time this expert is demanded it comes over
     // PCIe instead of the NVMe
     if (cache_ && cache_slots_ > 0 && cache_idx_[(size_t) key] < 0) {
+        const int base_slot = layer_slot_base_[(size_t) il];
+        const int n_slots = layer_slot_count_[(size_t) il];
         int cslot = -1;
-        for (int i = 0; i < cache_slots_; i++) {
-            if (!cache_used_[(size_t) i]) { cslot = i; break; }
+        for (int i = 0; i < n_slots; i++) {
+            if (!cache_used_[(size_t) base_slot + i]) { cslot = base_slot + i; break; }
         }
         if (cslot < 0) {   // evict the least recently used
             long oldest = std::numeric_limits<long>::max();
-            for (int i = 0; i < cache_slots_; i++) {
-                if (cache_stamp_[(size_t) i] < oldest) { oldest = cache_stamp_[(size_t) i]; cslot = i; }
+            for (int i = 0; i < n_slots; i++) {
+                const int gs = base_slot + i;
+                if (cache_stamp_[(size_t) gs] < oldest) { oldest = cache_stamp_[(size_t) gs]; cslot = gs; }
             }
-            const int old_key = (int) (cache_stamp_.size() ? -1 : -1);
-            (void) old_key;
-            for (size_t k = 0; k < cache_idx_.size(); k++) {
-                if (cache_idx_[k] == cslot) { cache_idx_[k] = -1; break; }
-            }
+            const int old_key = cache_slot_key_[(size_t) cslot];
+            if (old_key >= 0) cache_idx_[(size_t) old_key] = -1;
             n_cache_evict_++;
         }
         char * csrc = stage_ + (size_t) reqs_[r].stage * stage_bytes_;
-        char * cdst = cache_ + (size_t) cslot * cache_bytes_;
+        char * cdst = cache_ + cache_off_[(size_t) cslot];
         size_t at = 0;
         if (pack_mode_) {
             const uint32_t * cbs = &bsrc_[(size_t) key * 3];
@@ -778,6 +840,7 @@ bool moe_pager::commit_locked(int il, int e, void * dst_gate, size_t gate_bytes,
                 coff += cs[k].len;
             }
         }
+        cache_slot_key_[(size_t) cslot] = (int) key;
         cache_used_[(size_t) cslot] = 1;
         cache_stamp_[(size_t) cslot] = ++cache_tick_;
         cache_idx_[(size_t) key] = cslot;
@@ -924,7 +987,7 @@ bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targ
             const int cslot = cache_idx_[(size_t) key];
             if (cslot >= 0) {
                 const moe_expert_slice * cs = slices(il, e);
-                const char * csrc = cache_ + (size_t) cslot * cache_bytes_;
+                const char * csrc = cache_ + cache_off_[(size_t) cslot];
                 size_t coff = 0;
                 void * cdst[3] = { targets[i].dst_gate, targets[i].dst_up, targets[i].dst_down };
                 size_t cwant[3] = { targets[i].gate_bytes, targets[i].up_bytes, targets[i].down_bytes };
