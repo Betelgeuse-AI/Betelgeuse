@@ -14,14 +14,16 @@ if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()
 
-# llama-cli executable
+# bel-cli executable (retain the target name for build dependencies)
 
 set(TARGET llama-cli)
 
 add_executable(${TARGET} main.cpp)
+set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME bel-cli)
 target_link_libraries(${TARGET} PRIVATE llama-cli-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
+add_custom_target(bel-cli ALL DEPENDS ${TARGET})

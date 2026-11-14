@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -20,6 +21,8 @@ using json = common_json;
 struct cli_context_impl {
     json messages      = json::array();
     json pending_media = json::array(); // staged multimodal content parts
+    std::string model_path;
+    int64_t n_ctx = 0;
 };
 
 cli_context::cli_context(const common_params & params) : params(params), impl(new cli_context_impl()) {}
@@ -38,16 +41,6 @@ static bool should_stop() {
 }
 
 static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
-
-const char * LLAMA_ASCII_LOGO = R"(
-▄▄ ▄▄
-██ ██
-██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
-██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
-██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
-                                    ██    ██
-                                    ▀▀    ▀▀
-)";
 
 // number of values an arg consumes on the command line
 static int arg_num_values(const common_arg & opt) {
@@ -111,12 +104,12 @@ bool cli_context::init() {
             ui::show_error(
                 "no model specified",
                 "use -m <file.gguf> or -hf <user/repo> to run a local model,\n"
-                "or --server-base <url> to connect to a running llama-server"
+                "or --server-base <url> to connect to a running bel-server"
             );
             return false;
         }
 
-        spinner.emplace("\n\nLoading model...");
+        spinner.emplace("\nLoading model...");
 
         server.emplace();
         if (!server->start(params)) {
@@ -185,6 +178,10 @@ bool cli_context::init() {
 void cli_context::fetch_server_props() {
     try {
         json props = json::parse(client.get("/props"));
+        impl->model_path = props.value("model_path", "");
+        if (props.contains("default_generation_settings") && props.at("default_generation_settings").is_object()) {
+            impl->n_ctx = props.at("default_generation_settings").value("n_ctx", int64_t(0));
+        }
         model_name = props.value("model_alias", "");
         if (model_name.empty()) {
             const std::string path = props.value("model_path", "");
@@ -376,6 +373,18 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
             const auto & t = chunk.at("timings");
             timings.prompt_per_second    = t.value("prompt_per_second",    0.0);
             timings.predicted_per_second = t.value("predicted_per_second", 0.0);
+            int64_t prompt_n = t.value("prompt_n", int64_t(0));
+            int64_t pred_n   = t.value("predicted_n", int64_t(0));
+            if (prompt_n + pred_n > 0) {
+                ui::update_context_usage(prompt_n + pred_n);
+            }
+        }
+        if (chunk.contains("usage") && chunk.at("usage").is_object()) {
+            const auto & u = chunk.at("usage");
+            int64_t total_tokens = u.value("total_tokens", int64_t(-1));
+            if (total_tokens >= 0) {
+                ui::update_context_usage(total_tokens);
+            }
         }
         if (!chunk.contains("choices") || !chunk.at("choices").is_array() || chunk.at("choices").empty()) {
             return;
@@ -400,6 +409,7 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
             }
         }
     });
+    a.finish();
 
     cli_context::interrupted().store(false);
 
@@ -424,39 +434,28 @@ int cli_context::run() {
         modalities += ", video";
     }
 
-    std::string banner;
-    banner += "\n";
-    banner += LLAMA_ASCII_LOGO;
-    banner += "\n";
-    banner += "build      : " + build_info + "\n";
-    banner += "model      : " + model_name + "\n";
-    if (!model_ftype.empty()) {
-        banner += "ftype      : " + model_ftype + "\n";
+    std::string_view model_label = server && !impl->model_path.empty() ? impl->model_path : model_name;
+    if (model_label.empty()) {
+        model_label = server ? params.model.path : client.model;
     }
-    banner += "modalities : " + modalities + "\n";
-    if (!params.system_prompt.empty()) {
-        banner += "using custom system prompt\n";
+    const size_t separator = model_label.find_last_of("/\\");
+    if (separator != std::string_view::npos) {
+        model_label.remove_prefix(separator + 1);
     }
-    banner += "\n";
-    banner += "available commands:\n";
-    banner += "  /exit or Ctrl+C     stop or exit\n";
-    banner += "  /regen              regenerate the last response\n";
-    banner += "  /clear              clear the chat history\n";
-    banner += "  /read <file>        add a text file\n";
-    banner += "  /glob <pattern>     add text files using globbing pattern\n";
-    if (has_vision) {
-        banner += "  /image <file>       add an image file\n";
+    if (model_label.empty()) {
+        model_label = "unknown model";
     }
-    if (has_audio) {
-        banner += "  /audio <file>       add an audio file\n";
-    }
-    if (has_video) {
-        banner += "  /video <file>       add a video file\n";
-    }
-    banner += "\n";
 
-    ui::show_message(banner);
-
+    ui::set_session_info(std::string(model_label), server.has_value(), impl->n_ctx);
+    ui::show_hero_banner(
+        model_label,
+        server.has_value(),
+        impl->n_ctx,
+        model_ftype,
+        modalities,
+        build_info,
+        !params.system_prompt.empty()
+    );
     // interactive loop
     std::string cur_msg;
 
@@ -534,6 +533,7 @@ int cli_context::run() {
         } else if (string_starts_with(buffer, "/clear")) {
             impl->messages.clear();
             add_system_prompt();
+            ui::update_context_usage(0);
 
             impl->pending_media = json::array();
             ui::show_message("Chat history cleared.");
@@ -626,7 +626,10 @@ int cli_context::run() {
 
         cli_timings timings;
         generated_content content;
+        const auto generation_start = params.show_timings ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         generate_completion(content, timings);
+        const double generation_seconds = params.show_timings ? std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - generation_start).count() : 0.0;
 
         json assistant_msg = {
             {"role",    "assistant"},
@@ -653,11 +656,7 @@ int cli_context::run() {
         }
 
         if (params.show_timings) {
-            ui::show_info(string_format(
-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
-                timings.prompt_per_second,
-                timings.predicted_per_second
-            ));
+            ui::show_timings(timings.prompt_per_second, timings.predicted_per_second, generation_seconds);
         }
 
         if (params.single_turn) {
@@ -665,7 +664,7 @@ int cli_context::run() {
         }
     }
 
-    ui::show_message("\n\nExiting...");
+    ui::show_message("\nGoodbye.");
 
     return 0;
 }
