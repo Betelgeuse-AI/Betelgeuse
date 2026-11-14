@@ -18,8 +18,8 @@
 #include <cuda_runtime.h>
 
 static const char * MODEL =
-    "/mnt/windows/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS/IQ2_XS/"
-    "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf";
+    "/home/zyxciss/Models/Qwen3.8-Flash-Next/UD-IQ2_XS/"
+    "Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf";
 
 int main() {
     const int NL = 48, NE = 512, NU = 10;
@@ -28,6 +28,11 @@ int main() {
     std::string err;
     if (!pager.init(MODEL, NL, NE, NU, err)) {
         fprintf(stderr, "FAIL: pager.init: %s\n", err.c_str());
+        return 1;
+    }
+    // carve out demand slots like the engine does; fetch() submits demand reads
+    if (!pager.reserve_staging_split(48, 24)) {
+        fprintf(stderr, "FAIL: reserve_staging_split\n");
         return 1;
     }
     printf("pager: layers=%d experts=%d used=%d bytes/expert=%zu (%.3f MiB)\n",
@@ -66,7 +71,7 @@ int main() {
         const void *dsts[3] = { dg, du, dd };
         const char *roles[3] = { "gate", "up", "down" };
         for (int r = 0; r < 3 && ok; r++) {
-            if (pread(fd, h_ref, want[r], (off_t)(sl[r].off + sl[r].pre)) != (ssize_t) want[r]) {
+            if (pread(sl[r].fd >= 0 ? sl[r].fd : fd, h_ref, want[r], (off_t)(sl[r].off + sl[r].pre)) != (ssize_t) want[r]) {
                 fprintf(stderr, "FAIL: reference pread L%d E%d %s\n", il, e, roles[r]); bad = 1; ok = false; break;
             }
             cudaMemcpy(h_pag, dsts[r], want[r], cudaMemcpyDeviceToHost);
@@ -112,7 +117,7 @@ int main() {
             const void *dsts[3] = { dg, du, dd };
             for (int r = 0; r < 3 && ok; r++) {
                 std::vector<char> ref(want[r]), got(want[r]);
-                if (pread(fd, ref.data(), want[r], (off_t)(sl[r].off + sl[r].pre)) != (ssize_t) want[r]) {
+                if (pread(sl[r].fd >= 0 ? sl[r].fd : fd, ref.data(), want[r], (off_t)(sl[r].off + sl[r].pre)) != (ssize_t) want[r]) {
                     fprintf(stderr, "FAIL: reference pread async L%d E%d r%d\n", il, e, r); bad = 1; ok = false; break;
                 }
                 cudaMemcpy(got.data(), dsts[r], want[r], cudaMemcpyDeviceToHost);
