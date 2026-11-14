@@ -412,12 +412,22 @@ struct common_params_speculative {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
-    uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
-        });
+    // Bounded recurrent rollback is what lets a rejected draft be undone on a
+    // GDN model without a full-context checkpoint. Any drafter can reject, so
+    // the snapshots are reserved for every enabled drafter, not only the
+    // draft-model ones (n-gram drafting rejects constantly).
+    uint32_t rs_seq_override = 0;   // --rs-seq: 0 = derive from the drafter
 
-        return needs_rs_seq ? draft.n_max : 0u;
+    uint32_t need_n_rs_seq() const {
+        // --spec-type APPENDS to the default {NONE}, so NONE can sit at index 0
+        // while a real drafter follows; look at the whole list.
+        const bool enabled = std::any_of(types.begin(), types.end(),
+                [](auto t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+        if (!enabled) {
+            return 0u;
+        }
+        const uint32_t auto_n = draft.n_max > 0 ? draft.n_max : (ngram_simple.size_m > 1 ? ngram_simple.size_m : 0u);
+        return rs_seq_override > 0 ? rs_seq_override : auto_n;
     }
 };
 
@@ -598,11 +608,20 @@ struct common_params {
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
     bool warmup            = true;  // warmup run
+    int32_t cache_warmup    = 0;
+    std::string cache_warmup_prompt = "Explain a practical topic in detail, with examples and a short summary.";
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool load_mtp          = false; // load MTP/NextN layers
+
+    // ---- sparse MoE direct-IO engine (FluxAeros) -------------------------
+    bool    moe_direct_io   = false; // stream routed-expert weights via O_DIRECT into a VRAM slot pool
+    int32_t moe_slots       = 4096;  // total VRAM slots shared across all MoE layers
+    std::string moe_profile = "";    // hot-expert profile for slot seeding (empty = built-in table)
+    std::string moe_pack_dir = "";   // iq_pack.py expert pack dir (experts.bin + native_experts.txt)
+    int32_t moe_chunk_max  = 8;       // widest batch routed through the MoE slot pool
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -1015,6 +1034,7 @@ struct common_init_result {
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
+    bool warmup_cache(int32_t n_tokens, const std::string & prompt);
 
     std::vector<llama_adapter_lora_ptr> & lora();
 

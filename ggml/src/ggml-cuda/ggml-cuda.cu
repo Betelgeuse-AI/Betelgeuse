@@ -911,6 +911,12 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+static ggml_cuda_moe_slot_resolve_fn_t ggml_cuda_moe_slot_resolve_fn = nullptr;
+
+void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn) {
+    ggml_cuda_moe_slot_resolve_fn = fn;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -2518,7 +2524,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+    if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
         if (ggml_is_quantized(src0->type)) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
@@ -2558,7 +2564,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -2615,20 +2621,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<char> ids_host;
+    if (ne2 == 1) {
+        ids_to_sorted_host.resize(ne_get_rows);
+        for (int i = 0; i < ne_get_rows; i++) ids_to_sorted_host[i] = i;
+        ids_from_sorted_host = ids_to_sorted_host;
+    } else {
+        ids_host.resize(ggml_nbytes(ids));
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
-            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                    break;
+        for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
+            for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+                for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                    const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                    assert(expert_to_use >= 0 && expert_to_use < ne02);
+                    if (expert_to_use == i02) {
+                        ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
+                        ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
+                        tokens_per_expert[i02]++;
+                    }
                 }
             }
         }
@@ -3031,6 +3043,27 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_MOE_SLOT_RESOLVE:
+        case GGML_OP_MOE_SLOT_RESOLVE_KICK:
+        case GGML_OP_MOE_SLOT_RESOLVE_WAIT:
+        case GGML_OP_MOE_SLOT_PREKICK:
+            {
+                GGML_ASSERT(ggml_cuda_moe_slot_resolve_fn != nullptr);
+                const ggml_tensor * topk  = dst->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT ? dst->src[3] : dst->src[0];
+                const ggml_tensor * table = dst->src[1];
+                const ggml_tensor * full  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[2] : nullptr;
+                const ggml_tensor * look  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[3] : nullptr;
+                ggml_cuda_moe_slot_resolve_fn(ctx.stream(),
+                    (const int32_t *) topk->data, (const int32_t *) table->data, (int32_t *) dst->data,
+                    topk->ne[0], topk->ne[1], topk->nb[0], topk->nb[1], table->nb[0], dst->nb[0], dst->nb[1],
+                    full ? (const int32_t *) full->data : nullptr,
+                    full ? full->ne[0] : 0, full ? full->ne[1] : 0,
+                    full ? full->nb[1] : 0,
+                    look ? (const int32_t *) look->data : nullptr,
+                    look ? look->ne[0] * look->ne[1] : 0,
+                    ggml_get_op_params_i32(dst, 0), (int32_t) (table->ne[0] * table->ne[1]),
+                    ggml_get_op_params_i32(dst, 1), dst->op);
+            } break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -3226,6 +3259,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                     GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
                 }
             }
+        }
+
+        if (node->op == GGML_OP_MOE_SLOT_RESOLVE) {
+            use_cuda_graph = false;
+        }
+        if ((node->op == GGML_OP_MOE_SLOT_RESOLVE_KICK || node->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT ||
+             node->op == GGML_OP_MOE_SLOT_PREKICK) && node->src[0]->ne[1] != 1) {
+            use_cuda_graph = false;
         }
 
         if (!use_cuda_graph) {
@@ -5354,7 +5395,56 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                bool ok = false;
+                // diagnostics (GGML_CUDA_OP_DIAG=1):
+                //  * node census: op-type histogram of every node the graph
+                //    computes, accumulated across warmup calls so the per-token
+                //    distribution of the 6930-node decode graph is visible.
+                //  * per-op host time: only meaningful on the direct (capture)
+                //    path, reported alongside the census.
+                static const bool op_diag = (getenv("GGML_CUDA_OP_DIAG") != nullptr);
+                if (op_diag) {
+                    {
+                        static std::map<std::string, int> census;
+                        static int census_n = 0;
+                        if (census_n == 0) census.clear();
+                        census[ggml_op_name(node->op)]++;
+                        census_n++;
+                        static int cen_done = -1;
+                        if (cen_done != census_n && census_n % 1000 == 0) {
+                            cen_done = census_n;
+                            if (census_n <= 7000) {
+                                std::string line;
+                                for (auto & kv : census) line += " " + kv.first + "=" + std::to_string(kv.second);
+                                GGML_LOG_INFO("%s: NODES after %d ops:%s\n", __func__, census_n, line.c_str());
+                            }
+                        }
+                    }
+                    const auto o0 = ggml_time_us();
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    const double oms = (ggml_time_us() - o0) / 1000.0;
+                    if (oms > 0.02) {
+                        static std::map<std::string, std::pair<double, int>> op_time;
+                        auto & e = op_time[ggml_op_name(node->op)];
+                        e.first += oms; e.second++;
+                        static int op_n = 0;
+                        static bool reported_once = false;
+                        if (++op_n == 700 || !reported_once) {
+                            op_n = 0;
+                            reported_once = true;
+                            GGML_LOG_INFO("%s: op attribution (ms per layer, count per layer):\n", __func__);
+                            for (auto & kv : op_time) {
+                                if (kv.second.second >= 4) {
+                                    GGML_LOG_INFO("  %-16s %10.2f ms  x%4d\n", kv.first.c_str(),
+                                                   kv.second.first / 48.0, kv.second.second / 48);
+                                }
+                            }
+                            op_time.clear();
+                        }
+                    }
+                } else {
+                    ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5377,6 +5467,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             graph->instances.resize(n_chunks);
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
+            static bool logged_capture = false;
+            if (!logged_capture && getenv("MOE_DIAG")) {
+                for (int index = 0; index < cgraph->n_nodes; ++index) {
+                    if (cgraph->nodes[index]->op != GGML_OP_MOE_SLOT_RESOLVE_KICK) continue;
+                    fprintf(stderr, "[moe_graph] decode CUDA graph captured, nodes=%d\n", cgraph->n_nodes);
+                    logged_capture = true;
+                    break;
+                }
+            }
+
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
                 ggml_cuda_lock_cv.notify_all();
@@ -5390,6 +5490,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // the chunks were launched during capture, otherwise launch them here
         for (cudaGraphExec_t instance : graph->instances) {
             CUDA_CHECK(cudaGraphLaunch(instance, cuda_ctx->stream()));
+        }
+
+        static bool logged_replay = false;
+        if (!logged_replay && getenv("MOE_DIAG")) {
+            for (int index = 0; index < cgraph->n_nodes; ++index) {
+                if (cgraph->nodes[index]->op != GGML_OP_MOE_SLOT_RESOLVE_KICK) continue;
+                fprintf(stderr, "[moe_graph] decode CUDA graph replay active, nodes=%d\n", cgraph->n_nodes);
+                logged_replay = true;
+                break;
+            }
         }
 #else
         GGML_UNUSED(graph_key);
@@ -6662,6 +6772,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_SLOT_RESOLVE:
+            return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_I32;
+        case GGML_OP_MOE_SLOT_RESOLVE_KICK:
+        case GGML_OP_MOE_SLOT_RESOLVE_WAIT:
+        case GGML_OP_MOE_SLOT_PREKICK:
+            return ggml_cuda_moe_slot_resolve_fn != nullptr &&
+                op->src[0]->type == GGML_TYPE_I32 && op->src[0]->ne[1] == 1 &&
+                op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

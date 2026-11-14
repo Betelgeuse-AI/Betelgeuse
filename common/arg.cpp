@@ -1936,6 +1936,42 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--moe-slots"},
+        "N",
+        string_format("total number of VRAM expert slots shared across layers (default: %d)", params.moe_slots),
+        [](common_params & params, int value) {
+            params.moe_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
+
+    add_opt(common_arg(
+        {"--moe-profile"},
+        "PATH",
+        "hot-expert profile for MoE slot seeding (default: built-in table)",
+        [](common_params & params, const std::string & value) {
+            params.moe_profile = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
+
+    add_opt(common_arg(
+        {"--moe-pack-dir"},
+        "DIR",
+        "expert pack directory with experts.bin + native_experts.txt (one contiguous read per expert instead of three GGUF ranges)",
+        [](common_params & params, const std::string & value) {
+            params.moe_pack_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
+
+    add_opt(common_arg(
+        {"--moe-chunk-max"},
+        "N",
+        "widest token batch routed through the MoE slot pool during prefill (default: 8)",
+        [](common_params & params, int value) {
+            params.moe_chunk_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION}));
+
+    add_opt(common_arg(
         {"--warmup"},
         {"--no-warmup"},
         string_format("whether to perform warmup with an empty run (default: %s)", params.warmup ? "enabled" : "disabled"),
@@ -1943,6 +1979,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.warmup = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--auto-warm"},
+        "warm the model cache with a generated sequence of up to 256 tokens and one replay before serving requests",
+        [](common_params & params) {
+            params.cache_warmup = 256;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-warmup"}, "N",
+        "generate up to N cache-warmup tokens and replay the sequence once (0 disables; maximum 8192; bounded by context size)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 8192) {
+                throw std::invalid_argument("cache warmup must be between 0 and 8192 tokens");
+            }
+            params.cache_warmup = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_WARMUP"));
+    add_opt(common_arg(
+        {"--cache-warmup-prompt"}, "TEXT",
+        "representative prompt for cache warmup; startup cost is separate from request timings",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("cache warmup prompt must not be empty");
+            }
+            params.cache_warmup_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--spm-infill"},
         string_format(
@@ -2719,6 +2782,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"--moe-direct-io"},
+        "keep routed-expert (MoE) weights off device buffers so they can be "
+        "streamed on demand from the GGUF into a VRAM slot pool",
+        [](common_params & params) {
+            params.moe_direct_io = true;
+            // Same mechanism as --cpu-moe: route the fused expert tensors to the
+            // CPU buffer so they are never offloaded to VRAM. They stay
+            // mmap-backed, so this costs no RAM and keeps tensor metadata valid.
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_MOE_DIRECT_IO"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
@@ -4351,6 +4426,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
             }
             params.speculative.ngram_mod.n_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--rs-seq"}, "N",
+        "bounded recurrent-state snapshots per sequence, so a rejected draft rolls back "
+        "without a full-context checkpoint (0 = derive from the drafter, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.rs_seq_override = (uint32_t) value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 

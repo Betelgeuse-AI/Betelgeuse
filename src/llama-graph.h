@@ -147,6 +147,12 @@ public:
     ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
     ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
     ggml_tensor * embd_rows    = nullptr; // I32 [n_batch], embd row path: rows of ctx_other's layer input device buffer
+    ggml_tensor * token_embd_host = nullptr;
+    ggml_tensor * staged_tokens = nullptr;
+    ggml_tensor * staged_mixed_tokens = nullptr;
+    std::vector<float> gathered_tokens;
+
+    void set_staged_tokens(ggml_tensor * target, const llama_token * ids, int64_t count);
 
     float scale_tok = 1.0f;
 
@@ -836,6 +842,14 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+    // sparse MoE direct-IO pool (nullptr when --moe-direct-io is off):
+    // per-layer compact [n_embd,n_ff,s_pl] pools plus the I32 slot table
+    const ggml_tensor * const * moe_gate  = nullptr;
+    const ggml_tensor * const * moe_gate_up = nullptr;
+    const ggml_tensor * const * moe_up    = nullptr;
+    const ggml_tensor * const * moe_down  = nullptr;
+    const ggml_tensor * const * moe_table = nullptr;
+    int32_t moe_n_layer = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1074,6 +1088,13 @@ struct llm_graph_context {
     const enum llama_rope_type    rope_type;
 
     ggml_backend_sched_t sched;
+    // sparse MoE direct-IO pool (mirrored from llm_graph_params)
+    const ggml_tensor * const * moe_gate  = nullptr;
+    const ggml_tensor * const * moe_up    = nullptr;
+    const ggml_tensor * const * moe_gate_up = nullptr;
+    const ggml_tensor * const * moe_down  = nullptr;
+    const ggml_tensor * const * moe_table = nullptr;
+    int32_t moe_n_layer = 0;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
 
@@ -1218,6 +1239,9 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * lookahead_in = nullptr,
+             ggml_tensor * slot_ids_in = nullptr,
+             ggml_tensor * weights_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
 
@@ -1246,6 +1270,9 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
+             ggml_tensor * lookahead_in = nullptr,
+             ggml_tensor * slot_ids_in = nullptr,
+             ggml_tensor * weights_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
 
@@ -1265,7 +1292,7 @@ struct llm_graph_context {
     //
 
     // tok_scale: applied to token rows only
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f, bool stage_host = false) const;
 
     // the state input of an MTP graph: rows of the h_nextn device buffer of ctx_state_src (see llama_set_ctx_state_src()),
     // or uploaded from ubatch.embd_state

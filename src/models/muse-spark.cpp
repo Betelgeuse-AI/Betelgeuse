@@ -181,6 +181,7 @@ llama_model_muse_spark::graph::graph(const llm_graph_params & params)
                 il,
                 router_logits,
                 nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr,
                 model.layers[il].ffn_post_exp_norm, hparams.f_post_norm_eps);
         cb(moe_out, "ffn_moe_out", il);
 

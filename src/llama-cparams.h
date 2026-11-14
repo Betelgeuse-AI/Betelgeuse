@@ -69,6 +69,15 @@ struct llama_cparams {
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 
+    bool         moe_direct_io = false;
+    int32_t      moe_slots     = 4096;
+    const char * moe_pack_dir  = nullptr; // expert pack dir (experts.bin + native_experts.txt)
+    const char * moe_gguf_path = nullptr;
+    const char * moe_profile_path = nullptr; // optional hot profile (null = built-in)
+    // prefill micro-chunk ceiling: pool engages only when a batch row carries
+    // at most this many tokens (measured row union fits 72 slots at 8)
+    int32_t      moe_chunk_max = 64;
+
     llama_context * ctx_other;
 
     // context whose h_nextn device buffer holds the state rows of a batch, see llama_set_ctx_state_src()

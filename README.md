@@ -2,6 +2,8 @@
 
 ![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
+> **This is the `fluxaeros-mtp` MoE fork on top of llama.cpp v1.0.0.** Its demand-paged MoE path is a hardware-specific release candidate, not an upstream llama.cpp release. See [FluxAeros setup, cache warmup, measurements and limitations](docs/fluxaeros.md) before using this branch.
+
 <div align="center">
 
 <b>LLM inference in C/C++</b>

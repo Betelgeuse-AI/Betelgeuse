@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "moe_pager.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
 
@@ -13,7 +14,11 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 struct llama_model;
@@ -284,6 +289,127 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    // ---- sparse MoE direct-IO slot pool ----
+    struct moe_pool {
+        ggml_context        * ctx = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+        size_t               buf_bytes = 0;
+        std::vector<ggml_tensor *> pool_gate, pool_up, pool_gate_up, pool_down, slot_table;
+        std::vector<int32_t> slot_of, slot_key;
+        std::vector<uint32_t> slot_freq;
+        std::vector<uint32_t> dec_freq;   // n_layer*n_expert: decode-only routing counts
+        moe_lru lru;
+        std::vector<uint16_t> pred16;     // n_layer*16: predictor candidates for the next step
+        long pred_hit = 0, pred_fresh = 0;
+        int n_layer = 0, n_expert = 0, n_used = 0, s_per_layer = 0;
+        int n_slots = 0;   // s_per_layer plus the sentinel slot when armed
+        long n_hit = 0, n_miss = 0, n_page_fail = 0;
+        long n_warm_hit = 0, n_pack_hit = 0;
+        bool count_freq = true;
+        std::atomic<long> ra_done{0};
+        std::vector<uint16_t> exp_rank;  // n_layer*n_expert: LFU rank within layer
+        long prefill_resident = 0, prefill_miss = 0;
+        // zero-copy pinned host pool: flat array of H uniform slots holding
+        // whole experts (gate|up|down compact). served with plain H2D on the
+        // compute stream, no staging copy and no extra stream.
+        char * host_pool = nullptr;
+        size_t host_slot_bytes = 0;
+        bool host_odirect = false;
+        int    host_nslots = 0;
+        int    host_rr = 0;
+        int    host_ring = 0;
+        std::vector<void *> host_ev;
+        // per-layer compact role sizes within a host slot
+        std::vector<size_t> host_gate, host_up, host_down;
+        // previous decode step's top-k per layer, for the recency predictor
+        // (moe_step_sel[il*n_used+k]); empty until the first decode step
+        std::vector<int32_t> step_sel;
+        // ffn_moe_topk-<il> node of the graph in flight, kept so the
+        // between-launches refresh can read the routing it just produced
+        std::vector<ggml_tensor *> step_topk;
+        // last ubatch width seen; used to detect the prefill->decode edge
+        uint32_t last_ntok = 0;
+        // Direction 1: one extra all-zero slot per layer absorbing cold misses
+        bool     sentinel_slot = false;
+        // adaptive swap tier (MOE_ADAPT>=1): decayed routing demand per
+        // (layer, expert) plus the pass that swaps cold VRAM victims out for
+        // the hottest non-resident candidates.
+        std::vector<float>   adapt_decay;   // n_layer * n_expert
+        std::vector<int32_t> adapt_last;    // last pass the expert was demanded
+        std::vector<int32_t> adapt_pend_e;  // n_layer * n_expert: pending swap candidate
+        long adapt_pass  = 0;               // decode steps seen
+        long adapt_swaps = 0, adapt_bytes = 0, adapt_cold = 0;
+    };
+    moe_pool moe;
+    moe_pager pager;
+    // page-cache read-ahead pool: background threads only issue readahead(),
+    // never touch CUDA or slot tables
+    std::vector<std::thread> or_thr;
+    std::atomic<bool> or_run{false};
+    std::mutex or_mtx;
+    std::vector<uint32_t> or_q;
+    std::vector<int32_t> look_pred;   // n_layer*6: gate-lookahead top candidates
+    std::vector<long> look_fresh;
+    long look_hit = 0, look_need = 0, look_push = 0;
+    std::vector<uint16_t> coact;      // (n_layer-1)*n_expert*4: learned L+1 candidates
+    std::vector<uint16_t> coact_cnt;
+    std::vector<uint32_t> co_hint;    // n_layer*n_expert: token stamp of last hint
+    uint32_t co_tok = 0;
+    long co_push = 0, co_need = 0, co_cover = 0;
+    int  hot_k = 0;
+    int  hot_pos = 0;
+    bool hot_cycles = false;
+    // persistent pool for the staging-ring preads
+    struct moe_io_job { int32_t e; int vslot; int rslot; int fd; uint64_t off; uint32_t len; uint32_t pre; bool warm; };
+    std::mutex io_mtx;
+    std::condition_variable io_cv, io_done_cv;
+    std::vector<moe_io_job> io_jobs, io_jobs_scratch;
+    int  io_pfd = -1, io_il = 0;
+    size_t io_stride = 0, io_per = 0, io_nth = 0;
+    std::atomic<size_t> io_next{0};
+    std::atomic<long> io_fail{0};
+    std::atomic<long> io_warm_us{0}, io_warm_n{0}, io_cold_us{0}, io_cold_n{0};
+    std::atomic<long> io_finished{0};
+    long io_thr_active = 0;
+    unsigned long long io_gen = 0;
+    std::atomic<unsigned long long> io_gen_done{0};
+    std::atomic<bool> io_run{false};
+    std::vector<std::thread> io_thr;
+    bool      moe_ready = false;
+    bool moe_enabled() const { return moe_ready; }
+    int  moe_page(int il, int e);
+    int  moe_page_pinned(int il, int e, const bool * pinned);
+    void moe_page_batch(int il, const int32_t * sel, int n);
+    void moe_page_batch_sorted(int il, const int32_t * sel, int n);
+    // pipelined host-pool paging for one resolve batch: returns false only
+    // when the host pool is unavailable (caller falls back to pager fetch)
+    bool moe_page_host_batch(int il, const int32_t * uniq, size_t nunq,
+        std::vector<char> & pinned, int base, int s_pl, void * stream);
+    // queue async reads for experts the next layer(s) will likely need.
+    // never blocks; admission-controlled inside.
+    void moe_prefetch_ahead(int il, const int32_t * sel, int n);
+    void moe_publish(int il, int e, int slot);
+    // adaptive swap tier (MOE_ADAPT>=1)
+    bool moe_adapt_on() const;
+    void moe_adapt_note(int il, int e);
+    void moe_adapt_run();
+    // page every layer's experts the step just selected and republish the tables
+    // between graph launches (MOE_POST_REFRESH=1): the decode graph then runs
+    // with no split at all, which is where the per-token latency was going.
+    void moe_post_refresh();
+    // neural lookahead prefetch via 31M native CUDA router predictor
+    void moe_predict_and_prefetch();
+    const ggml_tensor * moe_pool_tensor(const char * which, int il) const;
+    // pre-populate every layer's slots with the offline hot profile so the
+    // first decode step starts warm; pages synchronously, failures are
+    // tolerated (slots stay -1). capped at 2s to bound server startup.
+    void moe_seed_hot();
+    void moe_hot_save();
+    void moe_hot_cycle(int fd);
+    // re-seed once when decoding starts after a long prefill: micro-chunk
+    // paging churns the hot set, so restore the profile before token 0.
+    // bounded by the same budget; no-op for pure decode streams.
+    void moe_reseed_decode();
 
 private:
     llm_graph_result * get_gf_res_prev();
@@ -442,6 +568,7 @@ private:
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
+
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 

@@ -1882,7 +1882,7 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            update_cache = update_cache && prompt_cache && task.params.cache_prompt;
 
             // cache prompts only for the tasks that reuse them
             update_cache = update_cache && !task.is_stateless();

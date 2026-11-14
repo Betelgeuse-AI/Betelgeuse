@@ -1417,6 +1417,82 @@ void common_init_result::reset_samplers() {
     }
 }
 
+bool common_init_result::warmup_cache(int32_t n_tokens, const std::string & prompt) {
+    if (n_tokens == 0) {
+        return true;
+    }
+    llama_context * ctx = context();
+    llama_model * loaded_model = model();
+    auto fail = [&](const char * message) {
+        COM_ERR("cache warmup failed: %s\n", message);
+        pimpl->context.reset();
+        return false;
+    };
+    if (!ctx || !loaded_model || n_tokens < 0 || n_tokens > 8192 || prompt.empty()) {
+        return fail("invalid configuration");
+    }
+    if (llama_model_has_encoder(loaded_model) || !llama_model_has_decoder(loaded_model) ||
+            llama_pooling_type(ctx) != LLAMA_POOLING_TYPE_NONE || !llama_get_memory(ctx)) {
+        return fail("requires a decoder-only generation context");
+    }
+
+    const auto * vocab = llama_model_get_vocab(loaded_model);
+    const llama_tokens prefix = common_tokenize(vocab, prompt, true, true);
+    const uint32_t context_size = llama_n_ctx_seq(ctx);
+    if (prefix.empty() || prefix.size() >= context_size) {
+        return fail("prompt leaves no context space for generation");
+    }
+    const int32_t budget = (int32_t) std::min((size_t) n_tokens, context_size - prefix.size());
+    const int64_t started = ggml_time_us();
+    llama_sampler_ptr greedy(llama_sampler_init_greedy());
+    llama_tokens generated;
+    generated.reserve((size_t) budget);
+
+    auto reset = [&]() {
+        llama_synchronize(ctx);
+        llama_memory_clear(llama_get_memory(ctx), true);
+        llama_synchronize(ctx);
+        reset_samplers();
+        llama_perf_context_reset(ctx);
+    };
+    auto decode = [&](const llama_token * tokens, int32_t count) {
+        common_batch batch = common_batch_get_one(ctx, tokens, count);
+        return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
+    };
+
+    COM_INF("cache warmup: up to %d generated tokens plus one replay; request state will be cleared\n", budget);
+    for (int pass = 0; pass < 2; ++pass) {
+        reset();
+        for (size_t offset = 0; offset < prefix.size();) {
+            const int32_t count = (int32_t) std::min(prefix.size() - offset, (size_t) llama_n_batch(ctx));
+            if (!decode(prefix.data() + offset, count)) {
+                reset();
+                return fail("prompt evaluation failed");
+            }
+            offset += (size_t) count;
+        }
+        const int32_t count = pass == 0 ? budget : (int32_t) generated.size();
+        for (int32_t index = 0; index < count; ++index) {
+            const llama_token token = pass == 0 ? llama_sampler_sample(greedy.get(), ctx, -1) : generated[(size_t) index];
+            if (pass == 0) {
+                if (llama_vocab_is_eog(vocab, token)) {
+                    break;
+                }
+                generated.push_back(token);
+            }
+            if (!decode(&token, 1)) {
+                reset();
+                return fail("sequence evaluation failed");
+            }
+        }
+        llama_synchronize(ctx);
+        COM_INF("cache warmup: pass %d/2 complete, %zu prompt + %zu generated tokens\n", pass + 1, prefix.size(), generated.size());
+    }
+    reset();
+    COM_INF("cache warmup: complete in %.2f s; inference state and request timers reset\n", (ggml_time_us() - started) / 1e6);
+    return true;
+}
+
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
@@ -1533,6 +1609,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(decoder_start_token_id);
         }
         if (llama_model_has_decoder(model)) {
+            std::vector<llama_token> tmp1 = { bos != LLAMA_TOKEN_NULL ? bos : 0 };
+            common_batch batch1 = common_batch_get_one(lctx, tmp1);
+            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch1.get());
+
             tmp.resize(std::min(tmp.size(), (size_t) params.n_batch));
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
@@ -1545,6 +1625,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
+    }
+
+    if (params.cache_warmup > 0) {
+        res->warmup_cache(params.cache_warmup, params.cache_warmup_prompt);
     }
 
     return res;
@@ -1717,6 +1801,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+    mparams.moe_direct_io               = params.moe_direct_io;
+    mparams.moe_slots                   = params.moe_slots;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
@@ -1741,6 +1827,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
@@ -1761,6 +1848,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.attention_type    = params.attention_type;
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
+    cparams.moe_direct_io     = params.moe_direct_io;
+    cparams.moe_slots         = params.moe_slots;
+    cparams.moe_gguf_path     = params.model.path.c_str();
+    cparams.moe_pack_dir      = params.moe_pack_dir.empty() ? nullptr : params.moe_pack_dir.c_str();
+    cparams.moe_chunk_max     = params.moe_chunk_max;
+    cparams.moe_profile_path  = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
