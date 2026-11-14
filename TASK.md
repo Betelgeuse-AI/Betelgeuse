@@ -1,29 +1,26 @@
-# betelgeuse-v6.1 — Mission 4
+# betelgeuse-v6.1 — Mission 5
 
-Working branch: `betelgeuse-v6.1` (119f7a015 = v1.0.0 port + bel re-implementation + fix).
-`fluxaeros-mtp`, `betelgeuse`, UD-IQ2_XS download, and `build/` all untouched.
+Goal: diagnose & isolate the `333...` output degeneracy on Alpha-Orionis-XS / betelgeuse-v6.1.
 
-- [x] Task 1 — Re-implement bel-server & bel-cli on v1.0.0 + build build-v1/ (verified)
-  - bel-server/bel-cli from betelgeuse inspected read-only (tools/cli/*, tools/server/server.cpp + CMakeLists.txt, common/betelgeuse-splash.h, assets/generate_terminal_logo.py). Ported onto v1.0.0 only:
-    - `tools/server/CMakeLists.txt`: OUTPUT_NAME bel-server + add_custom_target (target name unchanged); default port 9931 (v1.0.0 default).
-    - `tools/cli/CMakeLists.txt`: OUTPUT_NAME bel-cli + add_custom_target.
-    - `common/betelgeuse-splash.h` ported verbatim (self-contained inline banner); used by bel-cli + bel-server entries; no llama_moe_finish_pass / moe-stopwatch / hardcoded DeepSeek paths; no terminal-logo generation (not self-contained; splash header's inline banner used instead).
-    - bel-cli TUI (cli-context/cli-client/cli-server/cli-ui.h/cli-markdown.h) adapted from betelgeuse onto v1.0.0 APIs (dump_safe kept); hero banner made honest (bel-cli v1.0.0, no false machine/version claims).
-    - test-cli-markdown.cpp ported; passes ("test-cli-markdown: all assertions passed").
-    - One INP_TOKENS crash fix: staged-embedding path left the token leaf unconsumed (dropped from the graph); fixed with `ggml_build_forward_expand(gf, inp->tokens)` (+mixed). Committed as `061ee24dcfb0efdd46a89ac9f25cf7deca546f8c`.
-  - Built out-of-tree in `build-v1/` (sm_86, same CMake flags as reference `build/`, plus `CMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc`). `bel-server`, `bel-cli`, `test-llama-context` built; incremental rebuilds clean (0 warnings; only pre-existing fork `-Wcast-qual` idioms + NCCL-not-found note remain).
-  - Verified: `build-v1/bin/bel-server --help` and `build-v1/bin/bel-cli --help` both exit 0 and print the fork flags (`--moe-direct-io`, `--moe-slots`, `--moe-pack-dir`, `--moe-chunk-max`, `--auto-warm`, `--cache-warmup`, `--ple, --shard`, `--spec-type`); `ldd build-v1/bin/bel-server` resolves to build-v1 libs only.
-  - Bel port commit: `1a17076707b878f0389fc615941f87292557c050`; staged-embedding fix commit: `061ee24dcfb0efdd46a89ac9f25cf7deca546f8c`.
-- [x] Task 2 — Model check + ONE cgroup-wrapped bel-server baseline (no spec decode)
-  - Environment: aria2c pid 59045 still downloading UD-IQ2_XS (NOT touched). Alpha-Orionis-XS = reassembled logical GGUF split: Dense.gguf (bytes [0,3770978720)) + experts.bin (bytes [3770978720,39252693408)) + PLE.gguf (shard 1, split.no=1). Reassembled byte-exact as `Alpha-Orionis-XS-assembled/Qwen3.8-Flash-Next-00001-of-00002.gguf` (39252693408 B; PLE auto-discovered via split pattern). Originals untouched.
-  - Launch: `systemd-run --user --scope --quiet -p MemoryHigh=13824M -p MemoryMax=14G -p MemorySwapMax=0 --unit=bel-m4-baseline3 build-v1/bin/bel-server -m .../Alpha-Orionis-XS-assembled/Qwen3.8-Flash-Next-00001-of-00002.gguf -ngl 99 --moe-direct-io --moe-slots 5000 -ub 64 -np 1 -c 512 -t 6 --host 127.0.0.1 --port 9931` (env: MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1).
-  - Model loaded; MoE audit TRUE-VRAM 3264 MiB; PLE table (27466 MiB) and token_embd (322 MiB) host-aliased; hit rate 99.5%; ~941 page-ins for session.
-  - VRAM 10497 MiB / 12288 (1413 free); cgroup MemoryPeak 13697007616 B = 13061 MiB (~12.76 GiB < 13824M); end-of-run current 10918 MiB.
-  - 0 page failures, 0 ranks replaced, 0 CPU fallback expert rows; single prefill CPU op = RESHAPE (trivial).
-  - Warmup prompt (2 sentences): 63 prompt tokens @ 896.6 ms (70.3 tok/s), 48 tg @ 1164.3 ms (40.4 tok/s), cache_n=0.
-    Timed gen ("hash map internal", 96 tok): cache_n=42, 22 @ 328.4 ms (67.0 tok/s), 96 @ 2280.6 ms (41.7 tok/s).
-    Coding prompt ("implement binary_search...", 128 tok): cache_n=42, 39 @ 552.6 ms (70.6 tok/s), 128 @ 3062.1 ms (41.5 tok/s).
-    Probe ("Name one primary color", 16 tok): cache_n=42, 18 @ 330.7 ms (54.4 tok/s), 16 @ 363.9 ms (41.2 tok/s).
-  - Degeneracy: IQ2_XS 2-bit GSQ-RCO quant emits constant '3' for every prompt (temperature=0); engine verified end-to-end; degeneracy is a quant artifact (identical with MOE_PLE_STAGING=0 and with bel-cli).
-  - Clean shutdown via SIGTERM in ~2 s; VRAM released (15 MiB).
-  - Full baseline log: `/home/zyxciss/fluxaeros-data/m4_bel_server_baseline.log` (includes failed-attempt log history).
+- [x] Task 1 — Code, GGUF offset & history audit (read-only)
+  - Done; full record in /home/zyxciss/fluxaeros-data/m5_333_diag.log (appendix).
+  - `git show 061ee24dc`: adds `ggml_build_forward_expand(gf, inp->tokens)` so the staged token-embedding leaf keeps a backend buffer (scheduler aborted in set_inputs without it); staged-embd path otherwise identical to fluxaeros-mtp.
+  - `git diff fluxaeros-mtp:src/models/qwen4exp.cpp HEAD:src/models/qwen4exp.cpp` (809 lines, mostly the v1.0.0 rewrite): hc_mix math identical (inject gets 1/hc in both the merged `w_down_inject` and separate `w_down`+`w_inject` paths; this bundle has only separate tensors); `build_hc_combine` unchanged; PLE staging + n-gram hash identical; rope switched to `build_rope()` -> `get_rope_params()` with LLM_ARCH_QWEN4EXP -> IMROPE (sections [11,11,10,0], dim 64) — equivalent to mtp's `ggml_rope_multi(..., sections, IMROPE, ...)`; QSA/qkvz/beta-alpha merged paths unused by this bundle (separate `attn_qkv`/`attn_gate`, `ssm_alpha`/`ssm_beta` in tensor table); `TAG_RECURRENT_ROLLBACK_SPLITS` hunk replaced by `build_conv_state_store` (v1.0.0 rewrite, MTP rollback path only).
+  - `git diff 8345f3339..v1.0.0 -- src/models/qwen4exp.cpp`: the upstream v1.0.0 rewrite of the same file (217 +, 173 -), consistent with the mtp->HEAD diff.
+  - `git show 119f7a015 -- ggml/src/ggml-cuda/ggml-cuda.cu src/llama-context.cpp src/llama-model.cpp`: CUDA port faithful (MMVQ>=get_mmvq_mmid_max_batch on both MMID sites, ne2==1 no-sync fast path, MOE_SLOT_RESOLVE* dispatch via registered fn, CUDA-graph capture disabled for MOE_SLOT_RESOLVE / nt>1 kicks, env-gated op-diag nodes). llama-context.cpp additions are the MoE pager/slots machinery; nothing touches MUL_MAT_ID semantics on CPU.
+  - CPU path supports qwen4exp fully: GATED_DELTA_NET / LIGHTNING_INDEXER / TOP_K_MASK / DSV4_HC_* / SSM_CONV / TOP_K implemented, none stubbed.
+  - `stat -c%s`: Dense.gguf 3,770,978,720 (Mission 2's 3,770,973,720 was a 5,000-byte transcription error); experts.bin 35,481,714,688; PLE.gguf 28,800,138,432; assembled 39,252,693,408 (= Dense + experts.bin exactly).
+  - Assembled GGUF: magic GGUF v3, 1223 tensors, n_kv 76, data_offset 10,947,177; 0 out-of-bounds; expert abs range [3770901097..39225877097]; non-expert abs end 3,770,901,097 <= Dense size; PLE tensor lives in PLE.gguf (split.no=1, type IQ4_NL, ne 160 x 320001536), auto-discovered via split pattern (host-aliased 27466 MiB in m4 log).
+  - Whole-file md5: Dense == assembled[0:3770978720] and experts.bin == assembled[3770978720:] — the assembled file is byte-exact to the original shard.
+  - m4 log: MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 chosen as a clean baseline (empty hotlist, profile (null)); 0 page failures, 0 ranks replaced, 0 CPU fallback expert rows; prompt ~54-70 tok/s, tg ~41 tok/s, 99.5% VRAM slot hit — engine mechanics fine, output garbage on every prompt.
+  - `git log -n 25 --oneline fluxaeros-mtp`: all MoE stager/predictor work; NO record of Alpha-Orionis-XS ever running coherently. Only coherent local reference: DeepSeek-V4.1-Flash-1017 (coherent code via same engine machinery: GDN, HC, lightning indexer, MoE).
+  - UD-IQ2_XS (unsloth): NOT ready. aria2c pid 59045 elapsed 02:48:37; shard 2 at 46.5 GB of ~50 GB, shard 3 missing. Must not be touched.
+- [x] Task 2 — Single clean A/B isolation run
+  - ONE cgroup-wrapped run (systemd-run --user --scope -p MemoryHigh=13824M -p MemoryMax=14G -p MemorySwapMax=0 --unit=bel-m5-cpudiag), `-ngl 0` mmap CPU, no `--moe-direct-io`, prompt "Write a Python binary_search function", -n 24: **garbage output**, exact text (24 tokens):
+    `'"'%+#')!31(#3)"12%.)*((`
+    (timings: prompt 10.6 tok/s, 3.5 tok/s decode, prefill 9088 ms; exit 0; splits=97/73; prefill ops all CPU incl. LIGHTNING_INDEXER n=12, GATED_DELTA_NET n=36)
+  - Recorded in /home/zyxciss/fluxaeros-data/m5_333_diag.log (launch + output + full appendix).
+  - Because CPU-mmap also produced garbage, the bug is **not** in moe-direct-io / CUDA / the v6.1 MoE port / the reassembled GGUF; because the assembled GGUF is byte-exact the original shard and DeepSeek-V4.1 runs coherent on this same engine, the cause is the model bundle itself.
+  - Root-cause evidence (fp16 scale-field audit, GGUF + PLE.gguf + experts.bin): ~54-64% of blocks carry "sane-looking" scales, ~33-44% read as |d| > 10 (e.g. 4852, 32928, 55200, 39200), ~1-5% read as NaN/-NaN/inf — uniformly across EVERY sampled tensor (attn_qkv/attn_gate/ssm_out, shared experts, gate_exps IQ2_S, PLE IQ4_NL, DFlash2-Q4_0, VeriLoop-E2-GSQ-RCO-IQ3_XXS, mtp-Qwen3.8-Flash-Next-Q4_K_M). Same partition when decoded big-endian; no GSQ/RCO-aware dequant exists anywhere in the tree.
+  - VERDICT: the Qwen3.8-Flash-Next GSQ-RCO 2-bit bundle (Alpha-Orionis-XS) is numerically unusable on any standard ggml/llama.cpp dequantizer — this predates the v6.1 port and is independent of --moe-direct-io, CUDA graphs, PLE staging, tokenizer and reassembly. Engine is cleared; the GSQ-RCO files cannot produce coherent English.
+  - Only paths to a coherent Qwen3.8-Flash-Next end-to-end run: (a) UD-IQ2_XS (unsloth, standard IQ2_XS) once aria2c finishes, (b) another non-GSQ-RCO quant of this model. The assembled Alpha-Orionis-XS bundle cannot be salvaged by engine fixes.
