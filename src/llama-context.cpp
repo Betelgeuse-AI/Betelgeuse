@@ -465,6 +465,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                     if (demand_buf < 0) { const char * e = getenv("MOE_DEMAND_BUF"); demand_buf = (e && atoi(e) != 0) ? 1 : 0; }
                     const int demand_fd = (demand_buf == 1 && ctx->pager.pack_fd_buf() >= 0) ? ctx->pager.pack_fd_buf() : (cold && ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : loc.fd);
                     rfd.push_back(demand_fd);
+                    if (moe_prof_enabled()) {
+                        if (demand_fd == ctx->pager.pack_fd()) g_moe_prof.rfd_direct_count++;
+                        else g_moe_prof.rfd_buf_count++;
+                    }
                     } else {
                         locs.push_back(moe_pager::moe_pack_loc{-1, 0, 0, 0});
                         pl->copy_pre[ncopy] = 0;
@@ -819,7 +823,12 @@ static void start_doorbell_worker(llama_context * ctx) {
                         io_uring_sqe_set_data(sqe, (void *) (uintptr_t) w.tag);
                         n_sqe++;
                     }
+                    const int64_t t_submit0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                     bool submit_fail = !submit_ok;
+                    if (moe_prof_enabled()) {
+                        const uint64_t t0 = (uint64_t) t_prep0, t1 = (uint64_t) t_submit0;
+                        g_moe_prof.nvme_prep_cpu_us += t1 > t0 ? t1 - t0 : 0;
+                    }
                     if (!submit_fail && n_sqe > 0) {
                         int submitted = 0;
                         while (submitted < n_sqe) {
@@ -829,6 +838,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         }
                         if (submitted < n_sqe) submit_fail = true;
                     }
+                    if (moe_prof_enabled()) g_moe_prof.nvme_submit_syscall_us += (uint64_t) moe_prof_now() - (uint64_t) t_submit0;
                     if (moe_prof_enabled()) g_moe_prof.nvme_prep_submit_us += (uint64_t) moe_prof_now() - (uint64_t) t_prep0;
                     if (submit_fail) {
                         for (int ci = 0; ci < ncopy; ++ci) {
@@ -2844,7 +2854,7 @@ llama_context::~llama_context() {
     if (moe_prof_enabled()) {
         const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
         (void) us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu nvme_prep_submit_us=%llu nvme_drain_spec_us=%llu nvme_publish_h2d_us=%llu nvme_cqe_wait_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu spec_fallback=%llu\n",
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu nvme_prep_submit_us=%llu nvme_prep_cpu_us=%llu nvme_submit_syscall_us=%llu nvme_drain_spec_us=%llu nvme_publish_h2d_us=%llu nvme_cqe_wait_us=%llu rfd_direct_count=%llu rfd_buf_count=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu spec_fallback=%llu\n",
                 (unsigned long long) g_moe_prof.plan_us.load(),
                 (unsigned long long) g_moe_prof.plan_sel_us.load(),
                 (unsigned long long) g_moe_prof.plan_victim_us.load(),
@@ -2855,9 +2865,13 @@ llama_context::~llama_context() {
                 (unsigned long long) g_moe_prof.victim_fill_memcpy_us.load(),
                 (unsigned long long) g_moe_prof.nvme_us.load(),
                 (unsigned long long) g_moe_prof.nvme_prep_submit_us.load(),
+                (unsigned long long) g_moe_prof.nvme_prep_cpu_us.load(),
+                (unsigned long long) g_moe_prof.nvme_submit_syscall_us.load(),
                 (unsigned long long) g_moe_prof.nvme_drain_spec_us.load(),
                 (unsigned long long) g_moe_prof.nvme_publish_h2d_us.load(),
                 (unsigned long long) g_moe_prof.nvme_cqe_wait_us.load(),
+                (unsigned long long) g_moe_prof.rfd_direct_count.load(),
+                (unsigned long long) g_moe_prof.rfd_buf_count.load(),
                 (unsigned long long) g_moe_prof.kernel_us.load(),
                 (unsigned long long) g_moe_prof.ple_us.load(),
                 (unsigned long long) g_moe_prof.prekick_us.load(),
