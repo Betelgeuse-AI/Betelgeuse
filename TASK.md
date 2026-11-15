@@ -34,10 +34,24 @@ Goal: drop the 42 GB experts.bin pack; run direct-GGUF with offset-sorted `fetch
   - Early Host-Cache H2D: PREKICK-predicted expert found in the 3,830-slot victim cache now skips the NVMe read entirely (`pager.cache_has()` side-effect-free probe); KICK demand path DMAs it arena -> pool as usual. `spec_cache_hits=16,831` over the suite. NOTE: implemented as arena-hit detection at prekick time (no pool slot exists yet at prekick time, so a literal early arena -> pool DMA cannot be issued early; DtoD prefetch into a device scratch would add nothing over the existing arena->pool DMA at KICK).
   - `KICK` -> shared-expert FFN -> `WAIT` topology confirmed in `build_layer_ffn` (qwen4exp.cpp lines 1311-1317) - unchanged, no NVMe stall before shared compute.
 - [x] Benchmark (ONE cgroup-wrapped scope `bel-m10-udiq2xs`, MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0, `--moe-slots 4000 -ub 64 -np 1 -c 512 -t 6`, `MOE_CACHE_MIB=6144`, `MOE_HOT_K=0`, `MOE_PREKICK=1`, direct `00001-of-00003.gguf`, NO `--moe-pack-dir`), 3-prompt T=0 192 tok sequence (warmup binary_search, LRUCache, warm binary_search)
-  - Commit hash: `3ecaadc8c`. 0 GB pack used (NO `--moe-pack-dir`) ✓.
+  - Commit hash: `1b35bd187` (mission-10 commit). 0 GB pack used (NO `--moe-pack-dir`) ✓.
   - PREKICK kernel: 5.97 us/launch. Prediction overlap (pre vs post top-K): **55.4-55.9%** (`MOE_PREKICK=0` in M8/M9, so no prior overlap baseline exists in-tree). `spec_submitted` 17,729 (session total), `spec_reused` 9,546, `inflight_joined` 8,968, `ready_reused` 5,088, `spec_cache_hits` 16,831, `spec_cancelled` 0, `spec_short` 754.
   - Direct `.gguf` read/wait: see Task 1. PP tok/s: 4.98 / 5.60 / 5.98; TG tok/s: **6.07 / 6.82 / 6.32** (M8 direct-GGUF baseline 5.51-6.50; M9 pack reference 6.38 / 6.83 / 6.76).
   - 0 failed reads (whole log); `memory.events` all 0; swap 0; VRAM <= 11,277 MiB; cgroup peak 14,365,859,840 B = 13,700 MiB (< 13824M High); graphs reused 197/387/578; hit ~73.8%.
   - T=0 parity with M9 pack run: binary_search warmup & warm outputs **byte-identical** (472/472 bytes). LRUCache: content identical (empty); reasoning differs because the prompt sent in M10 ("Implement an LRUCache class...O(1) time complexity") was NOT the M9 prompt ("Write a Python LRUCache class", 31 vs 59 prompt tokens) - not a parity failure.
   - Pack removal: direct-GGUF matches/beats the M8 direct-GGUF baseline and is within ~4-7% of the M9 pack on TG, but PP is lower (4.98-5.98 vs 7.0-9.3). Whether this counts as "match" is the user's call; experts.bin NOT deleted yet (42 GB). Awaiting user confirmation.
 
+
+# betelgeuse-v6.1 - Mission 11
+
+Goal: direct-GGUF prefill parity via role-grouped coalesced O_DIRECT reads + MOE_PREKICK=0 isolation. 2 tasks max; ONE cgroup-wrapped benchmark scope.
+
+- [ ] Task 1 - Role-Grouped Extent-Coalesced O_DIRECT Prefill Reader (direct .gguf, for non-pack prefill batches n_tokens > 1)
+  - Disable PREKICK during prefill (n_tokens > 1); set MOE_PREKICK=0 default; keep only offset sort + stage_ev_ + per-layer victim cache.
+  - Role-grouped monotonic coalescing across the prefill batch: split NVMe misses into 3 contiguous role sweeps per layer ((1) gate sorted, (2) up sorted, (3) down sorted); when adjacent missing experts within a sweep sit within a small gap (<= 1 expert / ~2 MiB), coalesce into one contiguous O_DIRECT io_uring read (up to 4-8 MiB per SQE) into a temporary bounce/staging span, then slice out needed experts.
+  - Verify direct-GGUF read/wait ms/expert during prefill and decode; measure coalesced SQE count reduction.
+- [ ] Task 2 - One cgroup-wrapped direct-.gguf bel-server benchmark (MOE_PREKICK=0 clean isolation)
+  - Scope `bel-m11-udiq2xs`, MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0, `--moe-slots 4000 -ub 64 -np 1 -c 512 -t 6`, `MOE_CACHE_MIB=6144`, `MOE_HOT_K=0`, `MOE_PREKICK=0`, direct `00001-of-00003.gguf`, NO `--moe-pack-dir`.
+  - Exact 3-prompt suite (p1 binary_search 58-tok warmup, p2 exact M9 "Write a Python LRUCache class" prompt, p3 binary_search 16-tok warm; n=192, T=0) + longer cold prompt (~128-256 tok) if clean.
+  - Logs & responses -> /home/zyxciss/fluxaeros-data/m11_chunked_pp_direct.log. Verify 472/472 byte-exact T=0 binary_search parity, 0 failed reads, stop cleanly.
+  - Report PP tok/s (p1/p2/p3 vs M9 Pack 7.20/7.01/9.28 and M10 Direct 4.98/5.60/5.98), TG tok/s, VRAM, MemoryPeak, coalesced SQE count reduction, read/wait ms/expert, 0 drops, 0 CPU rows.
