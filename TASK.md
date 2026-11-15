@@ -406,3 +406,38 @@ Goal: test MOE_SEED_BUDGET_MS=4000 (built-in hot profile) and audit nvme_us / 02
       VRAM = 11,263 MiB (< 11,750); 0 failed expert reads (44 lines failed=0); SM 98%.
     * VERDICT: MOE_SEED_BUDGET_MS=4000 NOT USEFUL for this workload - it costs ~4 s of load wall + ~6 GB NVMe traffic + Rss growth without a residency gain (74.3% either way);
       keep MOE_SEED_BUDGET_MS=0. The M23 config remains the reference.
+
+# betelgeuse-v6.1 - Mission 25
+
+Goal: port 0219a5f25 (Expert-Chunked Single-Resolve PP + Zero-Sentinel) onto betelgeuse-v6.1.
+
+- [x] Task 1 - Port Expert-Chunked Single-Resolve MoE onto betelgeuse-v6.1 & build
+  - Port via git show 0219a5f25 (betelgeuse) + m24_seed_pp_audit.md onto ggml.h/c, ggml-cuda.cu, src/moe_doorbell.cu, src/llama-graph.cpp, src/llama-context.cpp.
+  - Replace the t0 += 8 intra-layer slicing loop (llama-graph.cpp) for n_tokens > 6 (up to 64, DFlash2 batches nt=7..8 and -ub 64 prefill) with 1 union KICK per layer/ubatch + sequential WAIT_CHUNK ops.
+  - Double-buffered zero-sentinel staging (+1 zero slot sized for 2,176,000 B max mixed-quant expert; bound 0 <= mapped_slot <= chunk_slots on every chunk pass); VRAM < 11,750 MiB at --moe-slots 4000.
+  - Deduplicate unique active experts across the whole ubatch once per layer; submit via io_uring (fd_pack_buf_).
+  - Keep the n_tokens == 1 decode path (CUDA Graph, MOE_PREKICK=1) untouched; rebuild; verify test_moe_pager; commit locally.
+- [x] Task 2 - One cgroup-wrapped benchmark (exact M23 config + 1 longer cold PP probe)
+  - MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; experts.bin --moe-pack-dir; --moe-slots 4000; log to /home/zyxciss/fluxaeros-data/m25_chunked_pp_bench.log.
+  - Run exact M23 p1/p2/p3 (192 tok, T=0) PLUS p4 (~192-token cold prompt, 16 tok, T=0) in the same session; capture live memory.peak/current/events + nvidia-smi VRAM; then stop cleanly (SIGTERM).
+  - Report PP tok/s (p1/p2/p3 vs M23 7.72/5.69/9.39 + p4), TG tok/s (vs M23 7.89/8.40/9.24), [moe_prof] waterfall, VRAM, MemoryPeak, memory.events.high, 0 failed reads, parity vs M23.
+  - Task 1 outcome: port builds; pager harness PASS 9/9; committed locally as 2a3f63141.
+    Chunked ops (GGML_OP_MOE_SLOT_RESOLVE_KICK with op_params[4]=6, WAIT_CHUNKs with op_params[4]=100..105) are dispatched to the sync host resolve
+    (moe_slot_resolve_sync) via moe_doorbell_resolve_launch; decode (nt==1) dispatches KICK/WAIT to the GPU doorbell kernel unchanged. FFN is one batched
+    mul_mat_id over the whole ubatch (was per-slice mul_mat_id); union expert fetch dedups across the ubatch (was one resolve per 8-token slice).
+  - Task 2 SESSION RESULTS (unit bel-m25-chunked, exit rc=0 clean; log m25_chunked_pp_bench.log):
+    * TG tok/s (p1/p2/p3): 7.04 / 7.14 / 6.95 (M23: 7.89 / 8.40 / 9.24) - REGRESSED 12-33% across the board.
+      PP tok/s (p1/p2/p3): 7.24 / 5.54 / 6.96 (M23: 7.72 / 5.69 / 9.39) - REGRESSED; p4 (107-token cold): 11.43 PP, 6.20 TG (first measurement of this prompt).
+      eval ms/tok 142.00 / 140.15 / 143.84 (M23: 126.82 / 119.04 / 108.17).
+    * PARITY: 472/472 BYTE-EXACT vs M23 for all three standard prompts (p1 537a71e9/23328639; p2 acd130f4/912 B - LRUCache holds); p4 coherent.
+    * VRAM = 11,263 MiB; memory.peak = 13,070,643,200 B = 12,469 MiB (< 13824M); current at stop = 12,838,830,080 B = 12,212 MiB;
+      events: high=0 max=0 oom=0; smaps_rollup: Rss 6,020,248 kB; 0 failed expert reads; SM 100% util at sample.
+    * [moe_prof] waterfall: plan_us=98,665 plan_victim_us=21,460 victim_fill_us=0 nvme_us=85,360,590 (+42.5% vs M23 59.9 s; p4 adds ~20 GB demand traffic)
+      kernel_us=2,022,698 ple_us=193,144 (was 112,646 in M23, +71%) prekick_us=65,945 served=24,469 logical_bytes=147.76 GB demand_bytes=117.63 GB.
+    * graphs reused 197/387/577 (identical to M23); PLE stage time inflated (+71%) - the chunked path's per-ubatch CPU resolve computes the
+      same PLE table but on the slower CPU-doorbell path instead of the GPU doorbell kernel.
+    * VERDICT: correctness holds - 0 failed reads, byte-exact everywhere; BUT decode regressed 12-33% and PP regressed 3-26%. The blocker appears
+      to be that the union resolve runs on the CPU doorbell path (blocking wait) for PP vbatches, versus the GPU doorbell kernel per slice which is
+      essentially free when warm. For this engine+MOE_PREKICK=1+MOE_CACHE_MIB=0 configuration, the OLD sliced path is faster. The mission's "zero decode regression"
+      invariant is NOT MET. See the report for options: revert 2a3f63141, or re-chunk with a smaller tile (nt <= 16 as dsv41 used), or gate behind
+      MOE_CHUNKED_PP=1 default OFF.
