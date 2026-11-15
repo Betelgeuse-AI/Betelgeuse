@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "moe_prof.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1450,6 +1451,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     if (staging) {
+        const int64_t ple_t0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
         const ggml_tensor * ple = model.per_layer_tok_embd;
         const int64_t width = ple->ne[0];
         gathered.resize((size_t) width * idx.size());
@@ -1465,6 +1467,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
                 traits->to_float(source, destination, width);
             }
         }
+        if (moe_prof_enabled()) g_moe_prof.ple_us += (uint64_t) moe_prof_now() - (uint64_t) ple_t0;
         ggml_backend_tensor_set(staging, gathered.data(), 0, gathered.size() * sizeof(float));
     } else {
         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));

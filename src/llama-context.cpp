@@ -1,6 +1,7 @@
 #include "llama-context.h"
 #include "moe_predictor.h"
 #include "moe_doorbell.h"
+#include "moe_prof.h"
 #include "ggml-cuda.h"
 #include <thread>
 #include <atomic>
@@ -292,6 +293,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             bool handled = false;
             for (int il = 0; il < n_layer; ++il) {
                 if (dbs[il].state != 1) continue;
+                const int64_t t_plan0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 dbs[il].state = 2;
 
@@ -467,6 +469,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                 }
 
+                if (moe_prof_enabled()) {
+                    g_moe_prof.plan_us += (uint64_t) moe_prof_now() - (uint64_t) t_plan0;
+                    g_moe_prof.hits[il] += (uint64_t) n_hit;
+                    g_moe_prof.misses[il] += (uint64_t) misses.size();
+                }
                 // publish the plan and ring the doorbell
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 moe_doorbell_signal_unblock(il, nullptr);
@@ -529,6 +536,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                 }
 
+                const int64_t t_vic0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 const auto t_read0 = std::chrono::high_resolution_clock::now();
                 if (victim_cache) {
                     for (int ci = 0; ci < ncopy; ++ci) {
@@ -547,6 +555,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         victim_bytes += gb + ub + db;
                     }
                 }
+                if (moe_prof_enabled()) g_moe_prof.victim_us += (uint64_t) moe_prof_now() - (uint64_t) t_vic0;
                 drain_spec();
                 int spec_copy = -1, spec_read = -1;
                 DoorbellPrekick * prediction = moe_doorbell_prekick_host(il);
@@ -928,6 +937,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                     if (!done[(size_t) ci]) fail_ci(ci);
                 }
                 const auto t_read1 = std::chrono::high_resolution_clock::now();
+                if (moe_prof_enabled()) {
+                    g_moe_prof.nvme_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_read1 - t_read0).count();
+                    g_moe_prof.bytes_read += (uint64_t) ncopy * (gb + ub + db);
+                    g_moe_prof.served++;
+                }
                 t_read += std::chrono::duration<double, std::milli>(t_read1 - t_read0).count();
                 n_read += ncopy;
 
@@ -951,6 +965,10 @@ static void start_doorbell_worker(llama_context * ctx) {
 #else
                     std::this_thread::yield();
 #endif
+                }
+                if (moe_prof_enabled()) {
+                    g_moe_prof.kernel_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::high_resolution_clock::now() - t_read1).count();
                 }
                 t_wait += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_read1).count();
@@ -1006,6 +1024,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         break;
                     }
                     if (spec_layer >= 0 && moe_doorbell_prekick_host(spec_layer)->state == 2) {
+                        const int64_t t_pk0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                         while (spec_next < spec_count && spec_pending < 0) {
                             const int selected = spec_next++;
                             const int expert = spec_experts[selected];
@@ -1088,6 +1107,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 break;
                             }
                         }
+                        if (moe_prof_enabled()) g_moe_prof.prekick_us += (uint64_t) moe_prof_now() - (uint64_t) t_pk0;
                     }
                 }
 #if defined(__x86_64__) || defined(_M_X64)
@@ -2737,6 +2757,24 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    if (moe_prof_enabled()) {
+        const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
+        fprintf(stderr, "[moe_prof] plan_us=%llu victim_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
+                (unsigned long long) g_moe_prof.plan_us.load(),
+                (unsigned long long) g_moe_prof.victim_us.load(),
+                (unsigned long long) g_moe_prof.nvme_us.load(),
+                (unsigned long long) g_moe_prof.kernel_us.load(),
+                (unsigned long long) g_moe_prof.ple_us.load(),
+                (unsigned long long) g_moe_prof.prekick_us.load(),
+                (unsigned long long) g_moe_prof.served.load(),
+                (unsigned long long) g_moe_prof.bytes_read.load());
+        for (int il = 0; il < 48 && il < (int) model.hparams.n_layer(); ++il) {
+            fprintf(stderr, "[moe_prof] layer %02d hit=%llu miss=%llu\n", il,
+                    (unsigned long long) g_moe_prof.hits[il].load(),
+                    (unsigned long long) g_moe_prof.misses[il].load());
+        }
+        (void) us;
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
