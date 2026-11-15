@@ -888,7 +888,18 @@ static void start_doorbell_worker(llama_context * ctx) {
                         }
                         if (remaining == 0) continue;
                         struct io_uring_cqe * cqe = nullptr;
+                        const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                         const int ready = spec_copy >= 0 ? io_uring_peek_cqe(&ring, &cqe) : io_uring_wait_cqe(&ring, &cqe);
+                        if (moe_prof_enabled()) {
+                            const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
+                            int bucket = 4;
+                            if (d < 50) bucket = 0;
+                            else if (d < 150) bucket = 1;
+                            else if (d < 500) bucket = 2;
+                            else if (d < 1500) bucket = 3;
+                            g_moe_prof.cqe_us[bucket] += d;
+                            g_moe_prof.cqe_n[bucket]++;
+                        }
                         if (ready == -EAGAIN) continue;
                         if (ready < 0) break;
                         const uint64_t ud = (uint64_t) (uintptr_t) io_uring_cqe_get_data(cqe);
@@ -2773,6 +2784,11 @@ llama_context::~llama_context() {
                 (unsigned long long) g_moe_prof.prekick_us.load(),
                 (unsigned long long) g_moe_prof.served.load(),
                 (unsigned long long) g_moe_prof.bytes_read.load());
+        for (int i = 0; i < 5; i++) {
+            fprintf(stderr, "[moe_prof] cqe_bucket=%d n=%llu us=%llu\n", i,
+                    (unsigned long long) g_moe_prof.cqe_n[i].load(),
+                    (unsigned long long) g_moe_prof.cqe_us[i].load());
+        }
         for (int il = 0; il < 48 && il < (int) model.hparams.n_layer(); ++il) {
             fprintf(stderr, "[moe_prof] layer %02d hit=%llu miss=%llu\n", il,
                     (unsigned long long) g_moe_prof.hits[il].load(),
