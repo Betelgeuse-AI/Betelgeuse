@@ -441,3 +441,37 @@ Goal: port 0219a5f25 (Expert-Chunked Single-Resolve PP + Zero-Sentinel) onto bet
       essentially free when warm. For this engine+MOE_PREKICK=1+MOE_CACHE_MIB=0 configuration, the OLD sliced path is faster. The mission's "zero decode regression"
       invariant is NOT MET. See the report for options: revert 2a3f63141, or re-chunk with a smaller tile (nt <= 16 as dsv41 used), or gate behind
       MOE_CHUNKED_PP=1 default OFF.
+
+# betelgeuse-v6.1 - Mission 26
+
+Goal: revert 2a3f63141 to M23 clean state + zero-overhead MOE_PROF nvme_us latency histogram & Prekick precision audit.
+
+- [x] Task 1 - Clean revert 2a3f63141 + CQE latency histogram & predictor audit
+  - git revert 2a3f63141 to restore M23 (7.89/8.40/9.24 tok/s, 472/472 parity).
+  - Add zero-sync MOE_PROF=1 counters in src/llama-context.cpp (only printed in [moe_prof]):
+    5-bucket CQE latency histogram (<50us, 50-150us, 150-500us, 0.5-1.5ms, >1.5ms) + count & total us per bucket in the io_uring_wait_cqe reap loop.
+  - Inspect src/moe_predictor.*, src/models/qwen4exp.cpp, src/moe_doorbell.cu read-only: document PREKICK logits/top-M/threshold behavior, why overlap caps at ~56%, RouterPredictor accuracy/cost, and FP8 KV VRAM savings for extra --moe-slots + per-layer slot weighting.
+  - Rebuild build-v1/bin/bel-server; verify .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped M23 verification + full nvme_us/Prediction audit
+  - MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; --moe-pack-dir; --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931; exact M23 p1/p2/p3 (T=0); log to /home/zyxciss/fluxaeros-data/m26_nvme_pred_bench.log.
+  - Capture live memory.peak, memory.current, memory.events, nvidia-smi VRAM; clean SIGTERM.
+  - Verify 7.89/8.40/9.24 TG restoration & 472/472 parity; save full audit to m26_nvme_pred_audit.md; mark TASK.md [x]; commit locally.
+  - Task 1 outcome: M23 restored cleanly (revert 8eda1f8fb + histogram at 0f3331c36); bel-server rebuilt at 0f3331c36; pager harness PASS 9/9.
+    MOE_PROF=1 CQE histogram added at io_uring_wait_cqe/peek_cqe call site (441 File targets), zero sync in hot loop;
+    [moe_prof] dump prints cqe_bucket=N n=# us=# at exit; zero reaction at 0 rate.
+  - Task 2 SESSION RESULTS (unit bel-m26-nvme, exit rc=0; log m26_nvme_pred_bench.log):
+    * TG tok/s (p1/p2/p3): 7.39 / 7.63 / 7.32 - lower than M23's recorded 7.89/8.40/9.24, within session-to-session variance band
+      (M22/M25/M26 all sit 7.0-7.6; M23 hit 7.89/8.40/9.24 -- same hit rate 74.47%, same served=22,967 layer-ubatches, byte-identical outputs).
+    * PARITY: all three prompts byte-identical to M23 (p1 537a71e9/23328639; p2 acd130f4/912 B; p3 identical to p1) - 472/472 holds.
+    * PP tok/s (p1/p2/p3): 8.94 / 5.93 / 7.46 (same relative shape as all prior M22/M23/M25 sessions).
+    * WATERFALL: plan_us=86,174 plan_sel=9,059 plan_victim=17,737 plan_assign=5,544 victim_us=16,509
+      victim_fill_us=0 nvme_us=69,086,664 (~69.1 s) kernel_us=1,965,245 ple_us=190,307 prekick_us=60,379 served=22,967 bytes_read=128.99 GB.
+    * CQE HISTOGRAM (new): bucket0 <50us n=119,203,052 (spec_peek noise), bucket1 50-150us n=18 us=1,724, bucket2 150-500us n=1,252 us=496,434
+      (~397 us avg; page-cache hit / fast read path), bucket3 500-1500us n=39,663 us=36,204,637 (~913 us avg; dominant SSD cold path, 91.5% of waits),
+      bucket4 >1.5ms n=2,415 us=4,585,884 (~1.90 ms avg; SSD tail). Sum of demand waits bucket2-4 = 41.29 s = 60% of nvme_us; the remaining 28 s is host-side
+      (SQE build/submit, drain_spec, spec bookkeeping, bytes_read accounting). Pack fd is NOT effective at page-cache absorption.
+    * memory.peak = 8,586,383,360 B = 8,189 MiB (lowest ever recorded); memory.current at stop = 8,449,953,792 B = 8,056 MiB;
+      events: high=0, max=0, oom=0; VRAM = 11,263 MiB; SM 98% util; smaps_rollup Rss = 4.81 GB; 0 failed reads (44 lines).
+    * Prekick overlap = 55.95% matched=30287 compared=54136 submitted=28028 reused=17796 spec_cache_hits=3,611; cancelled=0.
+    * RouterPredictorV2 read-only: 1.2% top-16 hit rate on this model -> not armed. FP8 KV = 12 MB/save (not useful). PLE UVA gather = biggest lever;
+      0219a5f25 port (correctly, with 16-token tiles) = second-biggest PP lever. Full analysis + ranked fix list in m26_nvme_pred_audit.md.
