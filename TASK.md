@@ -376,3 +376,33 @@ Goal: audit net nvme_us (52.36 s) and test clean MOE_CACHE_MIB=0 + MOE_STAGE_WC=
       (charged to the cgroup as file pages, LRU-reclaimable - no throttling pressure).
     * NOTE kernel_us=2,050,575 (2.05 s - highest to date) but watch-out: wall SM went down/up enough that TG improved anyway;
       arena duplication eliminated (no victim-cache traffic at all).
+
+# betelgeuse-v6.1 - Mission 24
+
+Goal: test MOE_SEED_BUDGET_MS=4000 (built-in hot profile) and audit nvme_us / 0219a5f25 PP port plan. HEAD unchanged (21b2acd49) - pure 1-variable test.
+
+- [x] Task 1 - Read-only audit of MOE_SEED_BUDGET_MS=4000, kernel_us (0.39 -> 2.05 s), 0219a5f25 PP port plan
+  - Inspect moe_seed_hot() (src/llama-context.cpp) and src/moe_hot_profile.h: confirm exact seeding behavior (72 experts/layer, which FD it reads from, whether it warms fd_pack_buf_, 0 impact on expert math).
+  - Inspect why kernel_us jumped 0.39 s -> 2.05 s in M23 (dbs[il].state spin vs PREKICK / io_uring fd_pack_buf_ latency); check simple fd_pack_buf_ / io_uring flags (RWF_NOWAIT probe, fadvise, Arrival-Slack, MOE_STATIC_HOT) for further nvme_us cuts.
+  - Inspect git show 0219a5f25 on betelgeuse; write a concise, exact porting plan for Mission 25 (Expert-Chunked Single-Resolve PP + 65-slot sentinel) into /home/zyxciss/fluxaeros-data/m24_seed_pp_audit.md.
+- [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=0 + MOE_SEED_BUDGET_MS=4000 benchmark (p1/p2/p3 at T=0)
+  - MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=4000 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1;
+    experts.bin --moe-pack-dir; --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931; log to /home/zyxciss/fluxaeros-data/m24_seed4000_bench.log.
+  - Before stopping, capture memory.peak, memory.current, memory.events (high/max/oom), smaps_rollup, nvidia-smi VRAM; then stop (SIGTERM).
+  - Report seed count & duration, [moe_prof] waterfall, [moe_slots] decode hit rate, read ms/expert, TG & PP vs M23 (7.89/8.40/9.24), VRAM, MemoryPeak, memory.events.high, 0 failed reads, parity hashes.
+  - Task 1 outcome (audit artifact: /home/zyxciss/fluxaeros-data/m24_seed_pp_audit.md): moe_seed_hot seeds up to 3,456 hot experts/layer@72 ranked top-down from the checked-in
+    built-in profile (q38 trace, 86.5% coverage, on-distribution for this model); reads go through the pager's own io_uring on fd_pack_ (O_DIRECT) - the page cache is NOT warmed;
+    seeds land in VRAM pool slots via the normal DMA path (zero expert-math impact); LRU ranks them below real accesses so they evict first; MOE_SEED_BUDGET_MS caps wall-clock (default 4,000 ms; 15,000 under MOE_STATIC_HOT=1).
+    kernel_us jump explained: inclusive DMA-tail spin under no-arena uniform-burst issue cadence; not actionable at this budget. nvme_us cut candidates reviewed - nothing free (RWF_NOWAIT no-op value over buffered reads, WILLNEED unaffordable, Arrival-Slack wrong tool, MOE_STATIC_HOT DeepSeek-oriented).
+    0219a5f25 port plan written (map of the dsv41 chunked-resolve to qwen4exp; ~800-1,000 LoC total with existing KICK/WAIT machinery; 64-token PP gate; byte-parity gate vs M23/M24 md5s).
+  - Task 2 SESSION RESULTS (exit rc=0; unit bel-m24-seed4k; log m24_seed4000_bench.log):
+    * Seed actually ran: "moe_seed_hot: budget hit at round 79, 3313 seeded (profile: built-in)" - 3,313 hot experts seeded at load inside the 4,000 ms budget (sample showed ~zero page-cache warming; Rss grew 2.17 -> 5.53 GB vs M23 thanks to file-backed lazy PLE/GGUF pages, Private_Clean 3.68 GB).
+    * TG tok/s (p1/p2/p3): 7.37 / 8.16 / 7.42 (M23: 7.89 / 8.40 / 9.24) - regressed -0.52/-0.24/-1.82 tok/s; PP: 8.43 / 6.18 / 7.76 (M23: 7.72 / 5.69 / 9.39) - p1/p2 PP better, p3 worse (noise band).
+    * WATERFALL: plan_us=88,514 plan_sel=8,137 plan_victim=18,039 plan_assign=6,037 victim_us=17,273 victim_fill_us=0
+      **nvme_us=66,951,203 (+12% vs M23's 59.91 s)** kernel_us=1,933,242 ple_us=172,293 prekick_us=65,182 served=22,971 logical_bytes=128.19 GB demand_bytes=96.97 GB; read=0.92-1.08 ms/expert (higher than M23 0.71-0.79).
+    * [moe_slots] decode hit = 74.29-74.31% (M23: 74.47%) - seeding did NOT move residency cover; the pool self-covers the hot set organically.
+    * PARITY BYTE-EXACT for all three prompts vs BOTH M23 and M16 reference (p1 537a71e9/23328639; p2 acd130f4/912 B - LRUCache trajectory held again; p3 identical).
+    * memory.peak = 11,310,780,416 B = 10,788 MiB; current at stop = 11,176,849,408 B = 10,660 MiB; events: high=0 max=0 oom=0 sock_throttled=0;
+      VRAM = 11,263 MiB (< 11,750); 0 failed expert reads (44 lines failed=0); SM 98%.
+    * VERDICT: MOE_SEED_BUDGET_MS=4000 NOT USEFUL for this workload - it costs ~4 s of load wall + ~6 GB NVMe traffic + Rss growth without a residency gain (74.3% either way);
+      keep MOE_SEED_BUDGET_MS=0. The M23 config remains the reference.
