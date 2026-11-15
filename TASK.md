@@ -95,10 +95,14 @@ Goal: kill the 73,840 cgroup throttles (MemoryHigh=13824M), restore page-cache a
 
 Goal: 100% GGUF-only (0 GB pack), restore 472/472 byte-exact T=0 parity, and measure throttle-free GGUF-only with `MOE_CACHE_MIB=4096` after M12's `init_mappings(false)` fix. 2 tasks; ONE cgroup-wrapped benchmark.
 
-- [ ] Task 1 - Gate Arrival-Slack behind `MOE_ARRIVAL_SLACK=1`; restore the parity-preserving default profile
+- [x] Task 1 - Gate Arrival-Slack behind `MOE_ARRIVAL_SLACK=1`; restore the parity-preserving default profile
   - Restore the original fork default (parity with M9/M10/M11: byte-exact `472/472` on binary_search).
   - Keep the `192/74/46` Arrival-Slack allocation cleanly gated behind `MOE_ARRIVAL_SLACK=1` (opt-in).
   - `MOE_CACHE_MIB=4096` (or 3840 if needed) fits under MemoryHigh=13824M with `memory.events.high == 0` (now that `init_mappings(false)` eliminated the `MAP_POPULATE` prefault storm).
-- [ ] Task 2 - Benchmark 100% GGUF-Only (NO --moe-pack-dir) direct `00001-of-00003.gguf`, `--moe-slots 4000 -ub 64 -np 1 -c 512 -t 6`, `MOE_ARRIVAL_SLACK=0`, `MOE_PREKICK=0`, `MOE_HOT_K=0`, `MOE_CACHE_MIB=4096`, ONE scope unit `bel-m13-udiq2xs` (MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0)
+- [x] Task 2 - Benchmark 100% GGUF-Only (NO --moe-pack-dir) direct `00001-of-00003.gguf`, `--moe-slots 4000 -ub 64 -np 1 -c 512 -t 6`, `MOE_ARRIVAL_SLACK=0`, `MOE_PREKICK=0`, `MOE_HOT_K=0`, `MOE_CACHE_MIB=4096`, ONE scope unit `bel-m13-udiq2xs` (MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0)
   - Same 3-prompt suite (p1 binary_search 58-tok warmup, p2 exact M9 "Write a Python LRUCache class" prompt, p3 binary_search 16-tok warm; n=192, T=0), log to /home/zyxciss/fluxaeros-data/m13_gguf_only_bench.log.
-  - Report: commit hash, `memory.events.high` (target 0), MemoryPeak, anon/file split, 472/472 MD5 parity on binary_search + LRUCache, slot hit %, victim cache hits, read/wait ms/expert, p1/p2/p3 PP & TG tok/s vs M11 Direct (4.64/4.35/6.91 PP, 5.60/6.17/6.11 TG) and M12 Pack (7.04/6.64/8.90 PP, 5.94/6.05/5.90 TG), 0 failed reads.
+  - Committed as `f87719d50`. Reports saved to /home/zyxciss/fluxaeros-data/m13_gguf_only_bench.log (+ .m13_p1..p3.json).
+  - Results (GGUF-only, 4096 MiB arena, fixed default profile, drop OFF): `memory.events.high == 0` throughout; **MemoryPeak = 13,058 MiB** (768 MiB headroom); anon 6.83 GB / file ~7.1 GB; slot hit ~73.0%; victim saved=66,466 hits=16,661 bytes=28.2 GB; read/wait 1.0-1.24 / 0.02-0.04 ms/expert (this NVMe state trended slower; M10 direct measured 0.57-0.74); graphs reused 197/387/577.
+  - **Parity restored: p1 binary_search byte-exact vs M9/M10/M11 (md5 537a71e9); p2 LRUCache reasoning + content byte-exact; p3 binary_search warm byte-exact.**
+  - p1 binary_search warmup: prompt 58 @ **4.11** tok/s, decode 192 @ **5.03** tok/s | p2 LRUCache (exact M9 prompt): cache_n=0, prompt 11 @ **3.77** tok/s, decode 192 @ **5.12** tok/s | p3 warm: cache_n=48, prompt 10 @ **5.44** tok/s, decode 192 @ **5.18** tok/s | 0 failed reads (whole log).
+  - GGUF-only is measurably slower than the pack path (PP 4.11/3.77/5.44 vs M12-pack 7.04/6.64/8.90; TG 5.03/5.12/5.18 vs M10-direct 6.07/6.82/6.32 and M11-direct 5.60/6.17/6.11). Direct .gguf read latency on this run was 1.0-1.24 ms/expert vs M10's 0.57-0.74 - consistent with concurrent NVMe state slowdown more than with code (engine identical, parity verified byte-exact). Timings bounded by NVMe; a single session cannot fully separate these factors.
