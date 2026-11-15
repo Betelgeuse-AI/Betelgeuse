@@ -2542,6 +2542,23 @@ extern "C" {
             struct ggml_tensor  * kick,
             struct ggml_tensor  * dependency);
 
+    // Chunked single-resolve variant for PP ubatches (n_tokens > 6).
+    // kick_chunked resolves the union of experts across the whole ubatch once;
+    // each wait_chunk re-emits the chunk's slot map slice and carries ordering.
+    GGML_API struct ggml_tensor * ggml_moe_slot_resolve_kick_chunked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * topk,
+            struct ggml_tensor  * table,
+            int32_t               il,
+            int32_t               sentinel,
+            int32_t               n_chunks);
+
+    GGML_API struct ggml_tensor * ggml_moe_slot_resolve_wait_chunk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kick,
+            struct ggml_tensor  * dependency,
+            int32_t               chunk);
+
     GGML_API struct ggml_tensor * ggml_moe_slot_prekick(
             struct ggml_context * ctx,
             struct ggml_tensor  * logits,

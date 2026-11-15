@@ -2568,41 +2568,45 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             ggml_tensor * p_down = (ggml_tensor *) moe_down[il];
             ggml_tensor * sel_c = ggml_cont(ctx0, selected_experts);
             const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
-            ggml_tensor * acc = nullptr;
             const uint32_t n_used_il = hparams.n_expert_used(il);
-            for (int64_t t0 = 0; t0 < n_tokens; t0 += 8) {
-                const int64_t chunk = std::min<int64_t>(8, n_tokens - t0);
-                ggml_tensor * cur_s = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd, 1, chunk,
-                    cur->nb[1], cur->nb[2], t0 * cur->nb[2]));
-                ggml_tensor * topk_s = ggml_cont(ctx0, ggml_view_2d(ctx0, sel_c, n_expert_used, chunk,
-                    sel_c->nb[1], t0 * sel_c->nb[1]));
-                ggml_tensor * w_s = ggml_cont(ctx0, ggml_view_3d(ctx0, weights, 1, n_expert_used, chunk,
-                    weights->nb[1], weights->nb[2], t0 * weights->nb[2]));
-                ggml_tensor * s_ids = ggml_moe_slot_resolve(ctx0, topk_s,
-                    (ggml_tensor *) moe_table[il], sel_c, nullptr, (int32_t) il, sentinel);
-                cb(s_ids, "ffn_moe_slot_ids", il);
-                ggml_tensor * u_r = build_lora_mm_id(p_up, cur_s, s_ids, up_exps_s);
-                ggml_tensor * g_r = build_lora_mm_id(p_gate, cur_s, s_ids, gate_exps_s);
-                ggml_tensor * a_r = nullptr;
-                if (slice_clim > 1e-6f) {
-                    u_r = ggml_clamp(ctx0, u_r, -slice_clim, slice_clim);
-                    ggml_tensor * ga_r = ggml_silu(ctx0, g_r);
-                    ga_r = ggml_clamp(ctx0, ga_r, -INFINITY, slice_clim);
-                    a_r = ggml_mul(ctx0, ga_r, u_r);
-                } else {
-                    a_r = ggml_swiglu_split(ctx0, g_r, u_r);
-                }
-                ggml_tensor * d_r = build_lora_mm_id(p_down, a_r, s_ids, down_exps_s);
-                ggml_tensor * w_r = ggml_mul(ctx0, d_r, w_s);
-                ggml_tensor * part = nullptr;
-                for (uint32_t i = 0; i < n_used_il; ++i) {
-                    ggml_tensor * v = ggml_view_2d(ctx0, w_r, n_embd, chunk, w_r->nb[2], i * w_r->nb[1]);
-                    ggml_build_forward_expand(gf, v);
-                    part = part ? ggml_add(ctx0, part, v) : v;
-                    if (i) ggml_build_forward_expand(gf, part);
-                }
-                acc = acc ? ggml_concat(ctx0, acc, part, 1) : part;
-                if (t0) ggml_build_forward_expand(gf, acc);
+            const int n_chunks = 6;
+            // one union KICK resolves the whole ubatch's expert set once; the
+            // wait ops are dependency fences ordered chunk-wise
+            ggml_tensor * kick = ggml_moe_slot_resolve_kick_chunked(ctx0, sel_c,
+                const_cast<ggml_tensor *>((const ggml_tensor *) moe_table[il]),
+                il, sentinel, n_chunks);
+            cb(kick, "ffn_moe_kick", il);
+            ggml_build_forward_expand(gf, kick);
+            ggml_tensor * slot_ids = ggml_view_2d(ctx0, kick, n_expert_used, n_tokens, kick->nb[1], 0);
+            cb(slot_ids, "ffn_moe_slot_ids", il);
+            ggml_tensor * weights_t = ggml_cont(ctx0, weights);
+            ggml_tensor * cur_3d = cur;
+            ggml_tensor * up = build_lora_mm_id(p_up, cur_3d, slot_ids, up_exps_s);
+            ggml_tensor * gate = build_lora_mm_id(p_gate, cur_3d, slot_ids, gate_exps_s);
+            ggml_tensor * a_r = nullptr;
+            if (slice_clim > 1e-6f) {
+                up = ggml_clamp(ctx0, up, -slice_clim, slice_clim);
+                ggml_tensor * ga_r = ggml_silu(ctx0, gate);
+                ga_r = ggml_clamp(ctx0, ga_r, -INFINITY, slice_clim);
+                a_r = ggml_mul(ctx0, ga_r, up);
+            } else {
+                a_r = ggml_swiglu_split(ctx0, gate, up);
+            }
+            ggml_tensor * down = build_lora_mm_id(p_down, a_r, slot_ids, down_exps_s);
+            ggml_tensor * w_r = ggml_mul(ctx0, down, weights_t);
+            ggml_tensor * acc = nullptr;
+            ggml_tensor * prev = kick;
+            for (int64_t c = 0; c < n_chunks; ++c) {
+                ggml_tensor * wch = ggml_moe_slot_resolve_wait_chunk(ctx0, kick, prev, (int32_t) c);
+                ggml_build_forward_expand(gf, wch);
+                prev = wch;
+            }
+            down->src[4] = prev;
+            for (uint32_t i = 0; i < n_used_il; ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx0, w_r, n_embd, n_tokens, w_r->nb[2], i * w_r->nb[1]);
+                ggml_build_forward_expand(gf, v);
+                acc = acc ? ggml_add(ctx0, acc, v) : v;
+                if (i) ggml_build_forward_expand(gf, acc);
             }
             cb(acc, "ffn_moe_out", il);
             return acc;

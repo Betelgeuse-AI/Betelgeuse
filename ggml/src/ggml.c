@@ -6650,6 +6650,50 @@ struct ggml_tensor * ggml_moe_slot_resolve_wait(
     return result;
 }
 
+struct ggml_tensor * ggml_moe_slot_resolve_kick_chunked(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * topk,
+        struct ggml_tensor  * table,
+        int32_t               il,
+        int32_t               sentinel,
+        int32_t               n_chunks) {
+    GGML_ASSERT(topk->type == GGML_TYPE_I32);
+    GGML_ASSERT(table->type == GGML_TYPE_I32);
+    GGML_ASSERT(n_chunks >= 1 && n_chunks <= 8);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32,
+            topk->ne[0], topk->ne[1], n_chunks + 1);
+
+    ggml_set_op_params_i32(result, 0, il);
+    ggml_set_op_params_i32(result, 1, sentinel);
+    ggml_set_op_params_i32(result, 4, n_chunks);
+
+    result->op     = GGML_OP_MOE_SLOT_RESOLVE_KICK;
+    result->src[0] = topk;
+    result->src[1] = table;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_slot_resolve_wait_chunk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kick,
+        struct ggml_tensor  * dependency,
+        int32_t               chunk) {
+    GGML_ASSERT(kick->op == GGML_OP_MOE_SLOT_RESOLVE_KICK);
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, kick);
+    memcpy(result->op_params, kick->op_params, sizeof(result->op_params));
+    ggml_set_op_params_i32(result, 4, 100 + chunk);
+
+    result->op     = GGML_OP_MOE_SLOT_RESOLVE_WAIT;
+    result->src[0] = kick;
+    result->src[1] = kick->src[1];
+    result->src[2] = dependency;
+    result->src[3] = kick->src[0];
+
+    return result;
+}
+
 // PREKICK takes the raw router logits and the slot map and does the
 // resident-expert mask + top-K selection on device (Rule A). out is I32 [count, 1].
 struct ggml_tensor * ggml_moe_slot_prekick(
