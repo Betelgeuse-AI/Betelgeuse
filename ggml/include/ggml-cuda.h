@@ -62,8 +62,7 @@ typedef void (*ggml_cuda_moe_slot_resolve_fn_t)(
     int32_t n_exp,
     int32_t sentinel,
     int32_t op,
-    int32_t count,
-    int32_t chunk_tag);
+    int32_t count);
 
 GGML_BACKEND_API void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn);
 

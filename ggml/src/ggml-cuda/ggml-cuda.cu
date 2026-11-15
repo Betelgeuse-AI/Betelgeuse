@@ -3062,8 +3062,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     look ? (const int32_t *) look->data : nullptr,
                     look ? look->ne[0] * look->ne[1] : 0,
                     ggml_get_op_params_i32(dst, 0), (int32_t) (table->ne[0] * table->ne[1]),
-                    ggml_get_op_params_i32(dst, 1), dst->op, ggml_get_op_params_i32(dst, 2),
-                    ggml_get_op_params_i32(dst, 4));
+                    ggml_get_op_params_i32(dst, 1), dst->op, ggml_get_op_params_i32(dst, 2));
             } break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);

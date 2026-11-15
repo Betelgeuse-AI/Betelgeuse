@@ -1185,7 +1185,7 @@ static void stop_doorbell_worker() {
     }
 }
 
-void moe_slot_resolve_sync(
+static void moe_slot_resolve_sync(
     void * stream,
     const int32_t * topk,
     const int32_t * table,
@@ -1207,15 +1207,14 @@ void moe_slot_resolve_sync(
     int32_t n_exp,
     int32_t sentinel,
     int32_t op,
-    int32_t count,
-    int32_t chunk_tag);
+    int32_t count);
 
 static void moe_slot_resolve_register_ctx(llama_context * ctx) {
     g_moe_resolve_ctx = ctx;
     ggml_cuda_moe_slot_resolve_register(moe_slot_resolve_sync);
 }
 
-void moe_slot_resolve_sync(
+static void moe_slot_resolve_sync(
     void * stream,
     const int32_t * topk,
     const int32_t * table,
@@ -1237,27 +1236,21 @@ void moe_slot_resolve_sync(
     int32_t n_exp,
     int32_t sentinel,
     int32_t op,
-    int32_t count,
-    int32_t chunk_tag) {
+    int32_t count) {
     (void) op;
     (void) table;
     (void) table_nb0;
     (void) out_nb0;
     (void) out_nb1;
     (void) count;
-    (void) chunk_tag;
     if (op == GGML_OP_MOE_SLOT_PREKICK) {
         // the CUDA doorbell path runs PREKICK on device; when this fallback is
         // active no PREKICK nodes are emitted, so there is nothing to do
         return;
     }
-    if (op == GGML_OP_MOE_SLOT_RESOLVE_WAIT && chunk_tag >= 100) {
-        // chunked wait: pure dependency fence; the KICK publishes the map
-        return;
-    }
     llama_context * ctx = g_moe_resolve_ctx;
     const int64_t total = nk * nt;
-    if (!ctx || !ctx->moe_enabled() || il < 0 || il >= ctx->moe.n_layer || total <= 0 || total > 4096) {
+    if (!ctx || !ctx->moe_enabled() || il < 0 || il >= ctx->moe.n_layer || total <= 0 || total > 80) {
         return;
     }
     (void) full; (void) fnk; (void) fnt; (void) full_nb1;
@@ -1525,10 +1518,6 @@ void moe_slot_resolve_sync(
         if (e < 0 || e >= n_exp) continue;
         const int cur = ctx->moe.slot_of[(size_t) il * n_exp + e];
         if (cur >= base && cur < base + s_pl) slot_of[(size_t) i] = cur - base;
-    }
-    for (int64_t i = 0; i < total; i++) {
-        if (slot_of[i] < 0) slot_of[i] = sentinel;
-        else if (slot_of[i] > s_pl) slot_of[i] = s_pl;
     }
     cudaMemcpyAsync(out, slot_of.data(), (size_t) total * sizeof(int32_t), cudaMemcpyHostToDevice, st);
 

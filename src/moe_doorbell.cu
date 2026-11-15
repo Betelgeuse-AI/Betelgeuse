@@ -440,31 +440,6 @@ extern "C" int moe_doorbell_plan_cap() {
     return MOE_DOORBELL_PLAN_MAX;
 }
 
-void moe_slot_resolve_sync(
-    void * stream,
-    const int32_t * topk,
-    const int32_t * table,
-    int32_t * out,
-    int64_t nk,
-    int64_t nt,
-    size_t topk_nb0,
-    size_t topk_nb1,
-    size_t table_nb0,
-    size_t out_nb0,
-    size_t out_nb1,
-    const int32_t * full,
-    int64_t fnk,
-    int64_t fnt,
-    size_t full_nb1,
-    const int32_t * look,
-    int64_t lnk,
-    int32_t il,
-    int32_t n_exp,
-    int32_t sentinel,
-    int32_t op,
-    int32_t count,
-    int32_t chunk_tag);
-
 void moe_doorbell_resolve_launch(
     void * stream,
     const int32_t * topk,
@@ -487,20 +462,9 @@ void moe_doorbell_resolve_launch(
     int32_t n_exp,
     int32_t sentinel,
     int32_t op,
-    int32_t count,
-    int32_t chunk_tag
+    int32_t count
 ) {
     (void) full; (void) fnk; (void) fnt; (void) full_nb1; (void) look; (void) lnk;
-    (void) count;
-
-    if (chunk_tag != 0) {
-        // chunked single-resolve PP path: full union resolve on the host
-        // doorbell (fetch + publish done there; no doorbell kernel rounding here)
-        moe_slot_resolve_sync(stream, topk, table, out, nk, nt, topk_nb0, topk_nb1,
-                              table_nb0, out_nb0, out_nb1, full, fnk, fnt, full_nb1,
-                              look, lnk, il, n_exp, sentinel, op, count, chunk_tag);
-        return;
-    }
 
     if (!g_active || !g_doorbells_dev || !g_plans_dev) return;
     if (g_lru_dev) GGML_ASSERT(n_exp == g_n_expert);
