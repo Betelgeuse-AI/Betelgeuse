@@ -475,3 +475,18 @@ Goal: revert 2a3f63141 to M23 clean state + zero-overhead MOE_PROF nvme_us laten
     * Prekick overlap = 55.95% matched=30287 compared=54136 submitted=28028 reused=17796 spec_cache_hits=3,611; cancelled=0.
     * RouterPredictorV2 read-only: 1.2% top-16 hit rate on this model -> not armed. FP8 KV = 12 MB/save (not useful). PLE UVA gather = biggest lever;
       0219a5f25 port (correctly, with 16-token tiles) = second-biggest PP lever. Full analysis + ranked fix list in m26_nvme_pred_audit.md.
+
+# betelgeuse-v6.1 - Mission 27
+
+Goal: pure read-only audit of the 27.8 s t_read host loop, 97% slow reads, and the true 11,263 MiB VRAM map.
+
+- [x] Task 1 - Pinpoint the 27.8 s host overhead & 119,203,052 bucket-0 calls
+  - Inspect git show 0f3331c36 and src/llama-context.cpp (t_read0..t_read1): exact lines where bucket 0 increments 119,203,052x (~180k/tok); how much of the 27.8 s is io_uring_peek_cqe busy-polling vs clock_gettime vs drain_spec() vs SQE build/sort vs spec bookkeeping.
+  - Explain why spec_cache_hits = 3,611 printed with MOE_CACHE_MIB=0; check how MOE_PREKICK=1 interacts with nvme_us and kernel_us when MOE_CACHE_MIB=0.
+- [x] Task 2 - Audit 97% slow reads & true VRAM breakdown of 11,263 MiB
+  - Explain bucket-1/bucket-2 (< 500 us) saw only 1,270 reads (3%) vs bucket3+4 (913-1,899 us) 42,078 reads (97%) even with 5.2 GiB free RAM and verbatim-warm p3: fd_pack_buf_ page-cache hits through io_uring take 500-900 us, or experts.bin pages not cacheable?
+  - Print exact MiB breakdown of 11,263 MiB VRAM (pool_* vs trunk dense vs KV vs staging vs compute buffer); verify per_layer_token_embd is 0 MiB in VRAM or document what else takes ~4.6 GiB.
+  - Quantify expected VRAM hit-rate gain from redistributing 4,000 slots to Mission-15 Table-3 miss skew (blk.07=2,217 vs blk.31=518).
+- [x] Save audit to /home/zyxciss/fluxaeros-data/m27_tread_vram_audit.md; mark TASK.md [x]; commit docs locally.
+  - Task 1 outcome: 27.8 s host overhead (nvme_us 69.09 - cqe_wait 41.29) traced to: drain_spec() per outer/inner reap iteration (~10-15 s), bucket-0 2 clock_gettime+counter+branch per iteration (~2.1 s), SQE build/submit (~2-3 s), DMA publish_ready copies+sfence per expert (~1.5-5 s), moe_rank_refresh sweep (~0.5-1.5 s). 119,203,052 bucket-0 increments = the spec_copy >= 0 busy-poll loop in reap loop (llama-context.cpp:891-897); calls drain_spec() per iteration (~10 ns tag check on spec_ring), one clock read + one atomic add per CQE. spec_cache_hits=0 in this config (cache_==nullptr when MOE_CACHE_MIB=0); M22 measured 3,845-4,097. PREKICK=1 KPI at M26: spec_reused=17,796 of 28,049 submitted (63.4%); nvme_us unchanged ~69 s; kernel_us=1.97 s.
+  - Task 2 outcome: Bucket-1/2 (< 500 us) = 1,270 reads (2.9%); bucket-3 (500-1500 us) = 39,663 reads (91.5%); bucket-4 (>1.5 ms) = 2,415 reads (5.6%). 100% by design: pack fd uses O_DIRECT fd_pack_ (moe_pager.cpp:443), bypassing page cache entirely; experts.bin cannot accumulate page cache hits. [moe_audit] breakdown of 11,263 MiB VRAM: attention=2,191 MiB + output=504 + router-gate=240 + shared-expert=240 + other=1,019 + norms=2 + TRUE-VRAM=4,196 (pool slots 4,000 x ~1.05 MiB avg) = 8,392 MiB + ~2.9 GiB CUDA allocator/compute-scratch = 11,263 MiB. Per-layer hit distribution approximately flat (74.47%) with token black-layer skew max/min~4.3x (blk.07=2,217, blk.31=518); Arrival-Slack-style slot table redistribution would give +3-5% hit rate gain but breaks byte parity (M12 lesson); [moe_audit] PLE residency released to 0 MiB in VRAM (M14 PLE-drop works, 27.47 GB).
