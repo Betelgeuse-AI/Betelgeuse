@@ -1707,13 +1707,27 @@ static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud);
 // Non-uniform "Arrival Slack" slot allocation: early layers need the most
 // over-booking (no prior slack at t=0), tail layers need the least.
 // UD-IQ2_XS profile (48 layers): 960 + 2812 + 230 = 4,002 slots.
+// Opt-in via MOE_ARRIVAL_SLACK=1; default restores the parity-preserving profile.
 static int g_moe_slots_total = 0; // 0 = fixed table; else scaled total
 static inline int moe_fixed_slots(int il, int n_layer) {
-    if (n_layer == 48) {
+    static const bool arrival = [] {
+        const char * env = getenv("MOE_ARRIVAL_SLACK");
+        return env && atoi(env) != 0;
+    }();
+    if (arrival && n_layer == 48) {
         if (il >= 0 && il < 5)  return 192;  // 960
         if (il >= 5 && il < 43) return 74;   // 2812
         if (il >= 43 && il < n_layer) return 46; // 230
         return 74;
+    }
+    if (n_layer == 48 && il >= 0 && il < n_layer) {
+        static const int profiled_slots[48] = {
+            220, 220, 220, 220, 220, 120, 136, 120, 80, 80, 80, 80,
+            128, 80, 80, 80, 80, 88, 120, 80, 80, 96, 136, 80,
+            80, 80, 96, 80, 112, 80, 80, 80, 80, 80, 112, 80,
+            80, 88, 128, 80, 80, 80, 88, 80, 80, 80, 80, 88,
+        };
+        return profiled_slots[il];
     }
     if (il >= 0 && il < 5) return 220;
     if (il >= 5 && il < 43) return 92;

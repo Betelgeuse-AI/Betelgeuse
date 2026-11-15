@@ -90,3 +90,15 @@ Goal: kill the 73,840 cgroup throttles (MemoryHigh=13824M), restore page-cache a
   - Committed as `72ad60c58`. Report: commit hash (`72ad60c58`), `memory.events.high` (**0** vs M11's 73,840), MemoryPeak **12,279 MiB**, anon 6.83 GB / file ~7 GB (same split as M11), slot hit %: **73.1%** (vs M9's 73-74%), read/wait ms/expert 0.72-0.80 / 0.03 ms, graphs reused 200/391/583, VRAM <= 11,225 MiB, 0 failed reads across the whole log.
   - p1 binary_search warmup: prompt 58 @ **7.04** tok/s, decode 192 @ **5.94** tok/s | p2 LRUCache (exact M9 prompt): cache_n=0, prompt 17 @ **6.64** tok/s, decode 192 @ **6.05** tok/s | p3 warm: cache_n=42, prompt 16 @ **8.90** tok/s, decode 192 @ **5.90** tok/s - all coherent, correct Python, 0 failed reads, PP improved sharply vs M11 (4.64/4.35/5.98) thanks to the prefault fix.
   - **Byte-exact parity vs M9/M10 fails** (see Task 2 note): M12 output md5 differs; p1/p3 diverge at byte 135, p2 at 192; coherent same-style completions.
+
+# betelgeuse-v6.1 - Mission 13
+
+Goal: 100% GGUF-only (0 GB pack), restore 472/472 byte-exact T=0 parity, and measure throttle-free GGUF-only with `MOE_CACHE_MIB=4096` after M12's `init_mappings(false)` fix. 2 tasks; ONE cgroup-wrapped benchmark.
+
+- [ ] Task 1 - Gate Arrival-Slack behind `MOE_ARRIVAL_SLACK=1`; restore the parity-preserving default profile
+  - Restore the original fork default (parity with M9/M10/M11: byte-exact `472/472` on binary_search).
+  - Keep the `192/74/46` Arrival-Slack allocation cleanly gated behind `MOE_ARRIVAL_SLACK=1` (opt-in).
+  - `MOE_CACHE_MIB=4096` (or 3840 if needed) fits under MemoryHigh=13824M with `memory.events.high == 0` (now that `init_mappings(false)` eliminated the `MAP_POPULATE` prefault storm).
+- [ ] Task 2 - Benchmark 100% GGUF-Only (NO --moe-pack-dir) direct `00001-of-00003.gguf`, `--moe-slots 4000 -ub 64 -np 1 -c 512 -t 6`, `MOE_ARRIVAL_SLACK=0`, `MOE_PREKICK=0`, `MOE_HOT_K=0`, `MOE_CACHE_MIB=4096`, ONE scope unit `bel-m13-udiq2xs` (MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0)
+  - Same 3-prompt suite (p1 binary_search 58-tok warmup, p2 exact M9 "Write a Python LRUCache class" prompt, p3 binary_search 16-tok warm; n=192, T=0), log to /home/zyxciss/fluxaeros-data/m13_gguf_only_bench.log.
+  - Report: commit hash, `memory.events.high` (target 0), MemoryPeak, anon/file split, 472/472 MD5 parity on binary_search + LRUCache, slot hit %, victim cache hits, read/wait ms/expert, p1/p2/p3 PP & TG tok/s vs M11 Direct (4.64/4.35/6.91 PP, 5.60/6.17/6.11 TG) and M12 Pack (7.04/6.64/8.90 PP, 5.94/6.05/5.90 TG), 0 failed reads.
