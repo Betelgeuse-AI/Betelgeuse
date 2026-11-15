@@ -47,6 +47,49 @@ static thread_local double moe_diag_publish_ms = 0.0;
 #include <unordered_map>
 #include <cstdlib>
 #include <vector>
+#include <csignal>
+#include <execinfo.h>
+
+// MOE_CRASH_TRACE=1 installs SIGSEGV/SIGABRT handlers that write raw frame
+// addresses to stderr with no heap allocation; gdb/addr2line resolve them.
+static void moe_crash_trace_init() {
+    static bool installed = []() {
+        const char * e = getenv("MOE_CRASH_TRACE");
+        if (!(e && atoi(e) != 0)) return false;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = [](int sig, siginfo_t *, void *) {
+            const char msg[] = "[moe_crash_trace] signal=";
+            (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            char num[8];
+            int v = sig, i = (int) sizeof(num);
+            if (v == 0) { num[--i] = '0'; } else { while (v > 0 && i > 0) { num[--i] = (char) ('0' + v % 10); v /= 10; } }
+            (void) !write(STDERR_FILENO, num + i, sizeof(num) - (size_t) i);
+            (void) !write(STDERR_FILENO, "\n", 1);
+            void * bt[48];
+            const int n = backtrace(bt, 48);
+            for (int j = 0; j < n; j++) {
+                uintptr_t a = (uintptr_t) bt[j];
+                char line[40];
+                int p = 0;
+                line[p++] = ' '; line[p++] = ' '; line[p++] = '#';
+                line[p++] = (char) ('0' + j / 10);
+                line[p++] = (char) ('0' + j % 10);
+                line[p++] = ' '; line[p++] = '0'; line[p++] = 'x';
+                for (int nib = 60; nib >= 0; nib -= 4) { line[p++] = "0123456789abcdef"[(a >> nib) & 0xf]; }
+                line[p++] = '\n';
+                (void) !write(STDERR_FILENO, line, (size_t) p);
+            }
+            _exit(128 + sig);
+        };
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        sigaction(SIGSEGV, &sa, nullptr);
+        sigaction(SIGABRT, &sa, nullptr);
+        return true;
+    }();
+    (void) installed;
+}
 
 
 static inline int moe_get_layer_slots(int il, int n_layer);
@@ -1933,6 +1976,7 @@ llama_context::llama_context(
     // MTP uses the embd input for the hidden state
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
                 llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
+    moe_crash_trace_init();
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -2711,6 +2755,30 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (moe_prof_enabled()) {
+        const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
+        (void) us;
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
+                (unsigned long long) g_moe_prof.plan_us.load(),
+                (unsigned long long) g_moe_prof.plan_sel_us.load(),
+                (unsigned long long) g_moe_prof.plan_victim_us.load(),
+                (unsigned long long) g_moe_prof.plan_assign_us.load(),
+                (unsigned long long) g_moe_prof.victim_us.load(),
+                (unsigned long long) g_moe_prof.victim_fill_us.load(),
+                (unsigned long long) g_moe_prof.victim_fill_reserve_us.load(),
+                (unsigned long long) g_moe_prof.victim_fill_memcpy_us.load(),
+                (unsigned long long) g_moe_prof.nvme_us.load(),
+                (unsigned long long) g_moe_prof.kernel_us.load(),
+                (unsigned long long) g_moe_prof.ple_us.load(),
+                (unsigned long long) g_moe_prof.prekick_us.load(),
+                (unsigned long long) g_moe_prof.served.load(),
+                (unsigned long long) g_moe_prof.bytes_read.load());
+        for (int il = 0; il < 48 && il < (int) model.hparams.n_layer(); ++il) {
+            fprintf(stderr, "[moe_prof] layer %02d hit=%llu miss=%llu\n", il,
+                    (unsigned long long) g_moe_prof.hits[il].load(),
+                    (unsigned long long) g_moe_prof.misses[il].load());
+        }
+    }
     synchronize();
     if (g_moe_resolve_ctx == this) {
         stop_doorbell_worker();
@@ -2758,30 +2826,6 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
-    if (moe_prof_enabled()) {
-        const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
-        (void) us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
-                (unsigned long long) g_moe_prof.plan_us.load(),
-                (unsigned long long) g_moe_prof.plan_sel_us.load(),
-                (unsigned long long) g_moe_prof.plan_victim_us.load(),
-                (unsigned long long) g_moe_prof.plan_assign_us.load(),
-                (unsigned long long) g_moe_prof.victim_us.load(),
-                (unsigned long long) g_moe_prof.victim_fill_us.load(),
-                (unsigned long long) g_moe_prof.victim_fill_reserve_us.load(),
-                (unsigned long long) g_moe_prof.victim_fill_memcpy_us.load(),
-                (unsigned long long) g_moe_prof.nvme_us.load(),
-                (unsigned long long) g_moe_prof.kernel_us.load(),
-                (unsigned long long) g_moe_prof.ple_us.load(),
-                (unsigned long long) g_moe_prof.prekick_us.load(),
-                (unsigned long long) g_moe_prof.served.load(),
-                (unsigned long long) g_moe_prof.bytes_read.load());
-        for (int il = 0; il < 48 && il < (int) model.hparams.n_layer(); ++il) {
-            fprintf(stderr, "[moe_prof] layer %02d hit=%llu miss=%llu\n", il,
-                    (unsigned long long) g_moe_prof.hits[il].load(),
-                    (unsigned long long) g_moe_prof.misses[il].load());
-        }
-    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
