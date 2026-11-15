@@ -399,7 +399,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                         char * destination = ctx->pager.cache_reserve(il, old_key % n_exp, sel.data(), (size_t) n);
                         if (destination) {
                             // copy the evicted slot synchronously; a background DMA store
-                            // can race the next H2D rewrite of the slot and poison the arena
+                            // can race the next H2D rewrite of the slot and poison the arena.
+                            // use the (unrelated) pager worker stream: the legacy default stream
+                            // implicitly syncs with the compute stream, which serializes this
+                            // copy against all pending KICK/H2D work and dominates plan_us.
+                            cudaStream_t d2h_ws = (cudaStream_t) ctx->pager.worker_stream();
                             const uint64_t srcs[3] = {
                                 pl->dst_gate + (uint64_t) (v - (size_t) base) * pl->gate_bytes,
                                 pl->dst_up   + (uint64_t) (v - (size_t) base) * pl->up_bytes,
@@ -408,14 +412,27 @@ static void start_doorbell_worker(llama_context * ctx) {
                             const uint32_t len[3] = { pl->gate_bytes, pl->up_bytes, pl->down_bytes };
                             size_t at = 0;
                             for (int r = 0; r < 3; r++) {
-                                cudaError_t derr = cudaMemcpy(destination + at,
-                                        (const void *) (uintptr_t) srcs[r], len[r], cudaMemcpyDeviceToHost);
+                                cudaError_t derr = d2h_ws
+                                    ? cudaMemcpyAsync(destination + at,
+                                                      (const void *) (uintptr_t) srcs[r], len[r],
+                                                      cudaMemcpyDeviceToHost, d2h_ws)
+                                    : cudaMemcpy(destination + at,
+                                                 (const void *) (uintptr_t) srcs[r], len[r],
+                                                 cudaMemcpyDeviceToHost);
                                 if (derr != cudaSuccess) {
                                     fprintf(stderr, "[moe_victim_cache] synchronous store failed: %s\n",
                                             cudaGetErrorString(derr));
                                     GGML_ABORT("victim cache store failed");
                                 }
                                 at += len[r];
+                            }
+                            if (d2h_ws) {
+                                cudaError_t serr = cudaStreamSynchronize(d2h_ws);
+                                if (serr != cudaSuccess) {
+                                    fprintf(stderr, "[moe_victim_cache] worker stream sync failed: %s\n",
+                                            cudaGetErrorString(serr));
+                                    GGML_ABORT("victim cache store sync failed");
+                                }
                             }
                             victim_saved++;
                         }
