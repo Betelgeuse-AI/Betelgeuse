@@ -270,3 +270,28 @@ Goal: re-apply bbbd75de0 (stage-to-arena fill) with MOE_STAGE_WC=0 and verify M1
     * CONCLUSION: speed restored to M16 level with the stage-to-arena fill + cacheable stage (WC default off) on the mandated config;
       parity holds for p1/p3 byte-exact, p2 reasoning flips at byte 440 (ulp near-tie, same class as the byte-135/M12 fractures);
       the one open item is the exit SIGSEGV + the missing waterfall, both needing a debug/read-only session, NOT a benchmark re-run.
+
+# betelgeuse-v6.1 - Mission 21
+
+Goal: read-only triage of the shutdown SIGSEGV (107239), inclusive-cache hit drop (28,641 -> 10,075), and the p2 byte-440 flip.
+
+- [x] Task 1 - Triage shutdown SIGSEGV (coredumpctl / 107239, 0x0 null jump) & [moe_prof] flush
+  - Inspect the truncated core dump (coredumpctl info / gdb batch backtrace; scratch output strictly under fluxaeros-data) to identify the exact thread, function, line, and destructor/teardown sequence causing SEGV_MAPERR at 0x0 at exit.
+  - Identify where [moe_prof] prints vs llama_context / moe_pager / moe_doorbell teardown order so Mission 22 can fix the crash AND print [moe_prof] reliably after requests / before exit teardown.
+- [x] Task 2 - Audit inclusive L2 cache duplication (28,641 -> 10,075 hits), 0.47 vs 1.00 ms read=, & p2 byte-440 flip
+  - Trace 5608789a8 (bbbd75de0) to quantify how much of victim_cache (3,195 slots) wasted duplicating the VRAM-resident experts (hits 28,641 -> 10,075); verify clean ways to restore exclusive caching without the 27.32 s DtoH (MOE_CACHE_MIB=0 fd_pack_buf_ vs MOE_CACHE_MIB=7168-8192 vs eviction tracking without DtoH).
+  - Check why M16 saw read = 0.47 ms while M20 saw read = 1.00 ms (page-cache warmth vs cold experts.bin under MOE_DROP_MMAP=1); check whether p2's byte-440 ULP near-tie flip can be triggered by MOE_PREKICK=1 timing or CUDA non-determinism across builds.
+- [x] Save audit to /home/zyxciss/fluxaeros-data/m21_sigsegv_cache_audit.md; mark TASK.md [x]; commit docs locally.
+  - Task 1 outcome: core is truncated (root-owned, ~1013 MiB); gdb batch shows frame #0 = 0x0 (null jump); ALL other 18 threads parked in libc waits;
+    stack pages absent -> the exact function is NOT resolvable read-only. Crash window pinned to exit path AFTER all requests served and AFTER the demand worker's final
+    log_io print, BEFORE the [moe_prof] dump (which prints at the END of ~llama_context) - i.e. inside teardown (moe_doorbell_free / oracle / io join / host-pool free /
+    HTTP-server teardown). No mechanism links the M18/M20 fill diff to exit paths; crash class is recurring across this fork's history. M22 fix: move the [moe_prof] dump
+    to the START of ~llama_context (or llama_free), add an env-gated SIGSEGV backtrace handler; do NOT touch the order of frees yet.
+  - Task 2 outcome: (a) victim-cache hit collapse 28,641 -> 10,075 (-64.8%), hit bytes 48.0 -> 15.75 GB (-67.2%), evict churn +62.6% - arrival-fill spends the 3,195
+    slots duplicating VRAM-resident experts instead of ghosts (useless until VRAM eviction); eviction-trigger admission remains the 45% policy. (b) M16 vs M20 read delta
+    is MOE_DROP_MMAP, NOT cache warmth (M16 had NO drop_pages; M20 mandated it -> honest SSD reads ~1.0 ms; page cache never populates; TG held 7.45 anyway).
+    (c) p2 byte-440 flip: ulp near-tie in the LRUCache reasoning region; same family as byte-135/M12; NOT PREKICK, NOT byte corruption; flip position differs across builds
+    (M18: p1/p3 also flipped; M20: only p2). No legitimate fix exists without changing logits.
+  - Ranked Mission 22 candidates: (A) MOE_CACHE_MIB=0 fd_pack_buf_ absorb, byte-exact, TG ~5.0-5.5, safest baseline; (B) MOE_CACHE_MIB=7168-8192 - rejected (peak would
+    exceed MemoryHigh); (C) selective hot-skip admission on arrival fill, ~18-25k hits target, zero DtoH; (D) async VRAM-eviction DtoH with fence-at-read, M16 policy at ~0 sync;
+    (E) keep M20 as-is; (M22) also ship the [moe_prof] early-flush + crash handler first.
