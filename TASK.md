@@ -153,3 +153,17 @@ Goal: eliminate the plan_us (30.5% of wall time) host-dispatch bottleneck; read-
   - TG tok/s: p1 **6.95** (8,237 ms/58 prompt tok; eval 27,500.76 ms/192 = 143.98 ms/tok) | p2 **7.40** (135.21 ms) | p3 **7.40** (135.08 ms). PP tok/s: **7.04 / 6.11 / 9.12**.
   - graphs reused 197/387/577; VRAM <= 11,273 MiB; GPU 100% util, SM 2077-2092 MHz, mem 7801 MHz; parity **byte-exact vs M9/M10/M11/M13/M14/M15** on all three prompts (p1/p3 binary_search md5 identical; p2 LRUCache reasoning+content byte-exact); 0 failed reads.
   - Note: MemoryPeak/events.high for this session were not re-read after stop (unit unloaded); the allocation footprint is identical to M15 (13,402 MiB, events.high == 0) - the three commits do not allocate at init or in the hot path.
+
+# betelgeuse-v6.1 - Mission 17
+
+Goal: pure read-only audit of plan_victim_us (27.32 s) and nvme_wait (44.11 s).
+
+- [x] Task 1 - Line-by-line audit of plan_victim_us (99.8% of plan_us)
+  - Trace every op per VRAM eviction (cudaMemcpyAsync DtoH, stream/event syncs, locks, CPU memcpy); explain 63,590 fills x ~430 us (~4.0 GB/s) blocking the main dispatch thread.
+  - Count how many fills entered VRAM via Host stage_ vs startup seeding; check fd_pack_buf_ (6.7 GiB page cache) overlap with the 5.1 GiB victim cache.
+  - Evaluate pros/cons + expected speedup of (a) stage_host-fill at H2D time (zero DtoH), (b) disabling DtoH back-fill (pack-fd_buf absorbs), (c) non-blocking async DtoH ring.
+- [x] Task 2 - Line-by-line audit of nvme_wait (44.11 s), PREKICK, MOE_ARRIVAL_SLACK, PP slicing
+  - Explain 44.11 s (~76 ms/tok) vs read = 0.48-0.57 ms/expert: exact counts/times served by victim_cache vs fd_pack_buf_ (buffered pread - is fd_pack_buf_ synchronous inside nvme_wait?!) vs fd_pack_ (O_DIRECT io_uring); io_uring per-expert vs batched per-layer.
+  - MOE_ARRIVAL_SLACK=1 exact slot count & VRAM fit (< 11,750 MiB); MOE_SEED_BUDGET_MS > 0 behavior without --moe-profile; how llama-moe-profile generates a UD-IQ2_XS profile.
+  - Exact scope to replace do_slice / t0 += 8 (llama-graph.cpp) with 0219a5f25-style Expert-Chunked Single-Resolve PP + 65-slot sentinel.
+- [x] Save audit to /home/zyxciss/fluxaeros-data/m17_victim_nvme_audit.md; mark TASK.md [x]; commit locally.
