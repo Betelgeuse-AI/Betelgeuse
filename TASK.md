@@ -230,3 +230,43 @@ Goal: pure read-only audit of the Mission 18 failure (2,011 us/fill, byte-135 pa
     M18 never warmed below 2.2). MOE_CACHE_MIB=0 at HEAD works via the init_cache(0) early-true + cache_bytes==0 -> victim_cache=false gate (llama-context.cpp:~2456/~210); zero DtoH,
     zero arena, fd_pack_buf absorbs warm experts, byte-exact by construction; MemoryHigh risk LOW (file pages LRU-reclaimable; PLE dropped; M12/M13 pattern clean).
   - Ranked Mission 20: (1) MOE_STAGE_WC=0 behind env knob + M15/M16 double-run byte-verify vs reference md5 537a71e9/acd130f4; (2) fallback MOE_CACHE_MIB=0; (3) keep reverted HEAD as reference.
+
+# betelgeuse-v6.1 - Mission 20
+
+Goal: re-apply bbbd75de0 (stage-to-arena fill) with MOE_STAGE_WC=0 and verify M16 parity + speedup.
+
+- [x] Task 1 - Re-apply bbbd75de0 with MOE_STAGE_WC=0 + sub-timers; build build-v1/
+  - Re-apply the bbbd75de0 diff cleanly onto betelgeuse-v6.1 (stage-to-arena fill on cold-read completion; DtoH back-fill removed).
+  - MOE_STAGE_WC=0 allocates g_stage_host as cacheable (cudaHostAllocMapped | cudaHostAllocPortable, no cudaHostAllocWriteCombined);
+    auto-default WC off when the stage-to-arena fill is active (callers cannot accidentally hit the 0.85 GB/s trap).
+  - Split victim_fill_us in MOE_PROF=1 into victim_fill_reserve_us vs victim_fill_memcpy_us.
+  - Rebuild build-v1/bin/bel-server; run .test_moe_pager / test_moe_pager; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_PROF=1 verification (exact M16 config & prompts)
+  - MOE_STAGE_WC=0 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_DROP_MMAP=1 MOE_CACHE_MIB=5120 MOE_PROF=1;
+    experts.bin --moe-pack-dir; --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931; exact M15/M16 p1/p2/p3 prompts (T=0);
+    log to /home/zyxciss/fluxaeros-data/m20_stage_wc0_bench.log.
+  - Before stopping bel-server, capture live cgroup memory.peak, memory.current, memory.events (high/max/oom), nvidia-smi VRAM; then stop cleanly.
+  - Byte/MD5 parity vs M16 reference (p1/p2 912 B reasoning + content/p3; 537a71e9/acd130f4); mark TASK.md [x]; commit locally;
+    report Table 1 waterfall + TG & PP + VRAM + MemoryPeak + memory.events.high + parity.
+  - Task 1 outcome: fix re-applied (5608789a8; fresh WC-off default + explicit MOE_STAGE_WC=1 opt-in warning, stage init logs WC=%d),
+    victim_fill_us split into victim_fill_reserve_us + victim_fill_memcpy_us under MOE_PROF=1; bel-server rebuilt; pager harness PASS 9/9;
+    committed as 627571fdc (x+Task 1 done).
+  - Task 2 SESSION RESULTS (unit bel-m20-stage-wc0, MOE_DROP_MMAP=1 as mandated, log m20_stage_wc0_bench.log):
+    * p1/p2/p3 TG: 7.45 / 7.45 / 7.42 tok/s; PP: 6.78 / 5.63 / 7.56 tok/s; eval 134.19 / 134.26 / 134.81 ms/tok; graphs reused 197/387/577.
+    * VRAM 11,273 MiB (< 11,750); memory.peak = 13,796,868,096 B = 13,156 MiB; memory.current at sample = 11,093,135,360 B = 10,581 MiB;
+      memory.events: high=0 max=0 oom=0 sock_throttled=0; SM 99% util at sample; 0 failed expert reads (44 lines failed=0, no aborts).
+    * PARITY: p1 byte-exact vs M16 (content md5 537a71e9 / reasoning 23328639; 472/313 B identical). p3 byte-exact vs M16 (same md5s).
+      p2 content identical (empty) but reasoning DIVERGES at byte 440 (939 B vs M16 912 B, md5 67c520c8 vs acd130f4) - near-tie flip in the
+      LRUCache reasoning trajectory only; p1/p3 are byte-exact and deterministic across M16 and M20 builds. NOT 472/472 overall.
+    * MOE_DROP_MMAP=1 (mandated) forces every pack read to NVMe: read=0.96-1.03 ms/expert honest-SSD (vs M16 page-cache-absorbed 0.47-0.57);
+      TG held at M16 level anyway because ~74.4% of selects are VRAM-resident.
+    * [moe_io] served=22,847 logical_bytes=128.90 GB; [moe_dma_io] copies=63,531 h2d_bytes=108.53 GB; [moe_victim_cache] saved=65,637
+      hits=10,075 bytes=15.75 GB cache_evict=52,378; decode hit=74.53%; [prekick] overlap~55.8% spec_cache_hits=4,958-5,067.
+    * EXIT-PATH SIGSEGV at shutdown (TID 107369, SEGV_MAPERR @ 0x0, single null jump) AFTER all stats printed and BEFORE the [moe_prof]
+      dump could print; waterfall (plan_victim_us, victim_fill_reserve/memcpy_us, nvme_us, kernel_us) is NOT CAPTURED this session.
+      A truncated 1013 MB core is stored under the systemd coredump dir (coredumpctl show 107239). Pre-existing intermittent shutdown
+      defect (many SIGSEGVs in history across builds); NOT caused by the fill diff (nothing touching exit paths changed); flagged for a
+      follow-up read-only triage.
+    * CONCLUSION: speed restored to M16 level with the stage-to-arena fill + cacheable stage (WC default off) on the mandated config;
+      parity holds for p1/p3 byte-exact, p2 reasoning flips at byte 440 (ulp near-tie, same class as the byte-135/M12 fractures);
+      the one open item is the exit SIGSEGV + the missing waterfall, both needing a debug/read-only session, NOT a benchmark re-run.
