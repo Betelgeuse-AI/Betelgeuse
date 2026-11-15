@@ -329,3 +329,50 @@ Goal: early [moe_prof] flush + MOE_CRASH_TRACE=1 backtrace; one cgroup-wrapped M
     - Honest verdict: speed restored to M16 level with WC=0 + no MOE_DROP_MMAP=1, BUT the [moe_prof] fill cost now sits inside the reap loop,
       so read=1.04 ms/expert (+~0.4 ms/fill over page-cache absorption); TG about equal to M16 (6.98/7.26/6.93 vs 6.95/7.40/7.40);
       arena defender still suffers the arrival-fill duplication (10,075 -> 9,171 hits); p2 ulp near-tie flips again (position moved 440 -> 473).
+
+# betelgeuse-v6.1 - Mission 23
+
+Goal: audit net nvme_us (52.36 s) and test clean MOE_CACHE_MIB=0 + MOE_STAGE_WC=1 (0 back-fill, full page cache). HEAD unchanged (21b2acd49) - pure 1-variable test.
+
+- [x] Task 1 - Read-only check of MOE_CACHE_MIB=0 path, net nvme_us (52.36 s), MOE_SEED_BUDGET_MS=4000
+  - Verify MOE_CACHE_MIB=0 + MOE_STAGE_WC=1 disables victim_cache cleanly at HEAD (plan_victim_us ~ 0, victim_fill_us = 0, fd_pack_buf_ absorbs via io_uring + page cache; WC stage fast for kernel writes + GPU DMA).
+  - Inspect src/llama-context.cpp:532-968 (net nvme_us = 52.36 s in M22) for remaining non-CQE CPU/vector/SQE bookkeeping inside t_read0..t_read1.
+  - Verify MOE_SEED_BUDGET_MS=4000 (moe_hot_profile.h) + Expert-Chunked PP readiness for Mission 24.
+- [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=0 benchmark (p1/p2/p3 at T=0)
+  - MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1;
+    NO MOE_DROP_MMAP=1; experts.bin --moe-pack-dir; --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931;
+    log to /home/zyxciss/fluxaeros-data/m23_cache0_bench.log.
+  - Before stopping, capture memory.peak, memory.current, memory.events (high/max/oom), /proc/<pid>/smaps_rollup, nvidia-smi VRAM; then stop (SIGTERM).
+  - Report full [moe_prof] waterfall, TG & PP, read ms/expert, VRAM, MemoryPeak, memory.current, memory.events.high, 0 failed reads, parity hashes.
+  - Task 1 outcome (HEAD 21b2acd49, no edits): (a) MOE_CACHE_MIB=0 -> cache_bytes=0 -> init_cache() NEVER charged (llama-context.cpp:2475-2484), cache_ stays
+    nullptr -> cache_bytes()==0 -> demand-view victim_cache=false (llama-context.cpp:942-ish); plan_victim_us ~= 0, victim_fill_us=0
+    (publish_ready fill branch is victim_cache-gated), cache_find/cache_remove/arena DMA-from-arena never run; [moe_victim_cache] print skipped;
+    every miss reads fd_pack_buf_ (buffered, page-cached; O_DIRECT fd unused with MOE_HOT_K=0); arena never reserved (no mmap, no cudaHostRegister,
+    no 5 GiB of VMA); WC stage (MOE_STAGE_WC=1) is optimal for the DMA H2D path and KICK-Kernel UVA reads; nothing on the CPU reads stage with the fill gone.
+    (b) src/llama-context.cpp:584-1004 t_read0..t_read1 non-CQE inventory: victim serve (~0.2-0.9 s, incl. memcpy path when arena present),
+    drain_spec (io_uring_peek_cqe per spec CQE), spec join scan (2 candidates per miss), !ring_ok sync fallback (never taken), coalesced SQE build
+    (~3-4 SQEs/pack-expert, works.stable_sort of <= ~12 items, one io_uring_submit per ubatch), pre-CQE left[]/exp_len assignment, per-CQE checks
+    (exp_len vs res, read_fail sticky flag, span items never build in pack mode) and publish_ready DMA submit (3 vd memcpyAsync + 4 B flag write)
+    - combined <= ~2 s, i.e. ~3-4% of nvme_us; ~96-97% is the io_uring_wait_cqe wait itself; M22 measured fill+reserve = 25.05 s of the 77.41, leaving net nvme_us = 52.36 s.
+    (c) MOE_SEED_BUDGET_MS=4000 without --moe-profile falls back to MOE_HOT_PROFILE="data/moe_hot_profile.bin" if present, else the checked-in
+    src/moe_hot_profile.h built-in (MOE_HOT_NLAYER=48, MOE_HOT_PER_LAYER=72, 86.5% of the trace decode accesses, generated once from
+    ~/flux-trace/traces/qwen38/q38.ids.u8 at T=0) - the trace source IS this model family (UD-IQ2_XS = Qwen3.8-Flash-Next), so the built-in is
+    on-distribution; budget default 4,000 ms, 15,000 ms under MOE_STATIC_HOT=1; seeding never armed in M13-M23 (MOE_SEED_BUDGET_MS=0).
+    (d) Expert-Chunked PP readiness for Mission 24: KICK exists in this fork; WAIT_CHUNK does NOT (betelgeuse-only ops);
+    scope stands at ~1,500-1,800 LoC across ggml-cuda.cu/ggml.h/ggml.c, moe_doorbell.cu, llama-graph.cpp (replace do_slice/t0+=8 at 2551-2608),
+    llama-context.cpp; parity bar: byte-exact md5 vs M13/M14/M15/M16 reference; test_moe_pager unaffected.
+  - Task 2 SESSION RESULTS (exit rc=0 clean; unit bel-m23-cache0; log m23_cache0_bench.log):
+    * TG tok/s (p1/p2/p3): 7.89 / 8.40 / 9.24 - BEST EVER on this engine; PP: 7.72 / 5.69 / 9.39; graphs reused 197/387/577;
+      eval 126.82 / 119.04 / 108.17 ms/tok (M16: 143.98 / 135.21 / 135.08).
+    * WATERFALL: plan_us=87,836 plan_sel_us=8,201 plan_victim_us=17,507 plan_assign_us=5,862 victim_us=17,251
+      victim_fill_us=0 victim_fill_reserve_us=0 victim_fill_memcpy_us=0 nvme_us=59,909,376 (~794 us/miss) kernel_us=2,050,575
+      ple_us=112,646 prekick_us=61,720 served=22,967 bytes_read=128.99 GB logical_bytes=129.14 GB; read=0.71-0.79 ms/expert.
+    * PARITY 472/472 BYTE-EXACT vs M14/M15/M16 reference (p1 537a71e9/23328639; p2 acd130f4/912 B - LRUCache trajectory restored;
+      p3 identical). The LRUCache near-tie does NOT flip in the no-arena config.
+    * memory.peak = 11,626,631,168 B = 11,089 MiB (HIGH margin ~2,249 MiB); memory.current at stop = 11,513,057,280 B = 10,983 MiB;
+      events: high=0, max=0, oom=0, sock_throttled=1; VRAM = 11,263 MiB (< 11,750); SM 97%; 0 failed expert reads (44 lines failed=0).
+    * smaps_rollup at stop: Rss=2,166,288 kB Pss=2,160,307 kB anon=1,572,664 kB file=422,139 kB shmem=165,504 kB swap=0 -
+      engine's host resident footprint shrunk to ~2.1 GB (5 GiB arena gone); the pack fd_pack_buf_ absorbs the experts.bin pages
+      (charged to the cgroup as file pages, LRU-reclaimable - no throttling pressure).
+    * NOTE kernel_us=2,050,575 (2.05 s - highest to date) but watch-out: wall SM went down/up enough that TG improved anyway;
+      arena duplication eliminated (no victim-cache traffic at all).
