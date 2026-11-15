@@ -167,3 +167,42 @@ Goal: pure read-only audit of plan_victim_us (27.32 s) and nvme_wait (44.11 s).
   - MOE_ARRIVAL_SLACK=1 exact slot count & VRAM fit (< 11,750 MiB); MOE_SEED_BUDGET_MS > 0 behavior without --moe-profile; how llama-moe-profile generates a UD-IQ2_XS profile.
   - Exact scope to replace do_slice / t0 += 8 (llama-graph.cpp) with 0219a5f25-style Expert-Chunked Single-Resolve PP + 65-slot sentinel.
 - [x] Save audit to /home/zyxciss/fluxaeros-data/m17_victim_nvme_audit.md; mark TASK.md [x]; commit locally.
+
+# betelgeuse-v6.1 - Mission 18
+
+Goal: eliminate the 27.32 s PCIe DtoH victim-cache back-fill; fill victim_cache from stage_host instead.
+
+- [x] Task 1 - Replace VRAM->Host DtoH back-fill with Host stage_host fill
+  - In plan_victim_us (src/llama-context.cpp:380-471), remove the cudaMemcpyAsync(..., DeviceToHost) + cudaStreamSynchronize(d2h_ws) back-fill on evicted old_key.
+  - In the CQE-reap / publish_ready cold-read completion path (llama-context.cpp:680-930), when the expert was read from disk into stage_host[ci] (NOT when served from victim_cache), call cache_reserve(il, e, ...) and memcpy exact (gate|up|down) bytes from stage_host[ci] into the arena slot before stage_host[ci] can be recycled.
+  - Exact per-layer role sizes must match cache_find reads (blk.4 + mixed-quant layers); zero stage-reuse race.
+  - Keep MOE_PROF=1 timers updated (victim_fill_us); rebuild build-v1/bin/bel-server; verify test_moe_pager; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_PROF=1 verification (exact M15/M16 config & prompts)
+  - systemd-run --user --scope -p MemoryHigh=13824M -p MemoryMax=14G -p MemorySwapMax=0; experts.bin --moe-pack-dir, MOE_CACHE_MIB=5120, MOE_PREKICK=1, MOE_PROF=1, MOE_SEED_BUDGET_MS=0, MOE_HOT_K=0, --moe-slots 4000; 472/472 parity vs M14-M16.
+  - Log memory.peak, memory.current, memory.events (high) from live cgroup + nvidia-smi VRAM before stopping bel-server.
+  - Report waterfall (plan_victim_us, victim_fill_us, nvme_wait), TG & PP tok/s (p1/p2/p3), VRAM, MemoryPeak, memory.events.high, 0 failed reads, parity.
+  - Task 1 outcome: implemented (bbbd75de0); bel-server rebuilt; pager harness PASS 9/9; committed locally as bbbd75de0.
+    The Task 2 verification then FAILED the invariants, so the engine path was reverted (7004670dd, bel-server
+    rebuilt, pager harness PASS 9/9 again). bbbd75de0 remains in local history for diagnosis.
+  - Task 2 VERIFICATION FAILED (session log: /home/zyxciss/fluxaeros-data/m18_stage_victim_bench.log; scope
+    bel-m18-udiq2xs, cleanly stopped; live-cgroup sample taken BEFORE stop):
+    - memory.peak = 13,744,578,560 B = 13,110 MiB (< 13824M); memory.current at stop = 13,495,963,648 B = 12,874 MiB;
+      memory.events: high=0 max=0 oom=0; VRAM = 11,273 MiB (< 11,750); 0 failed expert reads.
+    - TG tok/s (p1/p2/p3): 3.21 / 3.67 / 3.35 (M16: 6.95 / 7.40 / 7.40) - ~54% regression.
+      PP tok/s (p1/p2/p3): 2.76 / 1.99 / 2.44 (M16: 7.04 / 6.11 / 9.12).
+    - PARITY FAILS: p1 & p3 diverge from M16 at byte 135 (same near-tie position as the Arrival-Slack break);
+      p1 vs p3 diverge inside one session too (content byte 413, reasoning byte 269) -> decode nondeterministic
+      across requests in this build; p2 reasoning 922 B vs M16's 912 B.
+    - Waterfall: plan_us 27,378,902 -> 110,472 (-99.6%); plan_victim_us 27,317,948 -> 24,150 (-99.91%, the surgical
+      DtoH fix WORKED); BUT victim_fill_us (stage_host -> arena memcpy inside publish_ready) = 149,089,852 us,
+      ~2,011 us per fill over ~74k fills, ~10x the 208 us/fill (8.5 GB/s) measured by an isolated cudaHostRegister
+      probe of the same buffers (186-254 us with a concurrent H2D DMA); nvme_us 44,226,273 -> 184,435,064
+      (+317%, fully accounted for by the fill running inside the reap loop); victim_us 357,174 -> 896,191;
+      kernel_us 2,407,514 -> 360,320; served=22,799; bytes_read=126.51 GB; decode hit=69.0-69.5% (M16: 74.4%).
+    - Driver bug (diagnostics only): MOE_IO_DIAG=1 was not set; io_diag is counters only, no behavior change.
+    - Root cause NOT isolated within the one-benchmark budget; the ~2,011 us per in-session fill vs ~208 us isolated
+      remains unexplained. Byte-135 near-tie flip indicates an ulp-level decode-state perturbation, mechanism unknown.
+    - Verdict: implementation REJECTED on its own verification. DO NOT use this config. Branch HEAD reverted to the
+      M16-verified byte-exact state (7004670dd). Recommended: investigate with thread-level sub-timers inside
+      publish_ready (reserve vs memcpy vs NUMA locality) in a separate mission; only re-enable a stage-fill path
+      after parity re-verification AND TG parity with M16.
