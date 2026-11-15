@@ -174,6 +174,9 @@ static void start_doorbell_worker(llama_context * ctx) {
             (!split_env || atoi(split_env) != 0) &&
             io_uring_queue_init(16, &spec_ring, 0) == 0;
         char * spec_stage = nullptr;
+        // 64 MiB backstop for coalesced O_DIRECT span reads (allocated on first use)
+        char * stage_bounce_ = nullptr;
+        size_t stage_bounce_bytes_ = 0;
         if (spec_ok && posix_memalign((void **) &spec_stage, 4096, stride * 8) != 0) {
             io_uring_queue_exit(&spec_ring);
             spec_ok = false;
@@ -600,51 +603,134 @@ static void start_doorbell_worker(llama_context * ctx) {
                         else { read_fail[(size_t) ci] = 1; fail_ci(ci); }
                     }
                 } else {
-                    // collect all reads, then issue them in monotonically
-                    // increasing file offset order (NVMe-friendly) as one batch
-                    struct DemandSqeItem { int fd; uint64_t off; uint32_t len; char * dst; uint64_t tag; };
-                    std::vector<DemandSqeItem> sqe_items;
-                    sqe_items.reserve((size_t) ncopy * 3);
-                    for (int ci = 0; ci < ncopy; ++ci) {
-                        if (left[(size_t) ci] == 0) continue;
-                        char * dst = stage_host + (size_t) ci * stride;
+                    // role-grouped extent coalescing: sweep (1) gate, (2) up,
+                    // (3) down, each sorted by file offset; adjacent items with a
+                    // small gap merge into one multi-MiB O_DIRECT read into a
+                    // bounce span, then get sliced out at CQE time. pack keeps
+                    // one SQE per expert (contiguous blob already).
+                    const uint64_t SPAN_TAG = (uint64_t)1 << 63;
+                    const uint64_t COALESCE_GAP = (uint64_t)(2ull << 20);
+                    const uint64_t COALESCE_MAX = (uint64_t)(4ull << 20);
+                    struct RoleItem { int fd; uint64_t off; uint32_t len; char * dst; uint64_t tag; };
+                    struct SpanItem { uint64_t foff; uint32_t len; char * dst; int ci; int r; };
+                    struct SpanRec { int fd; uint64_t fbeg, fend; char * bounce; std::vector<SpanItem> items; };
+                    struct SqeWork { int fd; uint64_t off; char * dst; uint64_t len; uint64_t tag; };
+                    std::vector<SpanRec> spans;
+                    std::vector<SqeWork> works;
+                    works.reserve((size_t) ncopy * 3 + 8);
+                    if (io_diag) {
                         if (ctx->pager.pack_mode()) {
-                            const moe_pager::moe_pack_loc & loc = locs[(size_t) ci];
-                            sqe_items.push_back({ rfd[(size_t) ci], (uint64_t) loc.off, loc.len,
-                                dst, (uint64_t) (size_t) ci * 3 });
-                            if (io_diag) {
+                            for (int ci = 0; ci < ncopy; ++ci) {
+                                if (left[(size_t) ci] == 0) continue;
                                 demand_queued++;
-                                demand_bytes += loc.len;
+                                demand_bytes += locs[(size_t) ci].len;
                                 if (spec_pending >= 0 && spec_layer == il &&
                                     spec_experts[spec_pending] == misses[(size_t) ci]) duplicate_submissions++;
                             }
                         } else {
-                            const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) ci]);
-                            const size_t want[3] = { gb, ub, db };
-                            const size_t off[3] = { 0, gb, gb + ub };
-                            for (int r = 0; r < 3; ++r) {
-                                sqe_items.push_back({ s[r].fd >= 0 ? s[r].fd : fd_gguf,
-                                    (uint64_t) (s[r].off + s[r].pre), (uint32_t) want[r], dst + off[r],
-                                    (uint64_t) (size_t) ci * 3 + (uint64_t) r });
-                            }
-                            if (io_diag) {
+                            for (int ci = 0; ci < ncopy; ++ci) {
+                                if (left[(size_t) ci] == 0) continue;
                                 demand_queued += 3;
                                 demand_bytes += gb + ub + db;
                             }
                         }
                     }
-                    std::stable_sort(sqe_items.begin(), sqe_items.end(),
-                            [](const DemandSqeItem & a, const DemandSqeItem & b) {
+                    if (ctx->pager.pack_mode()) {
+                        for (int ci = 0; ci < ncopy; ++ci) {
+                            if (left[(size_t) ci] == 0) continue;
+                            const moe_pager::moe_pack_loc & loc = locs[(size_t) ci];
+                            if (loc.len > stride) { read_fail[(size_t) ci] = 1; left[(size_t) ci] = 0; continue; }
+                            works.push_back({ rfd[(size_t) ci], (uint64_t) loc.off,
+                                stage_host + (size_t) ci * stride, loc.len, (uint64_t) (size_t) ci * 3 });
+                        }
+                    } else {
+                        std::vector<RoleItem> role_items[3];
+                        for (int ci = 0; ci < ncopy; ++ci) {
+                            if (left[(size_t) ci] == 0) continue;
+                            const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) ci]);
+                            const size_t want3[3] = { gb, ub, db };
+                            const size_t off3[3] = { 0, gb, gb + ub };
+                            char * dst = stage_host + (size_t) ci * stride;
+                            for (int r = 0; r < 3; ++r) {
+                                role_items[r].push_back({ s[r].fd >= 0 ? s[r].fd : fd_gguf,
+                                    (uint64_t) (s[r].off + s[r].pre), (uint32_t) want3[r], dst + off3[r],
+                                    (uint64_t) (size_t) ci * 3 + (uint64_t) r });
+                            }
+                        }
+                        if (!stage_bounce_) {
+                            const size_t bounce_bytes = (size_t)(64ull << 20);
+                            void * bp = nullptr;
+                            if (posix_memalign(&bp, 4096, bounce_bytes) != 0) {
+                                GGML_ABORT("coalesce bounce alloc failed");
+                            }
+                            memset(bp, 0, bounce_bytes);
+                            stage_bounce_ = (char *) bp;
+                            stage_bounce_bytes_ = bounce_bytes;
+                        }
+                        size_t bounce_used = 0;
+                        long coalesce_items = 0;
+                        for (int r = 0; r < 3; ++r) {
+                            auto & v = role_items[r];
+                            std::stable_sort(v.begin(), v.end(),
+                                    [](const RoleItem & a, const RoleItem & b) {
+                                        if (a.fd != b.fd) return a.fd < b.fd;
+                                        return a.off < b.off;
+                                    });
+                            size_t i = 0;
+                            while (i < v.size()) {
+                                size_t j = i;
+                                uint64_t fbeg = v[i].off, fend = v[i].off + v[i].len;
+                                while (j + 1 < v.size() && v[j + 1].fd == v[i].fd) {
+                                    const uint64_t gap = v[j + 1].off - fend;
+                                    const uint64_t merged = v[j + 1].off + v[j + 1].len - fbeg;
+                                    if (gap <= COALESCE_GAP && merged <= COALESCE_MAX) {
+                                        fend = v[j + 1].off + v[j + 1].len;
+                                        j++;
+                                    } else break;
+                                }
+                                const uint64_t span_bytes = fend - fbeg;
+                                coalesce_items += (long) (j - i + 1);
+                                if (j > i && (fbeg % 512) == 0 && (span_bytes % 512) == 0 &&
+                                        bounce_used + span_bytes <= stage_bounce_bytes_) {
+                                    SpanRec sp;
+                                    sp.fd = v[i].fd;
+                                    sp.fbeg = fbeg; sp.fend = fend;
+                                    sp.bounce = stage_bounce_ + bounce_used;
+                                    bounce_used += span_bytes;
+                                    for (size_t k = i; k <= j; ++k) {
+                                        sp.items.push_back({ v[k].off, v[k].len, v[k].dst,
+                                            (int)(v[k].tag / 3), (int)(v[k].tag % 3) });
+                                    }
+                                    works.push_back({ sp.fd, sp.fbeg, sp.bounce, span_bytes,
+                                        SPAN_TAG + (uint64_t) spans.size() });
+                                    spans.push_back(std::move(sp));
+                                } else {
+                                    for (size_t k = i; k <= j; ++k) {
+                                        works.push_back({ v[k].fd, v[k].off, v[k].dst, v[k].len, v[k].tag });
+                                    }
+                                }
+                                i = j + 1;
+                            }
+                        }
+                                if (io_diag && !spans.empty()) {
+                            size_t n_single = 0;
+                            for (const auto & w : works) if (!(w.tag & SPAN_TAG)) n_single++;
+                            fprintf(stderr, "[coalesce] items=%ld spans=%zu singles=%zu sqes_out=%zu\n",
+                                    coalesce_items, spans.size(), n_single, works.size());
+                        }
+                    }
+                    std::stable_sort(works.begin(), works.end(),
+                            [](const SqeWork & a, const SqeWork & b) {
                                 if (a.fd != b.fd) return a.fd < b.fd;
                                 return a.off < b.off;
                             });
                     int n_sqe = 0;
                     bool submit_ok = true;
-                    for (const DemandSqeItem & it : sqe_items) {
+                    for (const SqeWork & w : works) {
                         struct io_uring_sqe * sqe = io_uring_get_sqe(&ring);
                         if (!sqe) { submit_ok = false; break; }
-                        io_uring_prep_read(sqe, it.fd, it.dst, it.len, (off_t) it.off);
-                        io_uring_sqe_set_data(sqe, (void *) (uintptr_t) it.tag);
+                        io_uring_prep_read(sqe, w.fd, w.dst, (uint32_t) w.len, (off_t) w.off);
+                        io_uring_sqe_set_data(sqe, (void *) (uintptr_t) w.tag);
                         n_sqe++;
                     }
                     bool submit_fail = !submit_ok;
@@ -730,11 +816,48 @@ static void start_doorbell_worker(llama_context * ctx) {
                         if (ready == -EAGAIN) continue;
                         if (ready < 0) break;
                         const uint64_t ud = (uint64_t) (uintptr_t) io_uring_cqe_get_data(cqe);
-                        const int ci = (int) (ud / 3);
-                        const int r  = (int) (ud % 3);
                         const int res = cqe->res;
                         io_uring_cqe_seen(&ring, cqe);
                         remaining--;
+                        if ((ud & SPAN_TAG) != 0) {
+                            // coalesced span: slice the member experts out of the bounce
+                            const size_t sp_idx = (size_t) (ud & ~SPAN_TAG);
+                            if (sp_idx >= spans.size()) continue;
+                            SpanRec & sp = spans[sp_idx];
+                            const bool span_ok = (res == (int) (sp.fend - sp.fbeg));
+                            for (const SpanItem & it : sp.items) {
+                                if (left[(size_t) it.ci] == 0) continue;
+                                bool ok = span_ok;
+                                if (span_ok) {
+                                    memcpy(it.dst, sp.bounce + (it.foff - sp.fbeg), it.len);
+                                } else {
+                                    // failed/short span read: retry this item synchronously
+                                    const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) it.ci]);
+                                    const int kfd = s[it.r].fd >= 0 ? s[it.r].fd : fd_gguf;
+                                    const size_t want = exp_len[(size_t) it.ci * 3 + (size_t) it.r];
+                                    size_t got = 0;
+                                    while (got < want) {
+                                        const ssize_t rr = pread(kfd, it.dst + got, want - got,
+                                                (off_t) (s[it.r].off + s[it.r].pre + got));
+                                        if (rr <= 0) break;
+                                        got += (size_t) rr;
+                                    }
+                                    ok = got == want;
+                                }
+                                if (!ok) {
+                                    fprintf(stderr, "[doorbell] span item retry failed layer=%d expert=%d role=%d\n",
+                                            il, misses[(size_t) it.ci], it.r);
+                                    read_fail[(size_t) it.ci] = 1;
+                                }
+                                if (--left[(size_t) it.ci] == 0) {
+                                    if (read_fail[(size_t) it.ci]) fail_ci(it.ci);
+                                    else publish_ready(it.ci);
+                                }
+                            }
+                            continue;
+                        }
+                        const int ci = (int) (ud / 3);
+                        const int r  = (int) (ud % 3);
                         if (ci < 0 || ci >= ncopy) continue;
                         if (left[(size_t) ci] == 0) continue;
                         if (res != (int) exp_len[(size_t) ci * 3 + (size_t) r]) {
@@ -958,6 +1081,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             io_uring_queue_exit(&spec_ring);
             free(spec_stage);
         }
+        free(stage_bounce_);
         log_io();
         if (fd_gguf >= 0) {
             close(fd_gguf);
