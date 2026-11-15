@@ -537,3 +537,32 @@ Goal: pure read-only audit of the 125M spin loop, 10.5 GiB empty RAM, and 2.87 G
   - Task 1 outcome: state machine mapped line-by-line: spec_copy set only at llama-context.cpp:618 when (1) spec_layer == il AND prediction->generation == spec_generation, AND (2) expert match AND length match, AND (3) !spec_ready[selected], AND (4) join_spec && spec_pending == selected. drain_spec drains CQEs each outer iteration; remaining-- only on demand CQE dispatch; loop's EAGAIN spin in remaining==0 && spec_copy>=0 is 125M due to drain_spec returning -EAGAIN with zero spec CQEs and spec_pending staying >= 0 forever (spec SQE never submitted for resident experts). Mission-30 fix sketch: track spec_ring_inflight; only wait when spec SQE was actually issued (slot_of < 0 AND not in cache); when spec_pending == -1, exit loop immediately and publish the local miss path instead of blocking. When remaining > 0 always block on io_uring_wait_cqe(&ring). Above: spec_pending == -1 with spec_copy >= 0 must NEVER wait.
   - Task 2 outcome: fd_pack_ used because MOE_CACHE_MIB=0 (arena gone) and fd_pack_buf_ would absorb 4+ GiB page cache without slowing any single read path (mmap-light DMA buffer behavior); this engine uses O_DIRECT to avoid unpredictable eviction (M22 lesson). [moe_audit] buckets: attention=2191 + output=504 + router-gate=240 + shared-expert=240 + TRUE-VRAM=4196 + other=1019 + norms=2 = 8,392 MiB; the ~2.87 GiB remainder is CUDA context + compute scratch + UVA + graph reserve, not model tensors (PLE already dropped). -ub 32 would save ~150-250 MiB compute reserve; nowhere near 4,000=>4,900 slot budget.
   - VERDICT for the audit: architecture unchanged; O_DIRECT+fd packed switchable with a single MOE_IO_DIAG change; PLE dropped permanently on this build.
+
+# betelgeuse-v6.1 - Mission 30
+
+Goal: deadlock-free spec_ring_inflight wait loop to eliminate the 125M EAGAIN spin-poll.
+
+- [x] Task 1 - Implement provably deadlock-free spec_ring_inflight reap loop
+  - Track spec_ring_inflight (increment on io_uring_submit success, decrement per CQE drained in drain_spec); all in the doorbell worker thread.
+  - When remaining > 0: blocking io_uring_wait_cqe(&ring, &cqe); drain_spec() once after wait_cqe returns.
+  - When remaining == 0 && spec_copy >= 0: drain_spec; while spec_copy >= 0 && !spec_ready[selected], wait on spec_ring only when spec_ring_inflight > 0; when spec_ring_inflight == 0, run fallback pread into stage_host, publish, clear spec_copy = -1.
+  - Histogram Bucket 0 records only real < 50 us completed CQEs (never -EAGAIN).
+  - Keep O_DIRECT / MOE_CACHE_MIB=0 unchanged; rebuild; pager harness PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_PROF=1 verification session (exact M28 config & prompts)
+  - MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; --moe-pack-dir; --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931; exact M28 prompts (T=0); log to /home/zyxciss/fluxaeros-data/m30_nospin_bench.log.
+  - Capture live memory.peak, memory.current, memory.events, nvidia-smi VRAM; clean SIGTERM.
+  - Report Bucket 0 count, fallback count, waterfall, TG & PP vs M28 (6.80/7.29/7.05), VRAM, MemoryPeak.
+  - Task 1 outcome: commit 0bd691f45; spec_ring_inflight tracked via += per submitted SQE / -= per CQE drained;
+    reap loop rewritten: remove the EAGAIN peek loop; when remaining > 0 always io_uring_wait_cqe on the demand ring;
+    when remaining == 0 && spec_copy >= 0, drain spec (or wait on spec ring only if spec_ring_inflight > 0, or fallback pread).
+    pager harness PASS 9/9.
+  - Task 2 SESSION RESULTS (unit bel-m30-nospin, exit rc=0 clean):
+    * PARITY BYTE-EXACT everywhere (p1 537a71e9/23328639; p2 acd130f4/912 B; p3 identical).
+    * Bucket0 (<50 us): n=125,095,052 -> **15,206** (-99.99%); bucket2 (150-500us) n=1,687 -> 4,103; bucket1 73 -> 132;
+      bucket3 n=42,508 -> 55,312; bucket4 n=2,751 -> 670. spec_fallback = 1 (one recovery).
+    * TG tok/s (p1/p2/p3): 6.96 / 6.96 / 6.88; graphs reused 197/387/577; PP: 8.30 / 5.81 / 7.49.
+    * Waterfall: plan_us=114,927 plan_sel=9,838 plan_victim=21,725 plan_assign=6,100 victim_us=17,040
+      nvme_us=75,307,950 (+1.97 s vs M28 73.3 s; within variance) kernel_us=1,877,948 ple_us=193,168
+      prekick_us=792 served=22,967 bytes_read=128.99 GB; hit rate 74.47%; prekick overlap ~55.95%.
+    * 0 failed expert reads (44 lines); events.high=0 max=0 oom=0 sock_throttled=0; VRAM = 11,263 MiB;
+      memory.peak = 9,936,617,472 B = 9,475 MiB; current at stop = 9,861,795,840 B = 9,402 MiB.
