@@ -886,10 +886,32 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 spec_copy = -1;
                             }
                         }
-                        if (remaining == 0) continue;
+                        if (remaining == 0) {
+                            if (spec_copy >= 0 && spec_pending >= 0) {
+                                // demand reads all done; spec read in flight: block on spec ring
+                                struct io_uring_cqe * scqe = nullptr;
+                                const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
+                                const int sr = io_uring_wait_cqe(&spec_ring, &scqe);
+                                if (moe_prof_enabled()) {
+                                    const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
+                                    int bucket = 4;
+                                    if (d < 50) bucket = 0;
+                                    else if (d < 150) bucket = 1;
+                                    else if (d < 500) bucket = 2;
+                                    else if (d < 1500) bucket = 3;
+                                    g_moe_prof.cqe_us[bucket] += d;
+                                    g_moe_prof.cqe_n[bucket]++;
+                                }
+                                if (sr >= 0) {
+                                    io_uring_cqe_seen(&spec_ring, scqe);
+                                    drain_spec();
+                                }
+                            }
+                            continue;
+                        }
                         struct io_uring_cqe * cqe = nullptr;
                         const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-                        const int ready = spec_copy >= 0 ? io_uring_peek_cqe(&ring, &cqe) : io_uring_wait_cqe(&ring, &cqe);
+                        const int ready = io_uring_wait_cqe(&ring, &cqe);
                         if (moe_prof_enabled()) {
                             const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                             int bucket = 4;
@@ -900,7 +922,6 @@ static void start_doorbell_worker(llama_context * ctx) {
                             g_moe_prof.cqe_us[bucket] += d;
                             g_moe_prof.cqe_n[bucket]++;
                         }
-                        if (ready == -EAGAIN) continue;
                         if (ready < 0) break;
                         const uint64_t ud = (uint64_t) (uintptr_t) io_uring_cqe_get_data(cqe);
                         const int res = cqe->res;
