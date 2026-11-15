@@ -23,6 +23,7 @@ struct moe_prof_state {
     std::atomic<uint64_t> served{0};
     std::atomic<uint64_t> cqe_n[5] = {};
     std::atomic<uint64_t> cqe_us[5] = {};
+    std::atomic<uint64_t> spec_fallback{0};
     std::atomic<uint64_t> hits[48] = {};
     std::atomic<uint64_t> misses[48] = {};
 };

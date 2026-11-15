@@ -240,6 +240,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         int spec_layer = -1;
         uint32_t spec_generation = 0;
         int spec_count = 0, spec_next = 0, spec_pending = -1;
+        int spec_ring_inflight = 0;
         bool spec_cancel_pending = false;
         int32_t spec_experts[8] = {};
         uint32_t spec_lengths[8] = {};
@@ -311,6 +312,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                 }
                 io_uring_cqe_seen(&spec_ring, completion);
+                if (spec_ring_inflight > 0) spec_ring_inflight--;
             }
         };
 
@@ -327,7 +329,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             }
             if (ok) {
                 spec_cancel_pending = io_uring_submit(&spec_ring) > 0;
-                if (spec_cancel_pending) cancel_requested++;
+                if (spec_cancel_pending) { cancel_requested++; spec_ring_inflight += need; }
             }
         };
 
@@ -837,8 +839,8 @@ static void start_doorbell_worker(llama_context * ctx) {
                     // kernel copies it while the later reads are still in flight
                     int remaining = n_sqe;
                     while ((remaining > 0 || spec_copy >= 0) && ring_ok) {
+                        drain_spec();
                         if (spec_copy >= 0) {
-                            drain_spec();
                             if (spec_pending < 0) {
                                 if (spec_ready[spec_read]) {
                                     memcpy(stage_host + (size_t) spec_copy * stride,
@@ -884,12 +886,73 @@ static void start_doorbell_worker(llama_context * ctx) {
                                     else fail_ci(spec_copy);
                                 }
                                 spec_copy = -1;
+                                continue;
                             }
+                            if (spec_ring_inflight > 0) {
+                                // spec read was submitted but CQ not yet reaped:
+                                // block on spec ring for at least one CQE
+                                struct io_uring_cqe * scqe = nullptr;
+                                const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
+                                const int sr = io_uring_wait_cqe(&spec_ring, &scqe);
+                                if (moe_prof_enabled()) {
+                                    const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
+                                    int bucket = 4;
+                                    if (d < 50) bucket = 0;
+                                    else if (d < 150) bucket = 1;
+                                    else if (d < 500) bucket = 2;
+                                    else if (d < 1500) bucket = 3;
+                                    g_moe_prof.cqe_us[bucket] += d;
+                                    g_moe_prof.cqe_n[bucket]++;
+                                }
+                                if (sr >= 0) {
+                                    io_uring_cqe_seen(&spec_ring, scqe);
+                                    if (spec_ring_inflight > 0) spec_ring_inflight--;
+                                }
+                                continue;
+                            }
+                            // spec_pending >= 0 but no SQE in flight: recover via fallback pread
+                            if (moe_prof_enabled()) g_moe_prof.spec_fallback++;
+                            bool ok = false;
+                            if (ctx->pager.pack_mode()) {
+                                const auto location = locs[(size_t) spec_copy];
+                                size_t got = 0;
+                                while (got < location.len) {
+                                    const ssize_t result = pread(rfd[(size_t) spec_copy],
+                                            stage_host + (size_t) spec_copy * stride + got,
+                                            location.len - got, (off_t) (location.off + got));
+                                    if (result < 0 && errno == EINTR) continue;
+                                    if (result <= 0) break;
+                                    got += (size_t) result;
+                                }
+                                ok = got == location.len;
+                            } else {
+                                const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) spec_copy]);
+                                const size_t want[3] = { gb, ub, db };
+                                const size_t off[3] = { 0, gb, gb + ub };
+                                ok = true;
+                                for (int r = 0; r < 3 && ok; r++) {
+                                    const int kfd = s[r].fd >= 0 ? s[r].fd : fd_gguf;
+                                    size_t got = 0;
+                                    while (got < want[r]) {
+                                        const ssize_t result = pread(kfd,
+                                                stage_host + (size_t) spec_copy * stride + off[r] + got,
+                                                want[r] - got, (off_t) (s[r].off + s[r].pre + got));
+                                        if (result < 0 && errno == EINTR) continue;
+                                        if (result <= 0) break;
+                                        got += (size_t) result;
+                                    }
+                                    ok = got == want[r];
+                                }
+                            }
+                            if (ok) publish_ready(spec_copy);
+                            else fail_ci(spec_copy);
+                            spec_copy = -1;
+                            continue;
                         }
-                        if (remaining == 0) continue;
+                        // remaining > 0 guaranteed here
                         struct io_uring_cqe * cqe = nullptr;
                         const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-                        const int ready = spec_copy >= 0 ? io_uring_peek_cqe(&ring, &cqe) : io_uring_wait_cqe(&ring, &cqe);
+                        const int ready = io_uring_wait_cqe(&ring, &cqe);
                         if (moe_prof_enabled()) {
                             const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                             int bucket = 4;
@@ -900,7 +963,6 @@ static void start_doorbell_worker(llama_context * ctx) {
                             g_moe_prof.cqe_us[bucket] += d;
                             g_moe_prof.cqe_n[bucket]++;
                         }
-                        if (ready == -EAGAIN) continue;
                         if (ready < 0) break;
                         const uint64_t ud = (uint64_t) (uintptr_t) io_uring_cqe_get_data(cqe);
                         const int res = cqe->res;
@@ -1151,6 +1213,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                             }
                             if (n_sqe > 0 && io_uring_submit(&spec_ring) == n_sqe) {
                                 spec_pending = selected;
+                                spec_ring_inflight += n_sqe;
                                 spec_submitted++;
                                 if (io_diag) {
                                     spec_bytes += spec_lengths[selected];
@@ -2769,7 +2832,7 @@ llama_context::~llama_context() {
     if (moe_prof_enabled()) {
         const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
         (void) us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu spec_fallback=%llu\n",
                 (unsigned long long) g_moe_prof.plan_us.load(),
                 (unsigned long long) g_moe_prof.plan_sel_us.load(),
                 (unsigned long long) g_moe_prof.plan_victim_us.load(),
@@ -2783,7 +2846,8 @@ llama_context::~llama_context() {
                 (unsigned long long) g_moe_prof.ple_us.load(),
                 (unsigned long long) g_moe_prof.prekick_us.load(),
                 (unsigned long long) g_moe_prof.served.load(),
-                (unsigned long long) g_moe_prof.bytes_read.load());
+                (unsigned long long) g_moe_prof.bytes_read.load(),
+                (unsigned long long) g_moe_prof.spec_fallback.load());
         for (int i = 0; i < 5; i++) {
             fprintf(stderr, "[moe_prof] cqe_bucket=%d n=%llu us=%llu\n", i,
                     (unsigned long long) g_moe_prof.cqe_n[i].load(),
