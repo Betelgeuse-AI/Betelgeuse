@@ -277,6 +277,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         };
         auto drain_spec = [&]() {
             if (!spec_ok) return;
+            const int64_t t_drain = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
             struct io_uring_cqe * completion = nullptr;
             while (io_uring_peek_cqe(&spec_ring, &completion) == 0) {
                 const uint64_t tag = completion->user_data;
@@ -314,6 +315,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                 io_uring_cqe_seen(&spec_ring, completion);
                 if (spec_ring_inflight > 0) spec_ring_inflight--;
             }
+            if (moe_prof_enabled()) g_moe_prof.nvme_drain_spec_us += (uint64_t) moe_prof_now() - (uint64_t) t_drain;
         };
 
         auto cancel_spec = [&]() {
@@ -459,7 +461,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                         const moe_pager::moe_pack_loc loc = ctx->pager.pack_loc(il, e);
                         locs.push_back(loc);
                         pl->copy_pre[ncopy] = loc.pre;
-                        rfd.push_back(cold && ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : loc.fd);
+                        static int demand_buf = -1;
+                    if (demand_buf < 0) { const char * e = getenv("MOE_DEMAND_BUF"); demand_buf = (e && atoi(e) != 0) ? 1 : 0; }
+                    const int demand_fd = (demand_buf == 1 && ctx->pager.pack_fd_buf() >= 0) ? ctx->pager.pack_fd_buf() : (cold && ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : loc.fd);
+                    rfd.push_back(demand_fd);
                     } else {
                         locs.push_back(moe_pager::moe_pack_loc{-1, 0, 0, 0});
                         pl->copy_pre[ncopy] = 0;
@@ -515,6 +520,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                 done.assign((size_t) ncopy, 0);
 
                 auto publish_ready = [&](int ci, const char * cached = nullptr) {
+                    const int64_t t_pub0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     if (moe_doorbell_dma_enabled() && pl->pad0 && pl->copy_slot[ci] >= 0) {
                         const bool submitted = cached ? moe_doorbell_dma_submit_from(il, ci, cached)
@@ -546,6 +552,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     _mm_sfence(); // push the store out for the UVA/PCIe readers (KICK kernel polls copy_ready)
 #endif
                     done[(size_t) ci] = 1;
+                    if (moe_prof_enabled()) g_moe_prof.nvme_publish_h2d_us += (uint64_t) moe_prof_now() - (uint64_t) t_pub0;
                     // The expert now lives in the VRAM pool, so its page-cache
                     // copy is a duplicate. Drop it to keep the two tiers
                     // exclusive and leave the RAM for the warm tail.
@@ -671,6 +678,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         else { read_fail[(size_t) ci] = 1; fail_ci(ci); }
                     }
                 } else {
+                    const int64_t t_prep0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                     // role-grouped extent coalescing: sweep (1) gate, (2) up,
                     // (3) down, each sorted by file offset; adjacent items with a
                     // small gap merge into one multi-MiB O_DIRECT read into a
@@ -821,6 +829,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         }
                         if (submitted < n_sqe) submit_fail = true;
                     }
+                    if (moe_prof_enabled()) g_moe_prof.nvme_prep_submit_us += (uint64_t) moe_prof_now() - (uint64_t) t_prep0;
                     if (submit_fail) {
                         for (int ci = 0; ci < ncopy; ++ci) {
                             if (left[(size_t) ci] > 0) { read_fail[(size_t) ci] = 1; left[(size_t) ci] = 0; }
@@ -835,8 +844,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         if (left[(size_t) ci] == 0 && ci != spec_copy) fail_ci(ci);
                     }
 
-                    // reap completions and publish each expert as it lands; the
-                    // kernel copies it while the later reads are still in flight
+                    // reap completions and publish each expert as it lands; the kernel copies it while the later reads are still in flight
                     int remaining = n_sqe;
                     while ((remaining > 0 || spec_copy >= 0) && ring_ok) {
                         drain_spec();
@@ -894,6 +902,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 struct io_uring_cqe * scqe = nullptr;
                                 const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                                 const int sr = io_uring_wait_cqe(&spec_ring, &scqe);
+                                if (moe_prof_enabled()) g_moe_prof.nvme_cqe_wait_us += (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                                 if (moe_prof_enabled()) {
                                     const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                                     int bucket = 4;
@@ -953,6 +962,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         struct io_uring_cqe * cqe = nullptr;
                         const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                         const int ready = io_uring_wait_cqe(&ring, &cqe);
+                        if (moe_prof_enabled()) g_moe_prof.nvme_cqe_wait_us += (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                         if (moe_prof_enabled()) {
                             const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                             int bucket = 4;
@@ -1163,10 +1173,12 @@ static void start_doorbell_worker(llama_context * ctx) {
                             int n_sqe = 0;
                             if (ctx->pager.pack_mode()) {
                                 const auto location = ctx->pager.pack_loc(spec_layer, expert);
-                                if (location.fd < 0 || location.len > stride) continue;
+                                const int spec_fd = ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : location.fd;
+                                if (spec_fd < 0 || location.len > stride) continue;
                                 struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
                                 if (!read) break;
-                                io_uring_prep_read(read, location.fd, dst,
+                                // O_DIRECT: mispredicted spec reads must not pollute the page cache
+                                io_uring_prep_read(read, spec_fd, dst,
                                         location.len, (off_t) location.off);
                                 read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
                                 if (spec_async) read->flags |= IOSQE_ASYNC;
@@ -2832,7 +2844,7 @@ llama_context::~llama_context() {
     if (moe_prof_enabled()) {
         const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
         (void) us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu spec_fallback=%llu\n",
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu nvme_prep_submit_us=%llu nvme_drain_spec_us=%llu nvme_publish_h2d_us=%llu nvme_cqe_wait_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu spec_fallback=%llu\n",
                 (unsigned long long) g_moe_prof.plan_us.load(),
                 (unsigned long long) g_moe_prof.plan_sel_us.load(),
                 (unsigned long long) g_moe_prof.plan_victim_us.load(),
@@ -2842,6 +2854,10 @@ llama_context::~llama_context() {
                 (unsigned long long) g_moe_prof.victim_fill_reserve_us.load(),
                 (unsigned long long) g_moe_prof.victim_fill_memcpy_us.load(),
                 (unsigned long long) g_moe_prof.nvme_us.load(),
+                (unsigned long long) g_moe_prof.nvme_prep_submit_us.load(),
+                (unsigned long long) g_moe_prof.nvme_drain_spec_us.load(),
+                (unsigned long long) g_moe_prof.nvme_publish_h2d_us.load(),
+                (unsigned long long) g_moe_prof.nvme_cqe_wait_us.load(),
                 (unsigned long long) g_moe_prof.kernel_us.load(),
                 (unsigned long long) g_moe_prof.ple_us.load(),
                 (unsigned long long) g_moe_prof.prekick_us.load(),
