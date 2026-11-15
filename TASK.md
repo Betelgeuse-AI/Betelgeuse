@@ -578,3 +578,39 @@ Goal: opt-in demand page-cache reads (MOE_DEMAND_BUF=1) and full 100% accountabi
 - [x] Task 2 - One cgroup-wrapped MOE_DEMAND_BUF=1 benchmark (p1/p2/p3 + warm p4 repeat)
   - MOE_DEMAND_BUF=1 MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3 + repeat p4 (LRUCache or repeat p1); log to /home/zyxciss/fluxaeros-data/m31_demand_buf_bench.log.
   - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM; clean SIGTERM; verify parity + 0 failed reads; report histogram shift, the 20.9 s breakdown, TG & PP, VRAM, MemoryPeak, events.high.
+
+# betelgeuse-v6.1 - Mission 32
+
+Goal: forensic split of nvme_prep_submit_us (27.95 s) + standalone io_uring vs pread probe.
+
+- [x] Task 1 - Sub-split nvme_prep_submit_us + standalone io_uring vs pread probe
+  - Split nvme_prep_submit_us into nvme_prep_cpu_us (works/spans build, qsort, coalescing, io_uring_prep_read) and nvme_submit_syscall_us (io_uring_submit only); MOE_PROF prints both.
+  - Print runtime counters rfd_direct_count vs rfd_buf_count; add fd_pack_buf_ mincore/cached-vs-miss counts if clean (zero hot-loop overhead).
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager check; commit locally.
+  - Standalone C++ probe /home/zyxciss/fluxaeros-data/probe_uring_vs_pread.cpp: 1.7 MB blocks from experts.bin; modes: cold O_DIRECT, warm buffered io_uring_prep_read (submit u vs wait u separately), warm buffered pread into WC and cacheable cudaHostAlloc buffers.
+- [x] Task 2 - One cgroup-wrapped MOE_PROF=1 run (p1/p2/p3 T=0)
+  - MOE_DEMAND_BUF=1 MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3; log m32_prep_audit_bench.log; cgroup snapshot; audit md m32_prep_cache_audit.md.
+  - Report: nvme_prep_cpu_us vs nvme_submit_syscall_us; rfd_direct vs rfd_buf; probe numbers; TG/PP; VRAM; MemoryPeak; events.high; 472/472 parity vs M31.
+  - Task 1 outcome (commit 791098f98): [moe_prof] now prints nvme_prep_submit_us, nvme_prep_cpu_us, nvme_submit_syscall_us, rfd_direct_count, rfd_buf_count (plus earlier splits). fd_pack_buf_ mincore/cached-vs-miss handled inside standalone probe (zero hot-path overhead). .test_moe_pager PASS 9/9.
+  - Task 2 SESSION RESULTS (log m32_prep_audit_bench.log):
+    * 27.95 s -> nvme_prep_submit_us = 21,199,252 us = 21.20 s; split:
+      nvme_prep_cpu_us = 5,350 us (0.005 s, SQE build/stable_sort ~ free)
+      nvme_submit_syscall_us = 21,192,646 us (21.19 s, io_uring_submit io-wq block) -> submit path is 100% of prep_submit.
+      nvme_drain_spec_us = 2,664,571 us (2.66 s); nvme_publish_h2d_us = 531,642 us (0.53 s); nvme_cqe_wait_us = 56,397,152 us (56.40 s).
+      nvme_us = 78,195,632 us (78.20 s). Sums check: 21.20 + 2.66 + 0.53 + 56.40 = 80.79 s >= nvme_us (within ~2.6 s of ceiling accounting slack).
+    * rfd_buf_count = 75,485; rfd_direct_count = 0 -> 100% demand reads ride fd_pack_buf_ (page cache); PREKICK spec reads stay on fd_pack_ O_DIRECT.
+    * Standalone probe (/home/zyxciss/fluxaeros-data/probe_uring_vs_pread.cpp, log m32_flapload_probe_out.log), 8 x 1.7 MB blocks from experts.bin:
+      - O_DIRECT cold ring:      avg_submit=4.5 us  avg_wait=1110.5 us  total=1115.4 us
+      - Buffered ring cold:      avg_submit=416.4 us avg_wait=1035.1 us  total=1451.9 us  (forced DONTNEED)
+      - Buffered ring warm:      avg_submit=208.9 us avg_wait=0 us       total=208.9 us   (mincore 425/425 resident)
+      - pread -> WC cudaHostAlloc cold:    1368.0 us avg
+      - pread -> WC cudaHostAlloc warm:     214.0 us avg
+      - pread -> cacheable cudaHostAlloc cold: 1228.8 us avg
+      - pread -> cacheable cudaHostAlloc warm:  157.5 us avg
+      - mincore before: 0/425 (0%); after: 425/425 (100%); pack size 39.43 GiB.
+    * Parity: 472/472 byte-exact (p1 537a71e9/23328639; p2 acd130f4; p3 identical to p1). TG=6.83/6.82/6.73; PP=7.35/5.48/6.81.
+    * 0 failed reads (44 doorbell lines). VRAM=11,263 MiB; MemoryPeak=7,103,209,472 B = 6,774 MiB (lowest ever recorded); events high=0 max=0 oom=0. smaps_rollup Rss=5,927,392 kB.
+    * CQE histogram: bucket2 n=2979 (387 us); bucket3 n=58,126 (931 us); bucket4 n=655 (1,811 us).
+    * EXIT PATH: TERM sent; server did NOT exit within 150 s (CPU ~140% futex_wait); SIGINT exited rc=0. Second consecutive TERM-hang; captured all metrics BEFORE shutdown.
+    * KEY FINDING: buffered fd_pack_buf_ submit path (io-wq congestion) costs 21 s/session (~280 us per miss) AND yields 0 page-cache hits (42 GB working set). M33 candidate: restore O_DIRECT demand reads (MOE_DEMAND_DIRECT=1 opt-in or flip default), killing the 21 s io-wq block; PREKICK stays O_DIRECT.
+  - Full audit: /home/zyxciss/fluxaeros-data/m32_prep_cache_audit.md
