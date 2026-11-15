@@ -621,6 +621,8 @@ bool moe_doorbell_dma_submit(int il, int copy_index) {
     return moe_doorbell_dma_submit_from(il, copy_index, source);
 }
 
+
+
 bool moe_doorbell_dma_store(int il, int slot, char * destination) {
     if (!g_dma_done || !g_stream_h2d || il < 0 || il >= g_n_layer || slot < 0 || !destination) return false;
     const DoorbellPlan & plan = g_plans_host[il];

@@ -176,6 +176,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         char * spec_stage = nullptr;
         // 64 MiB backstop for coalesced O_DIRECT span reads (allocated on first use)
         char * stage_bounce_ = nullptr;
+        void * stage_bounce_orig_ = nullptr;
         size_t stage_bounce_bytes_ = 0;
         if (spec_ok && posix_memalign((void **) &spec_stage, 4096, stride * 8) != 0) {
             io_uring_queue_exit(&spec_ring);
@@ -467,7 +468,8 @@ static void start_doorbell_worker(llama_context * ctx) {
                 auto publish_ready = [&](int ci, const char * cached = nullptr) {
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     if (moe_doorbell_dma_enabled() && pl->pad0 && pl->copy_slot[ci] >= 0) {
-                        const bool submitted = cached ? moe_doorbell_dma_submit_from(il, ci, cached) : moe_doorbell_dma_submit(il, ci);
+                        const bool submitted = cached ? moe_doorbell_dma_submit_from(il, ci, cached)
+                                                      : moe_doorbell_dma_submit(il, ci);
                         if (!submitted) GGML_ABORT("demand DMA submission failed");
                         if (io_diag) {
                             dma_copies++;
@@ -615,8 +617,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                     struct SpanItem { uint64_t foff; uint32_t len; char * dst; int ci; int r; };
                     struct SpanRec { int fd; uint64_t fbeg, fend; char * bounce; std::vector<SpanItem> items; };
                     struct SqeWork { int fd; uint64_t off; char * dst; uint64_t len; uint64_t tag; };
-                    std::vector<SpanRec> spans;
-                    std::vector<SqeWork> works;
+                    // reused across batches to avoid heap growth (peak budget matters)
+                    static std::vector<SpanRec> spans;
+                    static std::vector<SqeWork> works;
+                    spans.clear();
+                    works.clear();
                     works.reserve((size_t) ncopy * 3 + 8);
                     if (io_diag) {
                         if (ctx->pager.pack_mode()) {
@@ -644,7 +649,8 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 stage_host + (size_t) ci * stride, loc.len, (uint64_t) (size_t) ci * 3 });
                         }
                     } else {
-                        std::vector<RoleItem> role_items[3];
+                        static std::vector<RoleItem> role_items[3];
+                        for (auto & v : role_items) v.clear();
                         for (int ci = 0; ci < ncopy; ++ci) {
                             if (left[(size_t) ci] == 0) continue;
                             const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) ci]);
@@ -658,12 +664,14 @@ static void start_doorbell_worker(llama_context * ctx) {
                             }
                         }
                         if (!stage_bounce_) {
-                            const size_t bounce_bytes = (size_t)(64ull << 20);
+                            // CPU-only backstop; 24 MiB keeps memory.peak under MemoryHigh
+                            const size_t bounce_bytes = (size_t)(24ull << 20);
                             void * bp = nullptr;
-                            if (posix_memalign(&bp, 4096, bounce_bytes) != 0) {
+                            if (posix_memalign(&bp, 512, bounce_bytes) != 0) {
                                 GGML_ABORT("coalesce bounce alloc failed");
                             }
                             memset(bp, 0, bounce_bytes);
+                            stage_bounce_orig_ = bp;
                             stage_bounce_ = (char *) bp;
                             stage_bounce_bytes_ = bounce_bytes;
                         }
@@ -688,13 +696,17 @@ static void start_doorbell_worker(llama_context * ctx) {
                                         j++;
                                     } else break;
                                 }
-                                const uint64_t span_bytes = fend - fbeg;
                                 coalesce_items += (long) (j - i + 1);
-                                if (j > i && (fbeg % 512) == 0 && (span_bytes % 512) == 0 &&
+                                // align the span to 512 on both ends: legal on any O_DIRECT
+                                // block device; costs < 1 KiB of extra gap bytes
+                                const uint64_t abeg = fbeg & ~511ULL;
+                                const uint64_t aend = (fend + 511) & ~511ULL;
+                                const uint64_t span_bytes = aend - abeg;
+                                if (j > i &&
                                         bounce_used + span_bytes <= stage_bounce_bytes_) {
                                     SpanRec sp;
                                     sp.fd = v[i].fd;
-                                    sp.fbeg = fbeg; sp.fend = fend;
+                                    sp.fbeg = abeg; sp.fend = aend;
                                     sp.bounce = stage_bounce_ + bounce_used;
                                     bounce_used += span_bytes;
                                     for (size_t k = i; k <= j; ++k) {
@@ -829,6 +841,8 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 if (left[(size_t) it.ci] == 0) continue;
                                 bool ok = span_ok;
                                 if (span_ok) {
+                                    // kernel-copy mode requires stage_host to hold every item;
+                                    // DMA mode ignores it. memcpy keeps both correct.
                                     memcpy(it.dst, sp.bounce + (it.foff - sp.fbeg), it.len);
                                 } else {
                                     // failed/short span read: retry this item synchronously
@@ -1081,7 +1095,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             io_uring_queue_exit(&spec_ring);
             free(spec_stage);
         }
-        free(stage_bounce_);
+        free(stage_bounce_orig_);
         log_io();
         if (fd_gguf >= 0) {
             close(fd_gguf);
