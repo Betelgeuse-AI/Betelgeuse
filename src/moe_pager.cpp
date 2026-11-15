@@ -671,7 +671,10 @@ char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, si
     if (slot < 0) {
         const int base_slot = layer_slot_base_[(size_t) il];
         const int n_slots = layer_slot_count_[(size_t) il];
-        std::vector<char> pinned((size_t) n_slots, 0);
+        thread_local std::vector<char> pinned_tls;
+        std::vector<char> & pinned = pinned_tls;
+        if (pinned.capacity() < (size_t) n_slots) pinned.reserve((size_t) n_slots);
+        pinned.assign((size_t) n_slots, 0);
         for (size_t index = 0; index < count; ++index) {
             const int current = selected[index];
             if (current < 0 || current >= n_expert_) continue;

@@ -328,6 +328,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                 }
 
+                const int64_t t_sel0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 sel.resize((size_t) n);
                 misses.clear();
                 misses.reserve((size_t) n);
@@ -347,6 +348,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                 }
                 std::sort(misses.begin(), misses.end());
                 misses.erase(std::unique(misses.begin(), misses.end()), misses.end());
+                const int64_t t_sel1 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 const DoorbellPrekick * pre_plan = moe_doorbell_prekick_host(il);
                 const bool join_spec = ring_ok && spec_pending >= 0 && spec_layer == il && pre_plan &&
                     pre_plan->generation == spec_generation &&
@@ -374,6 +376,8 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 // pick victims and publish the read plan before the reads start,
                 // so the kernel can copy each expert as soon as its read lands
+                if (moe_prof_enabled()) g_moe_prof.plan_sel_us += (uint64_t) t_sel1 - (uint64_t) t_sel0;
+                const int64_t t_vic2 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 locs.clear();
                 cached_sources.assign(misses.size(), nullptr);
                 int ncopy = 0;
@@ -383,6 +387,8 @@ static void start_doorbell_worker(llama_context * ctx) {
                     g_hot_rank_valid.load(std::memory_order_relaxed);
                 std::vector<char> is_cold;
                 std::vector<int>  rfd;
+                is_cold.reserve(32);
+                rfd.reserve(32);
                 for (size_t mi = 0; mi < misses.size() && ncopy < stage_cap; ++mi) {
                     const int e = misses[mi];
                     const size_t v = ctx->moe.lru.victim(pinned.data(), (size_t) base, (size_t) s_pl);
@@ -445,6 +451,8 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                     ncopy++;
                 }
+                if (moe_prof_enabled()) g_moe_prof.plan_victim_us += (uint64_t) moe_prof_now() - (uint64_t) t_vic2;
+                const int64_t t_as2 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 pl->n_copy = (uint32_t) ncopy;
 
                 for (int j = 0; j < n; ++j) {
@@ -470,6 +478,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                 }
 
                 if (moe_prof_enabled()) {
+                    g_moe_prof.plan_assign_us += (uint64_t) moe_prof_now() - (uint64_t) t_as2;
                     g_moe_prof.plan_us += (uint64_t) moe_prof_now() - (uint64_t) t_plan0;
                     if (misses.size() <= (size_t) n) {
                         g_moe_prof.hits[il] += (uint64_t) ((size_t) n - misses.size());
@@ -498,8 +507,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                     pl->copy_ready[ci] = 1;
 #if defined(__x86_64__) || defined(_M_X64)
-                    _mm_clflush((const void *) (uintptr_t) &pl->copy_ready[ci]);
-                    _mm_sfence();
+                    _mm_sfence(); // push the store out for the UVA/PCIe readers (KICK kernel polls copy_ready)
 #endif
                     done[(size_t) ci] = 1;
                     // The expert now lives in the VRAM pool, so its page-cache
@@ -2761,8 +2769,11 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
     if (moe_prof_enabled()) {
         const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu victim_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
                 (unsigned long long) g_moe_prof.plan_us.load(),
+                (unsigned long long) g_moe_prof.plan_sel_us.load(),
+                (unsigned long long) g_moe_prof.plan_victim_us.load(),
+                (unsigned long long) g_moe_prof.plan_assign_us.load(),
                 (unsigned long long) g_moe_prof.victim_us.load(),
                 (unsigned long long) g_moe_prof.nvme_us.load(),
                 (unsigned long long) g_moe_prof.kernel_us.load(),

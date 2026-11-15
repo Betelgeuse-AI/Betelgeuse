@@ -8,6 +8,9 @@
 
 struct moe_prof_state {
     std::atomic<uint64_t> plan_us{0};
+    std::atomic<uint64_t> plan_sel_us{0};
+    std::atomic<uint64_t> plan_victim_us{0};
+    std::atomic<uint64_t> plan_assign_us{0};
     std::atomic<uint64_t> victim_us{0};
     std::atomic<uint64_t> nvme_us{0};
     std::atomic<uint64_t> kernel_us{0};
