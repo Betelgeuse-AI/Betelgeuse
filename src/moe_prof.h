@@ -13,6 +13,8 @@ struct moe_prof_state {
     std::atomic<uint64_t> plan_assign_us{0};
     std::atomic<uint64_t> victim_us{0};
     std::atomic<uint64_t> victim_fill_us{0};
+    std::atomic<uint64_t> victim_fill_reserve_us{0};
+    std::atomic<uint64_t> victim_fill_memcpy_us{0};
     std::atomic<uint64_t> nvme_us{0};
     std::atomic<uint64_t> kernel_us{0};
     std::atomic<uint64_t> ple_us{0};

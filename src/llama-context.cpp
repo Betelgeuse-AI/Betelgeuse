@@ -485,9 +485,13 @@ static void start_doorbell_worker(llama_context * ctx) {
                     // skip the victim-cache serve path: stage_host does not hold the expert.
                     if (victim_cache && !cached && pl->copy_slot[ci] >= 0) {
                         const int64_t t_fill0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
+                        const int64_t t_res0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                         char * destination = ctx->pager.cache_reserve(il, misses[(size_t) ci], sel.data(), (size_t) n);
+                        if (moe_prof_enabled()) g_moe_prof.victim_fill_reserve_us += (uint64_t) moe_prof_now() - (uint64_t) t_res0;
                         if (destination) {
+                            const int64_t t_cpy0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                             memcpy(destination, stage_host + (size_t) ci * stride + (size_t) pl->copy_pre[(size_t) ci], gb + ub + db);
+                            if (moe_prof_enabled()) g_moe_prof.victim_fill_memcpy_us += (uint64_t) moe_prof_now() - (uint64_t) t_cpy0;
                             victim_saved++;
                         }
                         if (moe_prof_enabled()) g_moe_prof.victim_fill_us += (uint64_t) moe_prof_now() - (uint64_t) t_fill0;
@@ -2756,13 +2760,16 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
     if (moe_prof_enabled()) {
         const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
+        (void) us;
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
                 (unsigned long long) g_moe_prof.plan_us.load(),
                 (unsigned long long) g_moe_prof.plan_sel_us.load(),
                 (unsigned long long) g_moe_prof.plan_victim_us.load(),
                 (unsigned long long) g_moe_prof.plan_assign_us.load(),
                 (unsigned long long) g_moe_prof.victim_us.load(),
                 (unsigned long long) g_moe_prof.victim_fill_us.load(),
+                (unsigned long long) g_moe_prof.victim_fill_reserve_us.load(),
+                (unsigned long long) g_moe_prof.victim_fill_memcpy_us.load(),
                 (unsigned long long) g_moe_prof.nvme_us.load(),
                 (unsigned long long) g_moe_prof.kernel_us.load(),
                 (unsigned long long) g_moe_prof.ple_us.load(),
@@ -2774,7 +2781,6 @@ llama_context::~llama_context() {
                     (unsigned long long) g_moe_prof.hits[il].load(),
                     (unsigned long long) g_moe_prof.misses[il].load());
         }
-        (void) us;
     }
 }
 

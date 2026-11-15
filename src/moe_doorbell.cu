@@ -555,7 +555,13 @@ extern "C" bool moe_doorbell_stage_init(size_t stride, int n_slots) {
     if (stride == 0 || n_slots <= 0 || (size_t) n_slots > SIZE_MAX / stride) return false;
     const size_t bytes = stride * (size_t) n_slots;
     const char * wc_env = getenv("MOE_STAGE_WC");
-    const bool write_combined = !wc_env || atoi(wc_env) != 0;
+    // WC hurts CPU reads of the stage buffer (the stage-to-arena fill memcpys
+    // from it). Default off; MOE_STAGE_WC=1 opts into WC explicitly.
+    const bool write_combined = wc_env && atoi(wc_env) != 0;
+    if (write_combined) {
+        fprintf(stderr, "moe_doorbell_stage_init: WARNING MOE_STAGE_WC=1 with stage-to-arena fill; "
+                        "CPU reads of the stage run at ~0.85 GB/s\n");
+    }
     const unsigned int flags = cudaHostAllocMapped | cudaHostAllocPortable | (write_combined ? cudaHostAllocWriteCombined : 0);
     cudaError_t err = cudaHostAlloc((void **) &g_stage_host, bytes, flags);
     if (err != cudaSuccess) {
@@ -574,8 +580,8 @@ extern "C" bool moe_doorbell_stage_init(size_t stride, int n_slots) {
     g_stage_stride = stride;
     g_stage_cap = n_slots;
     moe_doorbell_dma_init();
-    fprintf(stderr, "moe_doorbell_stage_init: %zu bytes (%d x %zu), dev=%p\n",
-            bytes, n_slots, stride, (void *) g_stage_dev);
+    fprintf(stderr, "moe_doorbell_stage_init: %zu bytes (%d x %zu), dev=%p, WC=%d\n",
+            bytes, n_slots, stride, (void *) g_stage_dev, write_combined ? 1 : 0);
     return true;
 }
 
