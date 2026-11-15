@@ -395,48 +395,6 @@ static void start_doorbell_worker(llama_context * ctx) {
                     if (v == (size_t) -1) break;
                     pinned[v - (size_t) base] = 1;
                     const int old_key = ctx->moe.slot_key[v];
-                    if (victim_cache && moe_doorbell_dma_enabled() && pl->pad0 && old_key >= 0) {
-                        char * destination = ctx->pager.cache_reserve(il, old_key % n_exp, sel.data(), (size_t) n);
-                        if (destination) {
-                            // copy the evicted slot synchronously; a background DMA store
-                            // can race the next H2D rewrite of the slot and poison the arena.
-                            // use the (unrelated) pager worker stream: the legacy default stream
-                            // implicitly syncs with the compute stream, which serializes this
-                            // copy against all pending KICK/H2D work and dominates plan_us.
-                            cudaStream_t d2h_ws = (cudaStream_t) ctx->pager.worker_stream();
-                            const uint64_t srcs[3] = {
-                                pl->dst_gate + (uint64_t) (v - (size_t) base) * pl->gate_bytes,
-                                pl->dst_up   + (uint64_t) (v - (size_t) base) * pl->up_bytes,
-                                pl->dst_down + (uint64_t) (v - (size_t) base) * pl->down_bytes,
-                            };
-                            const uint32_t len[3] = { pl->gate_bytes, pl->up_bytes, pl->down_bytes };
-                            size_t at = 0;
-                            for (int r = 0; r < 3; r++) {
-                                cudaError_t derr = d2h_ws
-                                    ? cudaMemcpyAsync(destination + at,
-                                                      (const void *) (uintptr_t) srcs[r], len[r],
-                                                      cudaMemcpyDeviceToHost, d2h_ws)
-                                    : cudaMemcpy(destination + at,
-                                                 (const void *) (uintptr_t) srcs[r], len[r],
-                                                 cudaMemcpyDeviceToHost);
-                                if (derr != cudaSuccess) {
-                                    fprintf(stderr, "[moe_victim_cache] synchronous store failed: %s\n",
-                                            cudaGetErrorString(derr));
-                                    GGML_ABORT("victim cache store failed");
-                                }
-                                at += len[r];
-                            }
-                            if (d2h_ws) {
-                                cudaError_t serr = cudaStreamSynchronize(d2h_ws);
-                                if (serr != cudaSuccess) {
-                                    fprintf(stderr, "[moe_victim_cache] worker stream sync failed: %s\n",
-                                            cudaGetErrorString(serr));
-                                    GGML_ABORT("victim cache store sync failed");
-                                }
-                            }
-                            victim_saved++;
-                        }
-                    }
                     if (old_key >= 0) ctx->moe.slot_of[(size_t) old_key] = -1;
                     ctx->moe.slot_of[(size_t) il * n_exp + e] = (int) v;
                     ctx->moe.slot_key[v] = il * n_exp + e;
@@ -521,6 +479,18 @@ static void start_doorbell_worker(llama_context * ctx) {
                             dma_copies++;
                             dma_bytes += gb + ub + db;
                         }
+                    }
+                    // back-fill the arena from the stage buffer; the bytes are already
+                    // there, so this avoids a VRAM<->Host round trip on every fill.
+                    // skip the victim-cache serve path: stage_host does not hold the expert.
+                    if (victim_cache && !cached && pl->copy_slot[ci] >= 0) {
+                        const int64_t t_fill0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
+                        char * destination = ctx->pager.cache_reserve(il, misses[(size_t) ci], sel.data(), (size_t) n);
+                        if (destination) {
+                            memcpy(destination, stage_host + (size_t) ci * stride + (size_t) pl->copy_pre[(size_t) ci], gb + ub + db);
+                            victim_saved++;
+                        }
+                        if (moe_prof_enabled()) g_moe_prof.victim_fill_us += (uint64_t) moe_prof_now() - (uint64_t) t_fill0;
                     }
                     pl->copy_ready[ci] = 1;
 #if defined(__x86_64__) || defined(_M_X64)
@@ -2785,13 +2755,14 @@ llama_context::~llama_context() {
     }
     ggml_opt_free(opt_ctx);
     if (moe_prof_enabled()) {
-        const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
+        const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu nvme_us=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu\n",
                 (unsigned long long) g_moe_prof.plan_us.load(),
                 (unsigned long long) g_moe_prof.plan_sel_us.load(),
                 (unsigned long long) g_moe_prof.plan_victim_us.load(),
                 (unsigned long long) g_moe_prof.plan_assign_us.load(),
                 (unsigned long long) g_moe_prof.victim_us.load(),
+                (unsigned long long) g_moe_prof.victim_fill_us.load(),
                 (unsigned long long) g_moe_prof.nvme_us.load(),
                 (unsigned long long) g_moe_prof.kernel_us.load(),
                 (unsigned long long) g_moe_prof.ple_us.load(),
