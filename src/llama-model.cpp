@@ -2543,6 +2543,22 @@ size_t llama_model::drop_mmap_cache() const {
     return total;
 }
 
+size_t llama_model::drop_mmap_cache_tensor(const ggml_tensor * t) const {
+    if (!t) return 0;
+    size_t total = 0;
+    for (auto & m : pimpl->mappings) {
+        if (!m) continue;
+        const char * a = (const char *) m->addr();
+        const size_t sz = m->size();
+        const char * base = (const char *) t->data;
+        if (base && base >= a && base < a + sz) {
+            total += sz;
+            m->drop_cache();
+        }
+    }
+    return total;
+}
+
 void llama_model::advise_mmap_random() const {
     for (auto & m : pimpl->mappings) {
         if (!m) continue;

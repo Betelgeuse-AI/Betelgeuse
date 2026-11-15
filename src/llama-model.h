@@ -967,6 +967,7 @@ struct llama_model {
 
     size_t size() const; // file size
     size_t drop_mmap_cache() const;
+    size_t drop_mmap_cache_tensor(const struct ggml_tensor * t) const; // drop only the mapping holding tensor `t`
     void advise_mmap_random() const;
     size_t n_tensors() const;    size_t n_devices() const;
     const float * tensor_split() const;

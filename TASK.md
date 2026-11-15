@@ -106,3 +106,15 @@ Goal: 100% GGUF-only (0 GB pack), restore 472/472 byte-exact T=0 parity, and mea
   - **Parity restored: p1 binary_search byte-exact vs M9/M10/M11 (md5 537a71e9); p2 LRUCache reasoning + content byte-exact; p3 binary_search warm byte-exact.**
   - p1 binary_search warmup: prompt 58 @ **4.11** tok/s, decode 192 @ **5.03** tok/s | p2 LRUCache (exact M9 prompt): cache_n=0, prompt 11 @ **3.77** tok/s, decode 192 @ **5.12** tok/s | p3 warm: cache_n=48, prompt 10 @ **5.44** tok/s, decode 192 @ **5.18** tok/s | 0 failed reads (whole log).
   - GGUF-only is measurably slower than the pack path (PP 4.11/3.77/5.44 vs M12-pack 7.04/6.64/8.90; TG 5.03/5.12/5.18 vs M10-direct 6.07/6.82/6.32 and M11-direct 5.60/6.17/6.11). Direct .gguf read latency on this run was 1.0-1.24 ms/expert vs M10's 0.57-0.74 - consistent with concurrent NVMe state slowdown more than with code (engine identical, parity verified byte-exact). Timings bounded by NVMe; a single session cannot fully separate these factors.
+
+# betelgeuse-v6.1 - Mission 14
+
+Goal: restore experts.bin + MOE_CACHE_MIB=5120 (0 throttles) and benchmark MOE_PREKICK=1 with spec_cache_hits. 2 tasks; ONE cgroup-wrapped benchmark.
+
+- [ ] Task 1 - Verify PREKICK uses spec_cache_hits + early RAM victim-cache skip on experts.bin
+  - Confirm MOE_PREKICK=1 works on --moe-pack-dir (v4 pack), keeps Rule C demand_arrived preemption, and triggers spec_cache_hits (skip NVMe read for experts already in RAM victim cache).
+  - Constrain PLE mmap (drop PLE shard, keep trunk/expert pages) to keep MemoryPeak <= 13,400 MiB with events.high == 0 at MOE_CACHE_MIB=5120.
+- [ ] Task 2 - Benchmark Conveyor Step 1 (experts.bin + MOE_CACHE_MIB=5120 + MOE_PREKICK=1)
+  - Scope bel-m14-udiq2xs, MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0, UD-IQ2_XS + --moe-pack-dir /home/zyxciss/Models/BIG-MOE/UD-IQ2_XS-pack, --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6, MOE_ARRIVAL_SLACK=0, MOE_HOT_K=0, MOE_CACHE_MIB=5120, MOE_PREKICK=1.
+  - 3-prompt suite (p1 binary_search, p2 LRUCache, p3 binary_search warm; n=192, T=0) -> /home/zyxciss/fluxaeros-data/m14_conveyor_prekick_bench.log.
+  - Report: commit hash; memory.events.high (target 0); MemoryPeak + anon/file split; spec_submitted, spec_cache_hits, spec_reused, inflight_joined, demand_cancelled, read/wait ms/expert; p1/p2/p3 PP & TG tok/s vs M9 (6.38/6.83/6.76 TG, 7.20/7.01/9.28 PP) and M12 (5.94/6.05/5.90 TG, 7.04/6.64/8.90 PP); 472/472 byte-exact parity; 0 failed reads.

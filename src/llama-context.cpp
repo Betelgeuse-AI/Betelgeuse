@@ -2536,6 +2536,14 @@ llama_context::llama_context(
                                 }
                                 model.audit_residency();
                                 model.advise_mmap_random();
+                                // bound the PLE mmap: read lazily, never hot-reused; drop its pages so they don't bloat the cgroup
+                                if (model.per_layer_tok_embd) {
+                                    const size_t ple_dropped = model.drop_mmap_cache_tensor(model.per_layer_tok_embd);
+                                    if (ple_dropped) {
+                                        fprintf(stderr, "[moe_cache] PLE mmap residency released (%.2f MiB)\n",
+                                                (double) ple_dropped / 1048576.0);
+                                    }
+                                }
                                 if (drop) {
                                     const size_t dropped = model.drop_mmap_cache();
                                     const bool dropped_backing = dropped > 0 && pager.pack_mode() && pager.drop_gguf_pages();
