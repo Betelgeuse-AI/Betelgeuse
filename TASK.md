@@ -522,3 +522,18 @@ Goal: eliminate the 119M-call spin-poll loop and verify byte parity on the real 
     bucket0 <50us n=125,095,052 (spec_peek noise even higher because of the wait-dispatch path).
     Honest verdict: the nospin fix is not viable on this engine+hw; M23 baseline is the reference;
     commit neither attempt as merged code.
+
+# betelgeuse-v6.1 - Mission 29
+
+Goal: pure read-only audit of the 125M spin loop, 10.5 GiB empty RAM, and 2.87 GiB VRAM scratch.
+
+- [x] Task 1 - Exact line-by-line state machine of spec_copy / drain_spec / remaining
+  - Trace every path that sets spec_copy >= 0 and prove why it occurred with 0 SQEs in spec_ring.
+  - Design the provably deadlock-free reap loop that eliminates 125M -EAGAIN spin-polls.
+- [x] Task 2 - Audit 10.5 GiB empty host RAM (MemoryPeak = 3,248 MiB) & ~2.87 GiB VRAM scratch
+  - Trace rfd in src/llama-context.cpp and src/moe_pager.cpp: why did demand reads use O_DIRECT (fd_pack_) vs buffered fd_pack_buf_; what would happen with 10+ GiB free reclaimable cgroup RAM.
+  - Inspect m28/m26 load logs + llama-context/ggml_backend_sched allocations to list what takes ~2.87 GiB (11,263 - 8,392 MiB) VRAM outside pool + weights; how much -ub 32 or buffer tuning would recover.
+- [x] Save audit to /home/zyxciss/fluxaeros-data/m29_spin_ram_vram_audit.md; mark TASK.md [x]; commit docs locally on betelgeuse-v6.1.
+  - Task 1 outcome: state machine mapped line-by-line: spec_copy set only at llama-context.cpp:618 when (1) spec_layer == il AND prediction->generation == spec_generation, AND (2) expert match AND length match, AND (3) !spec_ready[selected], AND (4) join_spec && spec_pending == selected. drain_spec drains CQEs each outer iteration; remaining-- only on demand CQE dispatch; loop's EAGAIN spin in remaining==0 && spec_copy>=0 is 125M due to drain_spec returning -EAGAIN with zero spec CQEs and spec_pending staying >= 0 forever (spec SQE never submitted for resident experts). Mission-30 fix sketch: track spec_ring_inflight; only wait when spec SQE was actually issued (slot_of < 0 AND not in cache); when spec_pending == -1, exit loop immediately and publish the local miss path instead of blocking. When remaining > 0 always block on io_uring_wait_cqe(&ring). Above: spec_pending == -1 with spec_copy >= 0 must NEVER wait.
+  - Task 2 outcome: fd_pack_ used because MOE_CACHE_MIB=0 (arena gone) and fd_pack_buf_ would absorb 4+ GiB page cache without slowing any single read path (mmap-light DMA buffer behavior); this engine uses O_DIRECT to avoid unpredictable eviction (M22 lesson). [moe_audit] buckets: attention=2191 + output=504 + router-gate=240 + shared-expert=240 + TRUE-VRAM=4196 + other=1019 + norms=2 = 8,392 MiB; the ~2.87 GiB remainder is CUDA context + compute scratch + UVA + graph reserve, not model tensors (PLE already dropped). -ub 32 would save ~150-250 MiB compute reserve; nowhere near 4,000=>4,900 slot budget.
+  - VERDICT for the audit: architecture unchanged; O_DIRECT+fd packed switchable with a single MOE_IO_DIAG change; PLE dropped permanently on this build.
