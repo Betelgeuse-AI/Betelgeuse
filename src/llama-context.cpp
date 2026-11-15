@@ -471,8 +471,10 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 if (moe_prof_enabled()) {
                     g_moe_prof.plan_us += (uint64_t) moe_prof_now() - (uint64_t) t_plan0;
-                    g_moe_prof.hits[il] += (uint64_t) n_hit;
-                    g_moe_prof.misses[il] += (uint64_t) misses.size();
+                    if (misses.size() <= (size_t) n) {
+                        g_moe_prof.hits[il] += (uint64_t) ((size_t) n - misses.size());
+                        g_moe_prof.misses[il] += (uint64_t) misses.size();
+                    }
                 }
                 // publish the plan and ring the doorbell
                 std::atomic_thread_fence(std::memory_order_seq_cst);

@@ -127,11 +127,12 @@ Goal: restore experts.bin + MOE_CACHE_MIB=5120 (0 throttles) and benchmark MOE_P
 
 Goal: full bottleneck audit - ms/tok waterfall, host-RAM map, per-layer misses, PP/DFlash2 readiness. 2 tasks; ONE profiled cgroup-wrapped benchmark.
 
-- [ ] Task 1 - Code/history audit + MOE_PROF=1 instrumentation
+- [x] Task 1 - Code/history audit + MOE_PROF=1 instrumentation
   - HEAD audit: Expert-Chunked Single-Resolve PP (0219a5f25 / 65-slot sentinel vs 8-token sliced prefill), moe_slot_resolve_sync vs GPU moe_doorbell_resolve_launch, Fate non-uniform cache, DFlash2 (n_rs_seq / extract_layer_inputs), cudaStreamSynchronize / cudaMemcpy sync points per layer.
   - Break down the ~8,240 MiB non-victim host RAM (13,360 - 5,120): staging buffers, experts.bin/Shard 2 page cache, token_embd, dense host mirror, CUDA pinned/UVA, VmRSS vs MemoryPeak.
   - Add lightweight, zero-extra-sync MOE_PROF=1 wall-clock timers + per-layer (blk.0..47) hit/miss counters; partition 100% of PP and TG request ms into: graph_compute_gpu_ms, slot_resolve_sync_ms, victim_cache_lookup_copy_ms, nvme_wait_exposed_ms, h2d_dma_wait_exposed_ms, ple_staging_ms, prekick_overhead_ms, scheduler_server_other_ms (residual).
+  - DONE: `MOE_PROF=1` timers around demand-path plan/victim/nvme/kernel/prekick/PLE phases + per-layer hit/miss counters (`src/moe_prof.h`, `src/llama-context.cpp`, `src/models/qwen4exp.cpp`); destructor dump `[moe_prof]` + per-layer dump keys. Perf overhead ~0 (one branch per ubatch).
   - Rebuild build-v1/bin/bel-server and commit the instrumentation locally.
-- [ ] Task 2 - Run ONE profiled M14 session (experts.bin + MOE_CACHE_MIB=5120 + MOE_PREKICK=1 + MOE_PROF=1) with the exact p1/p2/p3 prompts; sample nvidia-smi (SM/Mem clock, GPU%, power) + /proc/<pid>/smaps_rollup (Rss, Anon, Pss, Shared_Clean, Private_Clean, Private_Dirty) during steady state
-  - Save raw profile log to /home/zyxciss/fluxaeros-data/m15_profile.log and the audit to /home/zyxciss/fluxaeros-data/m15_bottleneck_audit.md with: Table 1 ms/tok & % waterfall PP & TG (sums to 100%), Table 2 host-RAM & VRAM breakdown, Table 3 per-layer hit rate & cold miss distribution, Table 4 PREKICK & DFlash2 audit, ranked root-cause bottlenecks + recommended fixes.
+- [x] Task 2 - Run ONE profiled M14 session (experts.bin + MOE_CACHE_MIB=5120 + MOE_PREKICK=1 + MOE_PROF=1) with the exact p1/p2/p3 prompts; sample nvidia-smi (SM/Mem clock, GPU%, power) + /proc/<pid>/smaps_rollup (Rss, Anon, Pss, Shared_Clean, Private_Clean, Private_Dirty) during steady state
+  - Saved /home/zyxciss/fluxaeros-data/m15_profile.log + /home/zyxciss/fluxaeros-data/m15_bottleneck_audit.md. Key numbers: nvl@~137 ms/tok TG (p1 140.1, p2 135.6, p3 136.0); waterfall 49.2% NVMe wait + 30.5% host plan + 17.0% GPU residual; per-layer blk.03/15/31/32 over-provisioned (miss 518-876), blk.07/10/22/21/13/46 under-served (1890-2217); PLE mmap drop released 27,466 MiB; Peak = 13,402 MiB; events.high == 0; parity byte-exact.
   - Mark TASK.md [x], commit locally, paste concise tables + verdict.
