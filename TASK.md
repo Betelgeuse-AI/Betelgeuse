@@ -566,3 +566,15 @@ Goal: deadlock-free spec_ring_inflight wait loop to eliminate the 125M EAGAIN sp
       prekick_us=792 served=22,967 bytes_read=128.99 GB; hit rate 74.47%; prekick overlap ~55.95%.
     * 0 failed expert reads (44 lines); events.high=0 max=0 oom=0 sock_throttled=0; VRAM = 11,263 MiB;
       memory.peak = 9,936,617,472 B = 9,475 MiB; current at stop = 9,861,795,840 B = 9,402 MiB.
+
+# betelgeuse-v6.1 - Mission 31
+
+Goal: opt-in demand page-cache reads (MOE_DEMAND_BUF=1) and full 100% accountability of nvme_us.
+
+- [x] Task 1 - MOE_DEMAND_BUF=1 opt-in + sub-time the 20.9 s non-wait gap inside nvme_us
+  - Add MOE_DEMAND_BUF=1 env (default 0, keep M30 O_DIRECT unchanged by default) routing demand rfd through fd_pack_buf_ (O_RDONLY buffered page cache), keeping PREKICK reads on fd_pack_ O_DIRECT (mispredicted spec reads do not pollute page cache), zero DtoH, zero victim_fill memcpy.
+  - Under MOE_PROF=1, split non-CQE-wait portion of nvme_us (75.31 s - 54.4 s = 20.9 s) into nvme_prep_submit_us, nvme_drain_spec_us, nvme_publish_h2d_us so cqe_wait_us + prep_submit_us + drain_spec_us + publish_h2d_us accounts for 100% of nvme_us.
+  - Rebuild build-v1/bin/bel-server; verify .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_DEMAND_BUF=1 benchmark (p1/p2/p3 + warm p4 repeat)
+  - MOE_DEMAND_BUF=1 MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3 + repeat p4 (LRUCache or repeat p1); log to /home/zyxciss/fluxaeros-data/m31_demand_buf_bench.log.
+  - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM; clean SIGTERM; verify parity + 0 failed reads; report histogram shift, the 20.9 s breakdown, TG & PP, VRAM, MemoryPeak, events.high.
