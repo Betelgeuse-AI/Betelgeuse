@@ -614,3 +614,15 @@ Goal: forensic split of nvme_prep_submit_us (27.95 s) + standalone io_uring vs p
     * EXIT PATH: TERM sent; server did NOT exit within 150 s (CPU ~140% futex_wait); SIGINT exited rc=0. Second consecutive TERM-hang; captured all metrics BEFORE shutdown.
     * KEY FINDING: buffered fd_pack_buf_ submit path (io-wq congestion) costs 21 s/session (~280 us per miss) AND yields 0 page-cache hits (42 GB working set). M33 candidate: restore O_DIRECT demand reads (MOE_DEMAND_DIRECT=1 opt-in or flip default), killing the 21 s io-wq block; PREKICK stays O_DIRECT.
   - Full audit: /home/zyxciss/fluxaeros-data/m32_prep_cache_audit.md
+
+# betelgeuse-v6.1 - Mission 33
+
+Goal: enable MOE_DEMAND_DIRECT=1 (O_DIRECT fd_pack_ for demand reads) to eliminate the 21.19 s io-wq submit stall measured in M32.
+
+- [x] Task 1 - Add MOE_DEMAND_DIRECT=1 (fd_pack_ O_DIRECT) & check 6.77 GiB page-cache / SIGTERM hang
+  - In src/llama-context.cpp, wire MOE_DEMAND_DIRECT=1: demand rfd[] in pack mode uses fd_pack_ (O_DIRECT); verify 4 KiB alignment of pack offsets and stage_host; keep MOE_DEMAND_BUF=1 working as explicit opt-in.
+  - Read-only inspection (note in TASK.md): why fd_pack_buf_ only accumulated ~0.8 GiB page cache in M32 (MemoryPeak 6,774 MiB; MOE_DROP_MMAP default? fadvise? LRU?); why SIGTERM hung in futex_wait on exit in M31/M32 while SIGINT exited rc=0.
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_DEMAND_DIRECT=1 benchmark (p1/p2/p3 T=0)
+  - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; experts.bin; --moe-slots 4000; -ub 64; -np 1; -c 512; -t 6; --port 9931; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m33_demand_direct_bench.log.
+  - Capture memory.peak/current/events, nvidia-smi VRAM before clean stop (SIGTERM, fallback SIGINT only if needed); rfd_direct_count > 0, rfd_buf_count == 0; 472/472 parity vs M32; report [moe_prof] waterfall, CQE histogram, TG/PP, VRAM, MemoryPeak, 6.77 GiB + SIGTERM findings.
