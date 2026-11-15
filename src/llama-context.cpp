@@ -102,6 +102,17 @@ size_t moe_doorbell_stage_stride();
 int moe_doorbell_stage_cap();
 }
 
+// page-cache retention: dropping expert pages is opt-in via MOE_DROP_MMAP=1;
+// default keeps the warm tier resident so buffered io_uring stays fast
+static bool moe_drop_pages() {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("MOE_DROP_MMAP");
+        on = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return on == 1;
+}
+
 static std::atomic<bool> g_doorbell_running{false};
 static std::thread g_doorbell_thread;
 static std::atomic<bool> g_hot_rank_valid{false};
@@ -485,7 +496,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     // The expert now lives in the VRAM pool, so its page-cache
                     // copy is a duplicate. Drop it to keep the two tiers
                     // exclusive and leave the RAM for the warm tail.
-                    if (ctx->pager.pack_mode() && (ctx->hot_k > 0 || (victim_cache && pl->pad0 && moe_doorbell_dma_enabled()))) {
+                    if (moe_drop_pages() && ctx->pager.pack_mode() && (ctx->hot_k > 0 || (victim_cache && pl->pad0 && moe_doorbell_dma_enabled()))) {
                         const moe_pager::moe_pack_loc & l = locs[(size_t) ci];
                         if (l.fd >= 0) {
                             posix_fadvise(l.fd, (off_t) l.off, (off_t) l.len, POSIX_FADV_DONTNEED);
@@ -1624,7 +1635,7 @@ static void moe_cache_scan(llama_context * ctx, const char * tag, bool drop_dup)
             if (ram)  n_ram++;
             if (vram && ram) n_both++;
             if (warm) { n_warm++; if (ram) n_warm_ram++; }
-            if (drop_dup && vram && ram) {
+            if (drop_dup && moe_drop_pages() && vram && ram) {
                 if (posix_fadvise(loc.fd, (off_t) loc.off, (off_t) loc.len, POSIX_FADV_DONTNEED) == 0) {
                     dropped += (double) loc.len;
                 }
@@ -1693,20 +1704,17 @@ void llama_context::moe_hot_cycle(int fd) {
 static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud);
 
 
-// Non-uniform "Arrival Slack" slot allocation (Pillar 2)
+// Non-uniform "Arrival Slack" slot allocation: early layers need the most
+// over-booking (no prior slack at t=0), tail layers need the least.
+// UD-IQ2_XS profile (48 layers): 960 + 2812 + 230 = 4,002 slots.
 static int g_moe_slots_total = 0; // 0 = fixed table; else scaled total
 static inline int moe_fixed_slots(int il, int n_layer) {
-    static const bool profiled = [] {
-        const char * env = getenv("MOE_POOL_PROFILE");
-        return !env || atoi(env) != 0;
-    }();
-    static const int profiled_slots[48] = {
-        220, 220, 220, 220, 220, 120, 136, 120, 80, 80, 80, 80,
-        128, 80, 80, 80, 80, 88, 120, 80, 80, 96, 136, 80,
-        80, 80, 96, 80, 112, 80, 80, 80, 80, 80, 112, 80,
-        80, 88, 128, 80, 80, 80, 88, 80, 80, 80, 80, 88,
-    };
-    if (profiled && n_layer == 48 && il >= 0 && il < n_layer) return profiled_slots[il];
+    if (n_layer == 48) {
+        if (il >= 0 && il < 5)  return 192;  // 960
+        if (il >= 5 && il < 43) return 74;   // 2812
+        if (il >= 43 && il < n_layer) return 46; // 230
+        return 74;
+    }
     if (il >= 0 && il < 5) return 220;
     if (il >= 5 && il < 43) return 92;
     if (il >= 43 && il < n_layer) return 80;
@@ -2510,7 +2518,7 @@ llama_context::llama_context(
                                 static int drop = -1;
                                 if (drop < 0) {
                                     const char * e = getenv("MOE_DROP_MMAP");
-                                    drop = (!e || atoi(e) != 0) ? 1 : 0;
+                                    drop = (e && atoi(e) != 0) ? 1 : 0;
                                 }
                                 model.audit_residency();
                                 model.advise_mmap_random();

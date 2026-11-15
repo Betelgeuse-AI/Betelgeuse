@@ -69,3 +69,18 @@ Goal: direct-GGUF prefill parity via role-grouped coalesced O_DIRECT reads + MOE
   - Parity: p1/p3 **byte-exact 472/472**; LRUCache reasoning+content byte-exact vs M9; p4 coherent.
   - PREKICK audit (M10, 53.6% = 9,546/17,795): pre-attention logits predict the post-attention top-10 at only ~55% overlap (weak signal, not a parameter bug - the KICK must wait for attention+GDN before the true router runs); M10's spec path ALSO lacked the victim-cache skip, so many correct predictions still burned NVMe on experts the demand would have served from the arena (~16,831 such predictions in M11's run avoided NVMe via the new `spec_cache_hits` probe) - most of the ~46% waste is (a) weak pre-attention signal, (b) arena-satisfiable predictions, (c) demand pre-emption cancelling spec reads (cancel_requested=7,175).
   - ~7.5 GiB non-cache Host-RAM audit (MemoryPeak minus 6,144 MiB arena): memory.stat shows anon=6.83 GB + file=7.11 GB + kernel=40 MB. Components: victim arena 6,144 MiB + host pinned stages (doorbell 152 MiB + host_pool ~174 MiB + spec_stage 17 MB + LRU/shadow) ~0.4 GB + heap/CUDA-driver internal pinned ~1.5-2 GB + PLE/embedding mmap hot pages + GGUF page-cache shares charged to the cgroup ~4-4.5 GB (moe_audit: routed-experts HOST 40,325 MiB; embeddings 27,466 MiB - the resident hot slice of those is the page-cache component).
+
+# betelgeuse-v6.1 - Mission 12
+
+Goal: kill the 73,840 cgroup throttles (MemoryHigh=13824M), restore page-cache absorption (Fix #2), port Arrival-Slack slot allocation (Fix #3, ~4,002 slots). ONE cgroup-wrapped benchmark on UD-IQ2_XS + pack.
+
+- [ ] Task 1 - Kill memory.events.high throttles + restore buffered page-cache absorption (Fix #2)
+  - Demand expert reader stays buffered io_uring (fd_gguf = O_RDONLY, pack_fd_buf for warm misses; cold tail may stay O_DIRECT).
+  - Gate all `posix_fadvise(..., POSIX_FADV_DONTNEED)` calls behind `MOE_DROP_MMAP` (default OFF); keep PLE mmap lazily faulted + bounded with MADV_RANDOM; stop releasing residency.
+  - Launch benchmark without `MOE_DROP_MMAP=1`; lower `MOE_CACHE_MIB` 6144 -> 3072 (or 2048 if events.high > 0); target `memory.events.high == 0`.
+- [ ] Task 2 - Port Arrival-Slack slot allocation (Fix #3, 4,002 slots) on UD-IQ2_XS
+  - Replace uniform per-layer slot table: layers 0..4 = 192 slots/layer (960), layers 5..42 = 74 (2,812), layers 43..47 = 46 (230). Total 4,002.
+  - Verify variable per-layer `s_pl` end-to-end: pool tensors sized `s_pl_il + 1`, slot_table sentinel = `s_pl_il`, doorbell plan `s_pl` per layer, LRU sized over the 4,002-slot range - no OOB indexing.
+- [ ] Benchmark (ONE cgroup-wrapped scope `bel-m12-udiq2xs`, MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0, `--moe-slots 4002 -ub 64 -np 1 -c 512 -t 6`, `MOE_PREKICK=0`, `MOE_HOT_K=0`, `MOE_CACHE_MIB=3072`, `--moe-pack-dir /home/zyxciss/Models/BIG-MOE/UD-IQ2_XS-pack`, NO `MOE_DROP_MMAP`)
+  - Same 3-prompt suite (p1 binary_search 58-tok warmup, p2 exact M9 "Write a Python LRUCache class" prompt, p3 binary_search 16-tok warm; n=192, T=0).
+  - Report: commit hash, `memory.events.high` (must be 0 vs M11's 73,840), MemoryPeak, anon/file split, slot hit % (vs M9's 73-74%), physical SSD MiB/token, read/wait ms/expert, p1/p2/p3 PP & TG tok/s (vs M9 6.38/6.83/6.76 TG and M11 5.60/6.17/6.11 TG), 472/472 byte-exact `binary_search` parity, 0 failed reads.
