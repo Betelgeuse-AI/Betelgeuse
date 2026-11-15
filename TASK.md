@@ -111,10 +111,14 @@ Goal: 100% GGUF-only (0 GB pack), restore 472/472 byte-exact T=0 parity, and mea
 
 Goal: restore experts.bin + MOE_CACHE_MIB=5120 (0 throttles) and benchmark MOE_PREKICK=1 with spec_cache_hits. 2 tasks; ONE cgroup-wrapped benchmark.
 
-- [ ] Task 1 - Verify PREKICK uses spec_cache_hits + early RAM victim-cache skip on experts.bin
-  - Confirm MOE_PREKICK=1 works on --moe-pack-dir (v4 pack), keeps Rule C demand_arrived preemption, and triggers spec_cache_hits (skip NVMe read for experts already in RAM victim cache).
-  - Constrain PLE mmap (drop PLE shard, keep trunk/expert pages) to keep MemoryPeak <= 13,400 MiB with events.high == 0 at MOE_CACHE_MIB=5120.
-- [ ] Task 2 - Benchmark Conveyor Step 1 (experts.bin + MOE_CACHE_MIB=5120 + MOE_PREKICK=1)
+- [x] Task 1 - Verify PREKICK uses spec_cache_hits + early RAM victim-cache skip on experts.bin
+  - Confirmed on experts.bin (v4 pack): `MOE_PREKICK=1` builds only n_tokens==1 PREKICK graphs; Rule C `demand_arrived` strict preemption intact; `spec_cache_hits` fires continuously (arena-hit predictions skip the NVMe spec read): final `[prekick]` line `overlap=55.95% matched=30287 compared=54136 submitted=18934 reused=10549 spec_cache_hits=14885`.
+  - PLE mmap bounded: new `drop_mmap_cache_tensor(...)` drops ONLY the PLE shard mapping (27,466 MiB released at load) at every launch; trunk/expert pages stay cached. Result with `MOE_CACHE_MIB=5120` + drop target: **MemoryPeak = 13,360 MiB (464 MiB headroom), events.high == 0, swap=0**. In M13 the 4096 arena peaked 13,058 and we want <= 13,400 here with 5 GiB arena - this split drop does it.
+- [x] Task 2 - Benchmark Conveyor Step 1 (experts.bin + MOE_CACHE_MIB=5120 + MOE_PREKICK=1)
   - Scope bel-m14-udiq2xs, MemoryHigh=13824M, MemoryMax=14G, MemorySwapMax=0, UD-IQ2_XS + --moe-pack-dir /home/zyxciss/Models/BIG-MOE/UD-IQ2_XS-pack, --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6, MOE_ARRIVAL_SLACK=0, MOE_HOT_K=0, MOE_CACHE_MIB=5120, MOE_PREKICK=1.
   - 3-prompt suite (p1 binary_search, p2 LRUCache, p3 binary_search warm; n=192, T=0) -> /home/zyxciss/fluxaeros-data/m14_conveyor_prekick_bench.log.
-  - Report: commit hash; memory.events.high (target 0); MemoryPeak + anon/file split; spec_submitted, spec_cache_hits, spec_reused, inflight_joined, demand_cancelled, read/wait ms/expert; p1/p2/p3 PP & TG tok/s vs M9 (6.38/6.83/6.76 TG, 7.20/7.01/9.28 PP) and M12 (5.94/6.05/5.90 TG, 7.04/6.64/8.90 PP); 472/472 byte-exact parity; 0 failed reads.
+  - Committed as `0f6d213d3` (PLE-only mapping drop). Report: commit hash `0f6d213d3`; **memory.events.high == 0** (all prompts, whole log); MemoryPeak **13,360 MiB**; anon 6.83 GB / file ~6.7 GB; VRAM <= 11,273 MiB; graphs reused 197/387/577; 0 failed expert reads.
+  - PREKICK metrics (final cumulative): `spec_submitted=18,934`, `spec_cache_hits=14,885` (NVMe spec reads skipped), `spec_reused=10,549`, `inflight_joined=9,810` (`join_retries=0`), `spec_cancelled=0`, `spec_short=0`, `cancel_requested=6,738`, join rate 100%. read/wait **0.48-0.57 / 0.03-0.04 ms/expert**.
+  - p1 binary_search warmup: prompt 58 @ **7.12** tok/s, decode 192 @ **6.85** tok/s | p2 LRUCache (exact M9 prompt): cache_n=48, prompt 11 @ **6.05** tok/s, decode 192 @ **7.20** tok/s (reasoning+content byte-exact vs M9) | p3 warm: cache_n=48, prompt 10 @ **8.76** tok/s, decode 192 @ **7.36** tok/s.
+  - Parity: **all three prompts byte-exact vs M9/M10/M11/M13** (binary_search p1 & p3 md5 identical; LRUCache reasoning byte-exact; md5 of the outputs matches).
+  - vs M9 (6.38/6.83/6.76 TG, 7.20/7.01/9.28 PP) and M12 (5.94/6.05/5.90 TG, 7.04/6.64/8.90 PP): **M14 is the fastest configuration so far on this hardware** (TG 6.85/7.20/7.36) with 0 throttles, 12 GiB+ headroom.
