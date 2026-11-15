@@ -295,3 +295,37 @@ Goal: read-only triage of the shutdown SIGSEGV (107239), inclusive-cache hit dro
   - Ranked Mission 22 candidates: (A) MOE_CACHE_MIB=0 fd_pack_buf_ absorb, byte-exact, TG ~5.0-5.5, safest baseline; (B) MOE_CACHE_MIB=7168-8192 - rejected (peak would
     exceed MemoryHigh); (C) selective hot-skip admission on arrival fill, ~18-25k hits target, zero DtoH; (D) async VRAM-eviction DtoH with fence-at-read, M16 policy at ~0 sync;
     (E) keep M20 as-is; (M22) also ship the [moe_prof] early-flush + crash handler first.
+
+# betelgeuse-v6.1 - Mission 22
+
+Goal: early [moe_prof] flush + MOE_CRASH_TRACE=1 backtrace; one cgroup-wrapped M15/M16-config run without MOE_DROP_MMAP=1.
+
+- [x] Task 1 - Guarantee [moe_prof] flush + MOE_CRASH_TRACE=1 signal backtrace (build build-v1/)
+  - Move the [moe_prof] waterfall dump to the very beginning of ~llama_context() (before synchronize(), moe_doorbell_free, io_thr join, predictor teardown).
+  - Add an env-gated MOE_CRASH_TRACE=1 signal handler (SIGSEGV / SIGABRT) writing backtrace() raw frames to STDERR_FILENO and _exit(128 + sig(no heap allocations in the handler); no teardown order changes; zero /tmp.
+  - Rebuild build-v1/bin/bel-server; verify test_moe_pager; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_PROF=1 run (M20 WC=0, no MOE_DROP_MMAP=1)
+  - MOE_STAGE_WC=0 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_CACHE_MIB=5120 MOE_PROF=1 MOE_CRASH_TRACE=1;
+    NO MOE_DROP_MMAP=1; experts.bin --moe-pack-dir; --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931; exact p1/p2/p3 prompts (T=0);
+    log to /home/zyxciss/fluxaeros-data/m22_wc0_nodrop_bench.log.
+  - Before stopping, capture memory.peak, memory.current, memory.events (high/max/oom), nvidia-smi VRAM; then stop with SIGTERM.
+  - Report full [moe_prof] waterfall, TG & PP, read ms/expert, victim_cache hits/bytes, VRAM, MemoryPeak, memory.events.high, 0 failed reads,
+    p1/p2/p3 parity hashes, MOE_CRASH_TRACE backtrace if the exit SIGSEGV triggers.
+  - Task 1 outcome: DONE (commit 21b2acd49). [moe_prof] dump moved to the START of ~llama_context() (before synchronize()/frees);
+    MOE_CRASH_TRACE=1 installs SIGSEGV/SIGABRT handlers (install at llama_context ctor top) writing raw frame addresses to stderr with
+    zero heap allocation (plain write()+backtrace(); resolve with gdb/addr2line); pager harness PASS 9/9; bel-server rebuilt.
+  - Task 2 SESSION RESULTS (unit bel-m22-wc0, MOE_CRASH_TRACE=1, NO MOE_DROP_MMAP=1; log m22_wc0_nodrop_bench.log; exit rc=0 CLEAN,
+    exit SIGSEGV did NOT reproduce this run - crash-trace handler never fired, no backtrace captured):
+    - WATERFALL ([moe_prof] NOW CAPTURED via early flush): plan_us=102,774 plan_sel_us=10,404 plan_victim_us=22,851 plan_assign_us=6,373
+      victim_us=223,650 victim_fill_us=25,049,362 (~380.9 us/fill; reserve 108,336 us = 0.4% ~= 1.65 us/fill; memcpy 24,895,973 us = 99.6%)
+      nvme_us=77,412,736 (~1,038 us/miss) kernel_us=393,891 ple_us=133,062 prekick_us=92,899 served=22,927 bytes_read=127.36 GB.
+      plan_victim_us 27,317,948 -> 22,851 (-99.92%). Fill is ~17x faster than M18 WC stage (149 s) and ~2% slower wall than M16 (27.32 s inside plan phase).
+    - TG tok/s (p1/p2/p3): 6.98 / 7.26 / 6.93; PP: 6.72 / 5.09 / 5.84; graphs reused 197/387/577; read= mean 1.04 ms/expert (fill is inside the reap loop).
+    - PARITY: p1 byte-exact (537a71e9/23328639); p3 byte-exact; p2 content identical (empty) but reasoning DIVERGES at byte 473
+      (888 B vs M16's 912 B; md5 b0b3501c; 4th distinct LRUCache trajectory across builds; p1/p3 stable across all builds since M14).
+    - memory.peak = 13,950,599,168 B = 13,305 MiB (< 13824M); memory.current at stop = 13,770,379,264 B = 13,131 MiB;
+      events: high=0 max=0 oom=0; VRAM = 11,273 MiB (< 11,750); 0 failed expert reads (44 lines failed=0); SM 100% util at sample.
+    - victim-cache traffic: saved=65,756 hits=9,171 bytes=14.38 GB cache_evict=53,393; decode hit~74.4%; prekick overlap~55.8% spec_cache_hits=4,925-5,067.
+    - Honest verdict: speed restored to M16 level with WC=0 + no MOE_DROP_MMAP=1, BUT the [moe_prof] fill cost now sits inside the reap loop,
+      so read=1.04 ms/expert (+~0.4 ms/fill over page-cache absorption); TG about equal to M16 (6.98/7.26/6.93 vs 6.95/7.40/7.40);
+      arena defender still suffers the arrival-fill duplication (10,075 -> 9,171 hits); p2 ulp near-tie flips again (position moved 440 -> 473).
