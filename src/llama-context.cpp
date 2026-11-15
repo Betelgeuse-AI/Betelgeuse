@@ -34,7 +34,6 @@
 #include <thread>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <poll.h>
 #include <sys/stat.h>
 #include <cuda_runtime.h>
 #include <liburing.h>
@@ -887,15 +886,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 spec_copy = -1;
                             }
                         }
-                        // block on whichever ring has a CQE ready
-                        struct pollfd pfds[2];
-                        pfds[0].fd = ring.ring_fd;
-                        pfds[0].events = POLLIN;
-                        pfds[1].fd = spec_ok ? spec_ring.ring_fd : -1;
-                        pfds[1].events = POLLIN;
-                        const int nfds = spec_ok ? 2 : 1;
+                        if (remaining == 0) continue;
+                        struct io_uring_cqe * cqe = nullptr;
                         const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-                        (void) poll(pfds, nfds, -1);
+                        const int ready = spec_copy >= 0 ? io_uring_peek_cqe(&ring, &cqe) : io_uring_wait_cqe(&ring, &cqe);
                         if (moe_prof_enabled()) {
                             const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                             int bucket = 4;
@@ -906,11 +900,8 @@ static void start_doorbell_worker(llama_context * ctx) {
                             g_moe_prof.cqe_us[bucket] += d;
                             g_moe_prof.cqe_n[bucket]++;
                         }
-                        if (spec_ok && (pfds[1].revents & POLLIN)) drain_spec();
-                        if (!(pfds[0].revents & POLLIN)) continue;  // only the spec fired; re-poll
-                        struct io_uring_cqe * cqe = nullptr;
-                        const int ready = io_uring_wait_cqe(&ring, &cqe);
-                        if (ready == -EAGAIN || ready < 0) continue;
+                        if (ready == -EAGAIN) continue;
+                        if (ready < 0) break;
                         const uint64_t ud = (uint64_t) (uintptr_t) io_uring_cqe_get_data(cqe);
                         const int res = cqe->res;
                         io_uring_cqe_seen(&ring, cqe);
