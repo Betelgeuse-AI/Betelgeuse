@@ -461,9 +461,18 @@ static void start_doorbell_worker(llama_context * ctx) {
                         const moe_pager::moe_pack_loc loc = ctx->pager.pack_loc(il, e);
                         locs.push_back(loc);
                         pl->copy_pre[ncopy] = loc.pre;
-                        static int demand_buf = -1;
+                        static int demand_buf = -1, demand_direct = -1;
                     if (demand_buf < 0) { const char * e = getenv("MOE_DEMAND_BUF"); demand_buf = (e && atoi(e) != 0) ? 1 : 0; }
-                    const int demand_fd = (demand_buf == 1 && ctx->pager.pack_fd_buf() >= 0) ? ctx->pager.pack_fd_buf() : (cold && ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : loc.fd);
+                    if (demand_direct < 0) { const char * e = getenv("MOE_DEMAND_DIRECT"); demand_direct = (e && atoi(e) != 0) ? 1 : 0; }
+                    int demand_fd;
+                    if (demand_direct == 1 && ctx->pager.pack_fd() >= 0) {
+                        // O_DIRECT fd_pack_: skip io-wq congestion entirely
+                        demand_fd = ctx->pager.pack_fd();
+                    } else if (demand_buf == 1 && ctx->pager.pack_fd_buf() >= 0) {
+                        demand_fd = ctx->pager.pack_fd_buf();
+                    } else {
+                        demand_fd = cold && ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : loc.fd;
+                    }
                     rfd.push_back(demand_fd);
                     if (moe_prof_enabled()) {
                         if (demand_fd == ctx->pager.pack_fd()) g_moe_prof.rfd_direct_count++;
