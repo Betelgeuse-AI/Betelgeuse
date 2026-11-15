@@ -206,3 +206,27 @@ Goal: eliminate the 27.32 s PCIe DtoH victim-cache back-fill; fill victim_cache 
       M16-verified byte-exact state (7004670dd). Recommended: investigate with thread-level sub-timers inside
       publish_ready (reserve vs memcpy vs NUMA locality) in a separate mission; only re-enable a stage-fill path
       after parity re-verification AND TG parity with M16.
+
+# betelgeuse-v6.1 - Mission 19
+
+Goal: pure read-only audit of the Mission 18 failure (2,011 us/fill, byte-135 parity break, MOE_CACHE_MIB=0).
+
+- [x] Task 1 - Forensic audit of bbbd75de0 (2,011 us/fill & T=0 nondeterminism)
+  - Inspect git show bbbd75de0 vs moe_doorbell_stage_init (stage_host allocation flags), moe_pager.cpp:init_cache (mmap / madvise / fault state), and the 208 us standalone probe.
+  - Pinpoint exactly why in-session victim_fill_us averaged ~2,011 us/fill (~0.85 GB/s).
+  - Trace bbbd75de0 line-by-line for the exact cause of the byte-135 failure and intra-session p1 vs p3 nondeterminism (stage-slot reuse race, concurrent H2D DMA vs CPU memcpy, cache_reserve/cache_find offset/role mismatch, stage_cap/pinning bug).
+- [x] Task 2 - Audit read = 2.26-2.64 ms/expert gap & MOE_CACHE_MIB=0
+  - Inspect m18_stage_victim_bench.log vs m16 logs and src/llama-context.cpp read timing boundaries: was read=2.26-2.64 ms/expert inflated by victim_fill_us inside the CQE reap loop, or caused by cold fd_pack_buf_ page cache (and check page-cache state across M14/M15/M16).
+  - Trace exact code behavior at HEAD (7004670dd/af96190b3) for MOE_CACHE_MIB=0 (no code changes: zero DtoH back-fill, zero 5 GiB duplicate arena, fd_pack_buf absorbs warm experts) vs fixing stage_host flags (Option 1a without WC/race).
+  - Check MemoryHigh=13824M reclaim risk if fd_pack_buf_ grows to ~11.8 GiB; rank the safest, highest-ROI next step for Mission 20.
+- [x] Save audit to /home/zyxciss/fluxaeros-data/m19_m18_failure_audit.md; mark TASK.md [x]; commit docs locally.
+  - Task 1 outcome: root cause of the 2,011 us/fill FOUND and replicated - stage_host is cudaHostAlloc WRITE-COMBINED by default (moe_doorbell.cu:558-560, MOE_STAGE_WC unset in every session);
+    probe .probe_wc_src.cpp measured 2,074 us/fill (0.85 GB/s) from a WC source vs 182-201 us from cacheable sources (9-10 GB/s). The fill (publish_ready memcpy) is the first CPU read of the WC
+    stage on the hot path; M14/M15/M16 never CPU-read stage_host. nvme_us inflation (+140 s) fully accounts for the TG collapse (~226 ms/tok of fills vs M16 135 ms/tok).
+  - Byte-135 parity flip: attached to the bbbd75de0 build (fingerprint b964-b3514cabd) but NOT byte-corruptible by the fill (DMA source bytes verified congruent; roles/offsets/arena layout
+    checked line-by-line; slot table unchanged). Trajectory is deterministic-but-shifted vs M14/M15/M16 (same divergence byte 135 both p1/p3; in-session p1==p3 equal until 413). Mechanism
+    NOT identified; near-tie at byte ~135 is known-fragile (M12 flipped at the same byte). Unverifiable in this read-only mission; flagged for Mission 20 double-experiment (MOE_STAGE_WC=0).
+  - Task 2 outcome: read=2.26-2.64 ms/expert in M18 = nvme_us/fills (~2.49 ms) - the in-loop page of WC memcpy, NOT NVMe and NOT cold page cache (M14/15/16 logs show identical cache warmth transient;
+    M18 never warmed below 2.2). MOE_CACHE_MIB=0 at HEAD works via the init_cache(0) early-true + cache_bytes==0 -> victim_cache=false gate (llama-context.cpp:~2456/~210); zero DtoH,
+    zero arena, fd_pack_buf absorbs warm experts, byte-exact by construction; MemoryHigh risk LOW (file pages LRU-reclaimable; PLE dropped; M12/M13 pattern clean).
+  - Ranked Mission 20: (1) MOE_STAGE_WC=0 behind env knob + M15/M16 double-run byte-verify vs reference md5 537a71e9/acd130f4; (2) fallback MOE_CACHE_MIB=0; (3) keep reverted HEAD as reference.
