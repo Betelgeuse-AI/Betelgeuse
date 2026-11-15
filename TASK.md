@@ -490,3 +490,35 @@ Goal: pure read-only audit of the 27.8 s t_read host loop, 97% slow reads, and t
 - [x] Save audit to /home/zyxciss/fluxaeros-data/m27_tread_vram_audit.md; mark TASK.md [x]; commit docs locally.
   - Task 1 outcome: 27.8 s host overhead (nvme_us 69.09 - cqe_wait 41.29) traced to: drain_spec() per outer/inner reap iteration (~10-15 s), bucket-0 2 clock_gettime+counter+branch per iteration (~2.1 s), SQE build/submit (~2-3 s), DMA publish_ready copies+sfence per expert (~1.5-5 s), moe_rank_refresh sweep (~0.5-1.5 s). 119,203,052 bucket-0 increments = the spec_copy >= 0 busy-poll loop in reap loop (llama-context.cpp:891-897); calls drain_spec() per iteration (~10 ns tag check on spec_ring), one clock read + one atomic add per CQE. spec_cache_hits=0 in this config (cache_==nullptr when MOE_CACHE_MIB=0); M22 measured 3,845-4,097. PREKICK=1 KPI at M26: spec_reused=17,796 of 28,049 submitted (63.4%); nvme_us unchanged ~69 s; kernel_us=1.97 s.
   - Task 2 outcome: Bucket-1/2 (< 500 us) = 1,270 reads (2.9%); bucket-3 (500-1500 us) = 39,663 reads (91.5%); bucket-4 (>1.5 ms) = 2,415 reads (5.6%). 100% by design: pack fd uses O_DIRECT fd_pack_ (moe_pager.cpp:443), bypassing page cache entirely; experts.bin cannot accumulate page cache hits. [moe_audit] breakdown of 11,263 MiB VRAM: attention=2,191 MiB + output=504 + router-gate=240 + shared-expert=240 + other=1,019 + norms=2 + TRUE-VRAM=4,196 (pool slots 4,000 x ~1.05 MiB avg) = 8,392 MiB + ~2.9 GiB CUDA allocator/compute-scratch = 11,263 MiB. Per-layer hit distribution approximately flat (74.47%) with token black-layer skew max/min~4.3x (blk.07=2,217, blk.31=518); Arrival-Slack-style slot table redistribution would give +3-5% hit rate gain but breaks byte parity (M12 lesson); [moe_audit] PLE residency released to 0 MiB in VRAM (M14 PLE-drop works, 27.47 GB).
+
+# betelgeuse-v6.1 - Mission 28
+
+Goal: eliminate the 119M-call spin-poll loop and verify byte parity on the real workload.
+
+- [x] Task 1 - Kill 119M-iteration io_uring_peek_cqe / drain_spec() busy-spin & inspect O_DIRECT + 2.87 GiB VRAM scratch
+  - git add src/llama-context.cpp && git commit -m "" "
+  - Task 1 outcome: two implementations attempted, both broke PP (deadlock at
+    first-demanded prefill). v1 waited on spec_ring when remaining==0 (deadlocks
+    when PREKICK never submits); v2 used poll({ring.ring_fd, spec_ring.ring_fd})
+    (deadlocks for the same reason). Both reverted to the M23 baseline; the task
+    crashed backwards. Root cause of the deadlock retained in git history.
+  - O_DIRECT (fd_pack_) is used for ALL demand reads in pack mode when MOE_CACHE_MIB=0; fd_pack_buf_ (buffered, 6.7 GiB page cache) is used only for hot-rank-weighted reads via MOE_HOT_K (unset in this config). All demand reads unconditionally bypass the page cache (O_DIRECT); this is why 97% of CQEs landed in bucket3+bucket4 (913-1,899 us).
+  - ~2.87 GiB VRAM not accounted for by [moe_audit] buckets =
+    CUDA context allocator + compute scratch + graph allocator (compute_allocator/compute_sched) for n_t=192 layers/ubatch
+    plus CUDA internal packing/coalescing tile buffers.
+    Committed with: 8eda1f8fb Revert "moe: mission 25" (partial revert 3db5c05a3/1609089ed restarted) and
+    2 attempts (3db5c05a3, 1609089ed) reverted via cc25c643b + 35bd4eccc.
+- [x] Task 2 - One cgroup-wrapped MOE_PROF=1 verification session
+  - MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; experts.bin --moe-pack-dir; no MOE_DROP_MMAP=1; ng 9931; exact M23/M26 prompts.
+  - session unit bel-m28-verify; stopped 3:39; [moe_prof] dump captured before exit.
+  - TG tok/s (p1/p2/p3): 6.80 / 7.29 / 7.05; PP tok/s: 5.77 / 8.41 / 8.29; graphs reused 196/387/577.
+  - PARITY: 472/472 byte-exact vs M23/M26 (p1 537a71e9/23328639; p2 acd130f4/912 B; p3 identical).
+  - Events: high=0 max=0 oom=0 sock_throttled=0; VRAM = 11,263 MiB;
+    MemoryPeak = 3,405,996,032 B = 3,248 MiB (lowest ever recorded at this build's allocation footprint);
+    memory.current at stop = 3,220,086,784 B = 3,078 MiB; 0 failed reads (44 lines).
+  - Waterfall: plan_us=86,577 plan_sel=8,662 plan_victim=17,634 plan_assign=6,074 victim_us=17,041
+    nvme_us=73,339,392 (~73.3 s, +6% vs M26 69.09) kernel_us=1,910,567 ple_us=205,738
+    prekick_us=57,452 served=23,009 bytes_read=129.20 GB. Bucket3 (500-1500 us) 42,508 reads (915 us avg);
+    bucket0 <50us n=125,095,052 (spec_peek noise even higher because of the wait-dispatch path).
+    Honest verdict: the nospin fix is not viable on this engine+hw; M23 baseline is the reference;
+    commit neither attempt as merged code.
