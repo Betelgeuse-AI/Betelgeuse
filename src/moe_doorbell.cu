@@ -744,6 +744,10 @@ bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
         return false;
     }
     memset(g_prekick_host, 0, sizeof(DoorbellPrekick) * (size_t) n_layer);
+    fprintf(stderr, "[doorbell_init] dbs host=%p device=%p | plans host=%p device=%p | prekick host=%p device=%p sizeof(pred)=%zu\n",
+            (void *) g_doorbells_host, (void *) g_doorbells_dev,
+            (void *) g_plans_host, (void *) g_plans_dev,
+            (void *) g_prekick_host, (void *) g_prekick_dev, sizeof(DoorbellPrekick));
 
     const char * lru_env = getenv("MOE_GPU_LRU");
     if (!lru_env || atoi(lru_env) != 0) {

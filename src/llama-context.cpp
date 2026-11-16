@@ -364,6 +364,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                     for (int layer = 0; layer < n_layer; ++layer) {
                         DoorbellPrekick * prediction = moe_doorbell_prekick_host(layer);
+                        // plain volatile pre-filter, same pattern as the demand
+                        // doorbell loop; skips a locked CAS when everyone is gone
+                        if (prediction->state != 1) continue;
+                        if (moe_prof_enabled()) g_moe_prof.pk_state1_seen++;
                         uint32_t expected_state = 1;
                         if (!__atomic_compare_exchange_n(&prediction->state, &expected_state, 2, false,
                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
@@ -2993,12 +2997,13 @@ llama_context::~llama_context() {
                     mx = std::max(mx, pkp->kick_dt_cycles);
                 }
             }
-            fprintf(stderr, "[moe_prekick_diag] kick_count=%llu dt_avg_cycles=%llu dt_min=%llu dt_max=%llu kick_cas_cleared=%llu\n",
+            fprintf(stderr, "[moe_prekick_diag] kick_count=%llu dt_avg_cycles=%llu dt_min=%llu dt_max=%llu kick_cas_cleared=%llu pk_state1_seen=%llu\n",
                     (unsigned long long) kick_count,
                     kick_count ? (unsigned long long) (dt_sum / kick_count) : 0ull,
                     kick_count ? (unsigned long long) mn : 0ull,
                     (unsigned long long) mx,
-                    (unsigned long long) cleared);
+                    (unsigned long long) cleared,
+                    moe_prof_enabled() ? (unsigned long long) g_moe_prof.pk_state1_seen.load() : 0ull);
         }
         for (int i = 0; i < 5; i++) {
             fprintf(stderr, "[moe_prof] cqe_bucket=%d n=%llu us=%llu\n", i,
