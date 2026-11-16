@@ -482,6 +482,76 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                 }
             }
+            // Mission 60: same-layer PREKICK(il) publish via dbs[il].pred_state;
+            // the doorbell the host already uses is guaranteed visible. Claim here
+            // and feed the spec ring with one true cold miss per prediction window.
+            if (spec_ok && spec_pending < 0 && !spec_cancel_pending) {
+                for (int layer = 0; layer < n_layer; ++layer) {
+                    if (dbs[layer].pred_state != 1) continue;
+                    uint32_t expected_pred = 1;
+                    if (!__atomic_compare_exchange_n(&dbs[layer].pred_state, &expected_pred, 2, false,
+                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    const uint32_t npred = dbs[layer].pred_count > 2u ? 2u : dbs[layer].pred_count;
+                    for (uint32_t pi = 0; pi < npred; pi++) {
+                        const int32_t e = (int32_t) dbs[layer].pred_next[pi];
+                        if (e < 0 || e >= n_exp) continue;
+                        if (ctx->moe.slot_of[(size_t) layer * n_exp + e] >= 0) {
+                            if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
+                            continue;
+                        }
+                        if (ctx->pager.cache_has(layer, e)) {
+                            if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
+                            spec_cache_hits++;
+                            continue;
+                        }
+                        const int selected = pi + 1;
+                        for (int z = 0; z < 8; ++z) {
+                            spec_ready[z] = false;
+                            spec_lengths[z] = 0;
+                            spec_got_bytes[z] = 0;
+                            spec_got_roles[z] = 0;
+                            spec_got_cancel[z] = 0;
+                        }
+                        spec_experts[selected] = e;
+                        if (!ctx->pager.pack_mode()) {
+                            // non-pack mode: leave to the pre-attn unsepic flow
+                            break;
+                        }
+                        const auto location = ctx->pager.pack_loc(layer, e);
+                        const int spec_fd = ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : location.fd;
+                        if (spec_fd < 0 || location.len > stride) break;
+                        spec_lengths[selected] = (uint32_t) location.len;
+                        struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
+                        if (!read) break;
+                        io_uring_prep_read(read, spec_fd,
+                                spec_stage + (size_t) selected * stride,
+                                (uint32_t) location.len, (off_t) location.off);
+                        read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+                        if (spec_async) read->flags |= IOSQE_ASYNC;
+                        read->user_data = (uint64_t) selected * 4 + 1;
+                        const auto submit_started = std::chrono::steady_clock::now();
+                        if (io_uring_submit(&spec_ring) == 1) {
+                            spec_pending = selected;
+                            spec_layer = layer;
+                            spec_ring_inflight = spec_ring_inflight + 1;
+                            spec_next = selected;
+                            spec_count = selected; // only one candidate per scan
+                            spec_generation = dbs[layer].pred_generation;
+                            spec_submitted++;
+                            if (moe_prof_enabled()) g_moe_prof.pk_submitted++;
+                            if (io_diag) {
+                                spec_bytes += spec_lengths[selected];
+                                spec_started = submit_started;
+                                spec_submit_ms += std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - submit_started).count();
+                            }
+                        }
+                        break;
+                    }
+                    break;
+                }
+            }
             bool handled = false;
             for (int il = 0; il < n_layer; ++il) {
                 if (dbs[il].state != 1) continue;

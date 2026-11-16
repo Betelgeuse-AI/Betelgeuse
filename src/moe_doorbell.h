@@ -27,7 +27,8 @@ struct alignas(64) LayerDoorbell {
     volatile uint32_t pred_count;      // number of candidate experts written
     volatile uint32_t pred_next[2];    // up to 2 cold-expert ids for il + 1
     volatile uint32_t pred_generation; // prekick plans[il + 1] generation
-    uint32_t pad2[10];
+    volatile uint32_t pred_state;      // 0 = none, 1 = PREKICK published cold il experts, 2 = host claimed
+    uint32_t pad2[9];
 };
 
 bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer);

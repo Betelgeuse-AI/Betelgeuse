@@ -374,6 +374,7 @@ static __global__ void moe_prekick_kernel(
         const int32_t * __restrict__ table,
         int32_t * __restrict__ out,
         DoorbellPrekick * __restrict__ plans,
+        LayerDoorbell * __restrict__ doorbells,
         int layer, int count, int n_exp, int sentinel,
         size_t logits_nb0, size_t table_nb0, size_t out_nb0) {
     const int tid = threadIdx.x;
@@ -434,6 +435,19 @@ static __global__ void moe_prekick_kernel(
         plans[layer].t_pk_cycles = clock64();
         __threadfence_system();
         pci_st_u32(&plans[layer].state, 1);
+        // Mission 60: also publish through the doorbell the demand path uses;
+        // the host scans dbs[layer] instead of reasoning about a separate
+        // prediction structure that never produced a visible state==1
+        if (layer >= 0 && doorbells != nullptr) {
+            LayerDoorbell & db = doorbells[layer];
+            pci_st_u32(&db.pred_layer, (uint32_t) layer);
+            pci_st_u32(&db.pred_count, (uint32_t) plans[layer].n);
+            pci_st_u32(&db.pred_generation, plans[layer].generation);
+            pci_st_u32(&db.pred_next[0], (uint32_t) plans[layer].experts[0]);
+            pci_st_u32(&db.pred_next[1], (uint32_t) plans[layer].experts[1]);
+            __threadfence_system();
+            pci_st_u32(&db.pred_state, 1);
+        }
         __threadfence_system();
     }
 }
@@ -516,7 +530,7 @@ void moe_doorbell_resolve_launch(
         // is the slot map; both tensors are dense I32/F32 rows, strides 1 element
         moe_prekick_kernel<<<1, 512, 0, s>>>(
             (const float *) topk, (const int32_t *) table, out, g_prekick_dev,
-            il, count, n_exp, sentinel,
+            g_doorbells_dev, il, count, n_exp, sentinel,
             topk_nb0 / sizeof(float), table_nb0 / sizeof(int32_t), out_nb0 / sizeof(int32_t));
         return;
     }
