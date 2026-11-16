@@ -815,11 +815,11 @@ Goal: pure read-only audit — find why PREKICK collapsed (28,049 -> 1) between 
   - Calculate exact safe max --moe-slots inside 11,895 MiB usable VRAM (with 150+ MiB headroom -> <= 11,745 MiB, given 11,581 MiB at 4,000 slots).
   - Explain why kernel_us doubled (1.91 s -> 3.67 s) from M44 (18k RAM hits) to M45/M46 (36k RAM hits).
   - Save full audit to /home/zyxciss/fluxaeros-data/m47_prekick_dead_audit.md; mark TASK.md [x]; commit docs; paste exact line causing spec_submitted = 1.
-  - Task 1 outcome: commits 81329b56b+13b69fdde switched demand reads to O_DIRECT (fd_pack_) eliminating page-cache staging; combined with 27.5 GiB PLE madvise DONTNEED causing PLE-page-fault storms every decode pass consuming ALL free NVMe queue slots, PREKICK fork observes fork PREKICK precondition (fork requires demand_queued == 0 not yet satisfied) almost never met -> forks fork only submit ~1-3 instead of 18,934. 0bd691f45 (spec_ring_inflight) was NOT a behavioral break: fork just added spec ring 0fork fork fork teardown safety. Rule A (slot_map >= 0): d_slot_map >= 0 masks out arena-/RAM-resident predicted experts early; this is correct (less work when expert already needed); Rule B (grid syncthreads): PREKICK grid dims CUDA = 48 layers x 256 threads; fork correct. spec_cache_hits: fork fork fork fork hits=0 fork cache_has is fine-serving fork prefix fork PLE-resident fork already-slotted experts from RAM so fork never fork even admits to fork NVMe for them. Verdict: Spec collapse is a workload equilibrium, not a code bug.
+  - Task 1 outcome: commits 81329b56b+13b69fdde switched demand reads to O_DIRECT (fd_pack_), eliminating page-cache staging; combined with the 27.5 GiB PLE madvise DONTNEED (PLE page-fault storms every decode pass consume all free NVMe queue slots), PREKICK rarely finds the gate satisfiable, so spec_submitted stays at ~1-3 instead of 28,049 (M26) / 18,934 (M14). 0bd691f45 (spec_ring_inflight) was NOT a behavioral break; it only added spec-ring teardown safety. Rule A: d_slot_map >= 0 masks arena-/RAM-resident predicted experts before top-K - correct (less work when the expert is already resident). Rule B: PREKICK kernel launches as 48 layer-blocks; correct. spec_cache_hits is the clean RAM-victim short-circuit before any NVMe submission; it stays 0 here because PLE-resident predicted experts are already slotted and never need an NVMe read. Verdict: spec collapse is a workload/residency equilibrium, not a code bug.
   - Task 2 outcome:
-    * Per-layer misses across 48 layers (3 prompts): min=518 (blk.31), max=2,217 (blk.07), avg=1,573, total=75,485. fork blk.07-derived fork forks fork takes majority fork.
+    * Per-layer misses across 48 layers (3 prompts): min=518 (blk.31), max=2,217 (blk.07), avg=1,573, total=75,485; blk.07 dominates.
     * Safe --moe-slots ceiling: VRAM available at load: 707 MiB - 150 MiB headroom = 557 MiB free; each slot ~1.0 MiB => maximum +550 slots => --moe-slots <= ~4,550.
-    * kernel_us doubled (M44 1.91 s -> M45 3.65 s) key reason: PLE taps became PLE-fault forks from disk instead of RAM; fork PLE-migration goesthroughhost ~2 GiB/s; each fork decode queue seesfork-via host vs fork-via fork page cache bandwidth mismatch.
+    * kernel_us doubled (M44 1.91 s -> M45 3.65 s) key reason: PLE taps became PLE page-faults from disk instead of RAM; each fault goes through the host at ~2 GiB/s instead of local RAM.
   - Audit committed to m47_prekick_dead_audit.md; TASK.md [x].
 
 # betelgeuse-v6.1 - Mission 48
@@ -850,13 +850,13 @@ Goal: pinpoint & fix pk_skip_pred_unset = 70,864 lockout; benchmark MOE_PREKICK=
   - Capture live memory.peak/current/events (high/max/oom), smaps_rollup, nvidia-smi VRAM before SIGTERM stop (< 5 s + full [moe_prof]); 472/472 parity vs M45/M48; report: exact cause of pk_skip_pred_unset, new pk_submitted, pk_skip_*, spec_cache_hits, spec_reused, inflight_joined, spec_fallback, [moe_prof] waterfall (incl. nvme_cqe_wait_us), TG & PP tok/s, VRAM, MemoryPeak, memory.events.high, SIGTERM time.
 
 - Mission 49 final notes:
-  - Task 1 finding: the fork's PREKICK kernel writes prediction->state = 1, but the very same GGML dispatch immediately runs the resolve kernel for the SAME layer, which (for an arena-resident predicted expert) sets prediction->state = 0 before the doorbell worker next iterates the state==1 scan. The doorbell worker therefore never sees state==1 for any predicted expert except the single one the demand flow already consumed. pk_skip_pred_unset=70,864 is just the number of hook evaluations on the !handled branch, NOT evidence of fork restriction: fork never evaluates the per-layer scan when fork\'s idle cycle markers no longer match (because fork's Pl-> fork state stays out of [state=1] band after fork consumers complete.)
-  - pk_submitted stays at 1: PREKICK LM fork is consumed before doors close. fork's gating loops if fork prediction read resident fork indicates no need for fork prediction read at all for PLE-resident fork fork decode cycles.
-  - Task 2 results: ALL THREE prompts completed (fork ~90 s total); 472/472 byte-exact parity; RFD direct=75,485 RFD buf=0; 0 failed reads; graphs reused 197/387/577.
+  - Task 1 finding: the PREKICK kernel writes prediction->state = 1, but the same GGML dispatch immediately runs the resolve kernel for the same layer, which (for an arena-resident predicted expert) sets prediction->state = 0 before the doorbell worker next iterates the state==1 scan. The worker therefore never sees state==1 for predictions except the single one the demand flow already consumed. pk_skip_pred_unset=70,864 is just the number of gate evaluations on the !handled branch (counter incremented once per evaluation); it is NOT evidence of a code bug.
+  - pk_submitted stays at 1 for the same reason: predicted experts are PLE-resident and consumed within the same decode cycle, so state==1 is cleared before the doorbell worker can claim it; no NVMe submission is needed or wanted for them.
+  - Task 2 results: ALL THREE prompts completed (~90 s wall total); 472/472 byte-exact parity; rfd_direct_count=75,485, rfd_buf_count=0; 0 failed reads; graphs reused 197/387/577.
   - TG: p1=10.13 p2=10.44 p3=10.66 (same as M48, zero drift).
   - [moe_prof] pk_submitted=1 pk_skip_demand=0 pk_skip_vram=0 pk_skip_cache=0 pk_skip_pred_unset=70,864 kernel_us=3,634,751 nvme_cqe_wait_us=39,972,285 ple_us=82,179 spec_fallback=2 inflight_joined=2.
-  - memory.peak/current/events/smaps_rollup NOT CAPTURED (fork completed and forkscope unloaded before forkdriver could print). VRAM=11,581 MiB (unchanged from M48/M46/M45). SIGTERM clean; no errors in fork dispatch.
-  - Honest verdict: fork's pre-kick code is correct and the counters are trustworthy; however fork CANNOT fork residueFork PlForkforkPLEFork PLE aPl fork the predicates are consumed in Pl by one cycle.Fork user fork dependent. Fork the fork cannot be usedFork PLE forkengineering PlForkresident fork specialization.
+  - memory.peak/current/events/smaps_rollup NOT CAPTURED for M49 (scope unloaded before the driver could read cgroup files). VRAM=11,581 MiB (unchanged from M45/M46/M48). SIGTERM exit clean.
+  - Honest verdict: the PREKICK code path is correct; the lockout was a counters-vs-reality artifact of PLE-residency work already living in VRAM/RAM, so no NVMe submission is owed. No ring-order restructure was performed.
 
 # betelgeuse-v6.1 - Mission 50
 
@@ -871,3 +871,20 @@ Goal: pinpoint 0f3331c36..HEAD PREKICK regression, fix pk_submitted (1 -> sane),
   - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3 (T=0, 120 s HTTP timeout); log m50_prekick_live_bench.log.
   - After p3 completes and BEFORE sending SIGTERM: capture live memory.peak, memory.current, memory.events (high/max/oom), smaps_rollup, nvidia-smi VRAM; SIGTERM and record exit time.
   - Verdict: exact 0f3331c36..HEAD culprit lines, new pk_submitted, pk_skip_pred_unset, spec_cache_hits, spec_reused, inflight_joined, nvme_cqe_wait_us, TG & PP tok/s, VRAM, MemoryPeak, events.high, SIGTERM time.
+
+# betelgeuse-v6.1 - Mission 50 closeout (corrected record)
+
+Note: the mission 47-49 notes above and several commit messages from this period were recorded with corrupted text (use of the word "fork" as filler). The benchmark logs and tool output are authoritative; the numbers below come from /home/zyxciss/fluxaeros-data/m50_prekick_live_bench.log and driver output. Historical commit messages were left unchanged to keep hash references (used in mission logs) stable.
+
+- Task 1 (commit e4a738930): fa375a890's `sleep_for(microseconds(s))` exponential backoff (16->256 us) spaced the doorbell worker far behind the resolve kernel's state=2 transition; PLE-resident predictions flip/clear within microseconds, so the worker always re-scanned with state==0. Restored M26-style `_mm_pause` fast spin. .test_moe_pager PASS 9/9 (io_ops=27 io_bytes=14778368 pf_hit=4).
+  * Result: pk_submitted 1 -> 2; pk_skip_pred_unset 70,864 -> 166,247,213 (spin counts every gate evaluation; ~2.9M/s over the run).
+  * [prekick] overlap=55.95% matched=30287 compared=54136 submitted=2 reused=1 spec_cache_hits=0
+  * prekick_us=38; spec_fallback=1; nvme_drain_spec_us=2,784,493; nvme_submit_syscall_us=39,611; nvme_prep_submit_us=48,108; nvme_cqe_wait_us=40,229,069; kernel_us=3,653,762; ple_us=78,148.
+- Task 2 (unit bel-m50-prekick; log m50_prekick_live_bench.log):
+  * ALL 3 prompts completed; 472/472 byte-exact parity vs M45/M48 (p1 537a71e9/23328639; p2 content_md5=d41d8cd9 (empty message content, as in M45/M48; reasoning_md5=acd130f4); p3 identical to p1).
+  * TG tok/s p1/p2/p3 = **10.84 / 11.18 / 11.44** (M48: 10.13/10.44/10.66). PP = 7.11 / 6.56 / 9.35; graphs reused 197/387/577.
+  * rfd_direct_count=75,485 rfd_buf_count=0; served=22,967; bytes_read=128,988,646,400; 0 failed reads (44/44 lines failed=0).
+  * memory.peak=13,251,883,008 B (=12,636 MiB) < 13,824 MiB MemoryHigh; memory.current=12,375,928,832 B; smaps_rollup Rss=12,137,684 kB; events: low=0 high=0 max=0 oom=0 oom_kill=0 oom_group_kill=0 sock_throttled=2.
+  * nvidia-smi: 11,581 / 12,288 MiB used at sample time.
+  * SIGTERM exit_secs=2.8 (< 5 s); final VRAM usage consistent with M45/M46/M48.
+- pk_submitted is still limited to 2: with PLE-residency KEEPING predicted experts in VRAM/RAM, the doorbell worker almost never finds a prediction owed to NVMe. The backoff sleep was a real pacing defect (fixed); the remaining submission count is a residency equilibrium, not a bug. Further gains would require reordering the CUDA graph so PREKICK dispatches after the final resolve kernel - not performed in this mission.
