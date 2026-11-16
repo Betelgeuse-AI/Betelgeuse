@@ -697,3 +697,15 @@ Goal: verify 2f5207e32 (non-blocking Exclusive DtoH victim cache) with MOE_DEMAN
     * TG & PP tok/s: NOT measurable; plan_victim_us / nvme_cqe_wait_us / [moe_victim_cache] saved/hits bytes: NOT measurable.
     * See /home/zyxciss/fluxaeros-data/m37_async_victim_direct0_audit.md for full evidence.
     * M34 baseline (Cache=0, PREKICK=0, DEMAND_DIRECT=1) remains the reference state.
+
+# betelgeuse-v6.1 - Mission 38
+
+Goal: pinpoint exact hang line (b6e87c585..HEAD audit + live gdb all-thread backtrace).
+
+- [x] Task 1 - Diff working M16 (b6e87c585) vs HEAD (944cd10c7); check MOE_PREKICK=0 interaction
+  - git log --oneline b6e87c585..HEAD; inspect code diffs in llama-context.cpp, moe_pager.{h,cpp}, moe_doorbell.cu (MOE_CACHE_MIB > 0 x MOE_PREKICK=0 vs MOE_PREKICK=1, spec_ring_inflight, cache_, d2h_stream, worker, pci_ld_u32(&db.gpu_ready)).
+  - Verify why M14/M15/M16 (MOE_CACHE_MIB=5120, MOE_PREKICK=1) worked while M35/M37 (MOE_CACHE_MIB>0, MOE_PREKICK=0) hung before printing [doorbell].
+- [x] Task 2 - Capture live gdb all-thread backtrace of the exact M37 hang
+  - ONE short cgroup-wrapped bel-server session with exact M37 config (MOE_DEMAND_DIRECT=0 MOE_CACHE_MIB=5120 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1, experts.bin --moe-pack-dir, --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931) p1 (max_tokens=8).
+  - Once it stalls (CPU ~100% / GPU 100% with no token after ~20-30 s), attach gdb -p <pid> -batch -ex "set pagination off" -ex "thread apply all bt" -> /home/zyxciss/fluxaeros-data/m38_hang_bt.log; terminate scope immediately (SIGKILL / systemctl stop).
+  - Combine gdb backtraces with Task 1 diff into /home/zyxciss/fluxaeros-data/m38_hang_triage.md; mark TASK.md [x]; commit docs; report exact function + file:line of every stuck thread and root cause.
