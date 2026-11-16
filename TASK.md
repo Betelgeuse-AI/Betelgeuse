@@ -709,3 +709,16 @@ Goal: pinpoint exact hang line (b6e87c585..HEAD audit + live gdb all-thread back
   - ONE short cgroup-wrapped bel-server session with exact M37 config (MOE_DEMAND_DIRECT=0 MOE_CACHE_MIB=5120 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1, experts.bin --moe-pack-dir, --moe-slots 4000 -ub 64 -np 1 -c 512 -t 6 --port 9931) p1 (max_tokens=8).
   - Once it stalls (CPU ~100% / GPU 100% with no token after ~20-30 s), attach gdb -p <pid> -batch -ex "set pagination off" -ex "thread apply all bt" -> /home/zyxciss/fluxaeros-data/m38_hang_bt.log; terminate scope immediately (SIGKILL / systemctl stop).
   - Combine gdb backtraces with Task 1 diff into /home/zyxciss/fluxaeros-data/m38_hang_triage.md; mark TASK.md [x]; commit docs; report exact function + file:line of every stuck thread and root cause.
+
+# betelgeuse-v6.1 - Mission 39
+
+Goal: fix d2h_stream doorbell-worker deadlock (2f5207e32) and benchmark Non-Blocking cudaEvent_t Exclusive DtoH Victim Cache.
+
+- [x] Task 1 - Pre-Create d2h_stream & All cudaEvent_t Objects on Main Thread (0 CUDA Driver Lock Calls on Doorbell Worker)
+  - Move cudaStreamCreateWithFlags(&ctx->moe.d2h_stream, cudaStreamNonBlocking) out of start_doorbell_worker (src/llama-context.cpp:466) onto the main thread during context/doorbell init (alongside moe_doorbell_stage_init); ensure every cudaEventCreate* (ev_of_v and cache_ev_) and cudaHostRegister runs strictly on the main thread at init_cache()/context init; verify zero cudaStreamCreate/cudaEventCreate/cudaMalloc/cudaHost* calls exist anywhere on the doorbell worker thread.
+  - Keep clean teardown ordering in ~llama_context() (stop_doorbell_worker(), cudaStreamSynchronize(d2h_stream), destroy events & d2h_stream, free cache_).
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=6144 + MOE_DEMAND_DIRECT=1 Benchmark (p1/p2/p3 T=0)
+  - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=6144 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; experts.bin --moe-pack-dir; --moe-slots 4000; -ub 64; -np 1; -c 512; -t 6; --port 9931; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m39_async_victim_bench.log.
+  - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); 472/472 byte-exact parity vs M33/M34; 0 failed reads.
+  - Report: [moe_prof] waterfall (plan_victim_us vs M16 27.32 s, nvme_cqe_wait_us vs M34 74.52 s, nvme_submit_syscall_us), CQE histogram (Bucket 0..4), [moe_victim_cache] saved/hits/bytes, TG & PP tok/s, VRAM, MemoryPeak, smaps_rollup, SIGTERM exit time.
