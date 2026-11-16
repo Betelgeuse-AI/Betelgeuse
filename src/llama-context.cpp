@@ -162,24 +162,26 @@ static std::thread g_doorbell_thread;
 static std::atomic<bool> g_hot_rank_valid{false};
 
 // Optional oracle trace collector. When MOE_ORACLE_TRACE=<file> is set at
-// process start, a small binary writer is opened. Every ubatch emits one
-// record containing h_t^{(checkpoint il)} (fp16) plus per-layer top-k IDs and
-// scores (fp16). Records are streamed through a FILE* with buffered fwrite.
-// When the env var is unset the writer is nullptr and all hooks are no-ops.
+// process start, a small binary writer is opened. On decode UBATCHES
+// (n_tokens==1) it emits one record per token containing the exact
+// pre-router normalized vector u_t,l for all layers (fp16), plus per-layer
+// top-k ids and normalized scores. When the env var is unset the writer is
+// nullptr and all hooks are no-ops.
 struct OracleTraceWriter {
     FILE * fp = nullptr;
     uint64_t magic = 0;             // "ORCTRCE\0"
     uint16_t n_layer = 48;
     uint16_t n_expert = 512;
     uint16_t top_k = 10;
-    uint16_t n_embd = 2048;
-    uint16_t n_checkpoint = 7;
-    int32_t  checkpoints[7] = {0, 7, 15, 23, 31, 39, 47};
+    uint16_t n_embd = 2560;
+    uint16_t n_checkpoint = 48;
+    int32_t  checkpoints[48] = {};
     uint64_t n_records = 0;
     int32_t  prev_token_id = -1;
-    std::vector<float> hidden_scratch;   // [n_checkpoint][n_embd] fp32 scratch
-    std::vector<float> scores_scratch;    // [n_layer][n_expert] fp32 scratch
-    std::vector<int32_t> ids_scratch;     // [n_layer][top_k] int32 scratch
+    uint32_t prompt_id = 0;          // count of prefill ubatches seen so far
+    uint64_t decode_tokens = 0;      // for fadvise cadence
+    bool     router_dumped = false;  // router-gate one-shot dump guard
+    std::vector<float> scratch_float;
 };
 static OracleTraceWriter g_oracle_trace;
 
@@ -191,10 +193,11 @@ static bool oracle_trace_enabled() {
 
 static void oracle_trace_close() {
     if (g_oracle_trace.fp) {
-        // rewind and stamp n_records
+        // rewind and stamp n_records (new layout: magic+5xu16+N_LAYERx int32)
         std::fflush(g_oracle_trace.fp);
         if constexpr (sizeof(uint64_t) == 8) {
-            std::fseek(g_oracle_trace.fp, 46, SEEK_SET); // bytes 46..53 hold the n_records slot (after magic+5x u16+7x int32 0..45)
+            const long off = 8 + 5 * (long) sizeof(uint16_t) + (long) g_oracle_trace.n_checkpoint * (long) sizeof(int32_t);
+            std::fseek(g_oracle_trace.fp, off, SEEK_SET); // u64 n_records slot
             std::fwrite(&g_oracle_trace.n_records, sizeof(uint64_t), 1, g_oracle_trace.fp);
         }
         std::fclose(g_oracle_trace.fp);
@@ -216,18 +219,14 @@ static bool oracle_trace_open(int n_layer, int n_expert, int top_k, int n_embd) 
     g_oracle_trace.n_expert = (uint16_t) n_expert;
     g_oracle_trace.top_k = (uint16_t) top_k;
     g_oracle_trace.n_embd = (uint16_t) n_embd;
-    g_oracle_trace.hidden_scratch.assign((size_t) g_oracle_trace.n_checkpoint *
-                                          (size_t) g_oracle_trace.n_embd, 0.0f);
-    g_oracle_trace.scores_scratch.assign((size_t) g_oracle_trace.n_layer *
-                                         (size_t) g_oracle_trace.n_expert, 0.0f);
-    g_oracle_trace.ids_scratch.assign((size_t) g_oracle_trace.n_layer *
-                                      (size_t) g_oracle_trace.top_k, -1);
+    g_oracle_trace.n_checkpoint = (uint16_t) n_layer;
+    for (uint32_t i = 0; i < (uint32_t) n_layer; i++) g_oracle_trace.checkpoints[i] = (int32_t) i;
+    g_oracle_trace.scratch_float.assign((size_t) n_embd, 0.0f);
     g_oracle_trace.magic = 0x4f52435452434500ULL; // "ORCTRCE\0" padding-free
     // File header layout:
     //   u64 magic
-    //   u16 n_layer, u16 n_expert, u16 top_k, u16 n_embd,
-    //   u16 n_checkpoint (6 u16 = 12 B)
-    //   int32 checkpoints[7]
+    //   u16 n_layer, u16 n_expert, u16 top_k, u16 n_embd, u16 n_checkpoint
+    //   int32 checkpoints[n_checkpoint]
     //   u64 n_records (patched at close)
     std::fwrite(&g_oracle_trace.magic, sizeof(uint64_t), 1, fp);
     uint16_t u16 = g_oracle_trace.n_layer;    std::fwrite(&u16, sizeof(u16), 1, fp);
@@ -235,13 +234,58 @@ static bool oracle_trace_open(int n_layer, int n_expert, int top_k, int n_embd) 
     u16 = g_oracle_trace.top_k;                std::fwrite(&u16, sizeof(u16), 1, fp);
     u16 = g_oracle_trace.n_embd;               std::fwrite(&u16, sizeof(u16), 1, fp);
     u16 = g_oracle_trace.n_checkpoint;         std::fwrite(&u16, sizeof(u16), 1, fp);
-    for (int i = 0; i < 7; i++) std::fwrite(&g_oracle_trace.checkpoints[i], sizeof(int32_t), 1, fp);
+    for (uint32_t i = 0; i < (uint32_t) n_layer; i++) std::fwrite(&g_oracle_trace.checkpoints[i], sizeof(int32_t), 1, fp);
     uint64_t zero = 0;
     std::fwrite(&zero, sizeof(uint64_t), 1, fp);
     std::fflush(fp);
-    fprintf(stderr, "[moe_oracle_trace] opened %s for binary trace (n_layer=%u n_expert=%u top_k=%u n_embd=%u)\n",
-            path, g_oracle_trace.n_layer, g_oracle_trace.n_expert, g_oracle_trace.top_k, g_oracle_trace.n_embd);
+    fprintf(stderr, "[moe_oracle_trace] opened %s for binary trace v2 (n_layer=%u n_expert=%u top_k=%u n_embd=%u checkpoints=0..%u)\n",
+            path, g_oracle_trace.n_layer, g_oracle_trace.n_expert, g_oracle_trace.top_k, g_oracle_trace.n_embd, (uint32_t) n_layer - 1);
     return true;
+}
+
+// One-shot dump of the router gate matrices blk.0..47.ffn_gate_inp.weight at
+// first decode. Layout of q38_router_gates_fp16.bin:
+//   char[8] "RTGATE01"; u32 version; u32 n_layer; u32 n_embd; u32 n_expert;
+//   payload [n_layer][n_expert][n_embd] fp16 (layer-major, expert-major).
+static void dump_router_gates(const llama_model & model) {
+    const char * path = "/home/zyxciss/fluxaeros-data/q38_router_gates_fp16.bin";
+    const int n_layer = (int) model.hparams.n_layer();
+    const int n_embd  = (int) model.hparams.n_embd;
+    const int n_expert = (int) model.hparams.n_expert;
+    FILE * out = std::fopen(path, "wb");
+    if (!out) {
+        fprintf(stderr, "[moe_oracle_trace] cannot write router gates to %s\n", path);
+        return;
+    }
+    std::fwrite("RTGATE01", 1, 8, out);
+    uint32_t u32 = 1;            std::fwrite(&u32, sizeof(u32), 1, out);
+    u32 = (uint32_t) n_layer;    std::fwrite(&u32, sizeof(u32), 1, out);
+    u32 = (uint32_t) n_embd;     std::fwrite(&u32, sizeof(u32), 1, out);
+    u32 = (uint32_t) n_expert;   std::fwrite(&u32, sizeof(u32), 1, out);
+    std::vector<float> fbuf((size_t) n_embd);
+    std::vector<ggml_fp16_t> hbuf((size_t) n_embd);
+    int ok = 0, bad = 0;
+    for (int il = 0; il < n_layer; il++) {
+        ggml_tensor * w = model.layers[(size_t) il].ffn_gate_inp;
+        const bool good = w && w->type == GGML_TYPE_F32 && (int) w->ne[0] == n_embd && (int) w->ne[1] == n_expert;
+        if (!good) {
+            fprintf(stderr, "[moe_oracle_trace] router gate layer %d: unexpected shape/type; writing zeros\n", il);
+            const size_t zeros = (size_t) n_expert * n_embd * sizeof(ggml_fp16_t);
+            std::vector<char> zero_block(zeros, 0);
+            std::fwrite(zero_block.data(), 1, zeros, out);
+            bad++;
+            continue;
+        }
+        for (int e = 0; e < n_expert; e++) {
+            ggml_backend_tensor_get(w, fbuf.data(), (size_t) e * n_embd * sizeof(float), (size_t) n_embd * sizeof(float));
+            ggml_fp32_to_fp16_row(fbuf.data(), hbuf.data(), (int64_t) n_embd);
+            std::fwrite(hbuf.data(), sizeof(ggml_fp16_t), (size_t) n_embd, out);
+        }
+        ok++;
+    }
+    std::fflush(out);
+    std::fclose(out);
+    fprintf(stderr, "[moe_oracle_trace] router gates dumped to %s (%d layers ok, %d zero-filled)\n", path, ok, bad);
 }
 
 static void oracle_trace_write_u16(FILE * fp, uint16_t v) { std::fwrite(&v, sizeof(v), 1, fp); }
@@ -3068,6 +3112,7 @@ llama_context::llama_context(
                         moe.step_sel.assign((size_t) n_layer * n_used, -1);
                         moe.step_topk.assign((size_t) n_layer, nullptr);
                         moe.step_weights.assign((size_t) n_layer, nullptr);
+                        moe.step_router_inp.assign((size_t) n_layer, nullptr);
                         const char * doorbell_env = getenv("MOE_DOORBELL");
                         const char * predictor_env = getenv("MOE_PRED");
                         const bool demand_only = pager.pack_mode() && (!doorbell_env || atoi(doorbell_env) != 0) && (!predictor_env || atoi(predictor_env) == 0);
@@ -4706,30 +4751,39 @@ bool llama_context::set_adapter_cvec(
 void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_result * res) {
     if (!res) return;
     const int64_t n_tokens = (int64_t) ubatch.n_tokens;
-    // Mission 65: collect decode steps only
-    if (n_tokens != 1) return;
-    const int32_t il_ck[7] = {0, 7, 15, 23, 31, 39, 47};
-    if (!extract_layer_inputs(res, 0, (size_t) n_tokens)) {
-        fprintf(stderr, "[moe_oracle_trace] extract_layer_inputs returned false; skipping dump\n");
+    if (n_tokens != 1) {
+        if (n_tokens > 1) g_oracle_trace.prompt_id++; // count prefill chunks as prompt boundaries
         return;
     }
     if (!oracle_trace_open((int) moe.n_layer, (int) model.hparams.n_expert, (int) moe.n_used, (int) model.hparams.n_embd)) return;
+    if (!g_oracle_trace.router_dumped) {
+        dump_router_gates(model);
+        g_oracle_trace.router_dumped = true;
+    }
     FILE * fp = g_oracle_trace.fp;
     const int n_embd = (int) model.hparams.n_embd;
     const int n_used = (int) moe.n_used;
     const int n_layer = (int) moe.n_layer;
     const int n_expert = (int) model.hparams.n_expert;
     for (int64_t row = 0; row < n_tokens; row++) {
-        const bool is_decode = (n_tokens == 1);
+        const bool is_decode = true;
         const int32_t token_id = ubatch.token[(size_t) row];
         const int32_t prev_id = g_oracle_trace.prev_token_id;
         oracle_trace_write_u8(fp, is_decode ? 1 : 0);
+        oracle_trace_write_int32(fp, (int32_t) g_oracle_trace.prompt_id);
         oracle_trace_write_int32(fp, token_id);
         oracle_trace_write_int32(fp, prev_id);
-        for (int c = 0; c < 7; c++) {
-            const float * srcp = embd_layer_inp[(size_t) il_ck[c]].data + row * n_embd;
-            if (!srcp) continue;
-            for (int i = 0; i < n_embd; i++) oracle_trace_write_fp16(fp, srcp[i]);
+        // all-48 pre-router normalized vectors u_t,l (fp16), captured fresh per ubatch
+        for (int il = 0; il < n_layer; il++) {
+            ggml_tensor * t = moe.step_router_inp[(size_t) il];
+            const bool good = t && (int) t->ne[0] == n_embd && row < (int64_t) t->ne[1] &&
+                              t->nb[0] == sizeof(float) && t->nb[1] == (size_t) n_embd * sizeof(float);
+            if (good) {
+                ggml_backend_tensor_get(t, g_oracle_trace.scratch_float.data(), (size_t) row * t->nb[1], (size_t) n_embd * sizeof(float));
+            } else {
+                g_oracle_trace.scratch_float.assign((size_t) n_embd, 0.0f);
+            }
+            for (int i = 0; i < n_embd; i++) oracle_trace_write_fp16(fp, g_oracle_trace.scratch_float[(size_t) i]);
         }
         for (int il = 0; il < n_layer; il++) {
             ggml_tensor * topk = moe.step_topk[(size_t) il];
@@ -4755,8 +4809,13 @@ void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_res
             }
         }
         g_oracle_trace.n_records++;
+        g_oracle_trace.decode_tokens++;
         g_oracle_trace.prev_token_id = token_id;
         std::fflush(fp);
+        if ((g_oracle_trace.decode_tokens % 32) == 0) {
+            // keep the trace out of the page cache so it never builds up cgroup memory
+            posix_fadvise(fileno(fp), 0, 0, POSIX_FADV_DONTNEED);
+        }
     }
 }
 
@@ -9127,6 +9186,16 @@ static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud) {
         }
     }
     if (!ctx || !ctx->moe_enabled()) {
+        return false;
+    }
+
+    // oracle trace: capture the exact pre-router normalized vector (Mission 66)
+    if (strncmp(nm, "ffn_router_inp-", 15) == 0) {
+        const int ilr = atoi(nm + 15);
+        if (ilr >= 0 && ilr < ctx->moe.n_layer && t->ne[1] == 1) {
+            ggml_set_output(t);
+            ctx->moe.step_router_inp[(size_t) ilr] = t;
+        }
         return false;
     }
 

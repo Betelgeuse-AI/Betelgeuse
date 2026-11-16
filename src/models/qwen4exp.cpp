@@ -1245,6 +1245,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+    // Mission 66: capture the exact pre-router normalized vector (the input
+    // to build_lora_mm(ffn_gate_inp, cur)) for the oracle trace
+    cb(cur, "ffn_router_inp", il);
 
     ggml_tensor * lookahead = nullptr;
     {
