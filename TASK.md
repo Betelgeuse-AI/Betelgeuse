@@ -1035,3 +1035,34 @@ Goal: implement MOE_VRAM_FATE=1 residual-miss VRAM slot rebalancing + MOE_CACHE_
     * memory.peak=12,620,877,824 B = 12,039 MiB (LOWEST PEAK YET!); events low=0 high=0 max=0 oom=0 sock_throttled=3; smaps_rollup Rss=12,453,280 kB; current=12,100,325,376 B = 11,542 MiB.
     * VRAM = 11,525 MiB (LOWEST YET, below M50-54 11,581-11,583) < 11,750; TRUE-VRAM pool 6,883 MiB (4,182 slots); SIGTERM exit_secs=1.0 (< 5 s).
     * HONEST VERDICT: solve failed on its own estimator. Rebalancing toward high-miss layers slightly lowers their misses but catastrophically starves low-miss layers (30-slot floors), net -0.74 hit-rate points and -4.8/-7.8% TG vs M51. The estimate's premise (slot starvation is the binding constraint for NVMe misses) is WRONG at this scale; victim cache hits (identical) and PLE residency already cover the majority. MOE_VRAM_FATE as specified is NOT a speedup; keep MOE_VRAM_FATE=0 as default or consider shallower donor floors if rerun desired.
+
+# betelgeuse-v6.1 - Mission 56
+
+Goal: restore MOE_VRAM_FATE=0 default (M51 parity), audit moe_predictor.* + combined Oracle/PREKICK Architecture; benchmark MOE_CACHE_MIB=8000.
+
+- [x] Task 1 - Set MOE_VRAM_FATE default 0 & audit moe_predictor.* + cross-layer confidence combiner
+  - Change MOE_VRAM_FATE default 1 -> 0 in src/llama-context.cpp (keep MOE_VRAM_FATE=1 opt-in).
+  - Read-only inspect src/moe_predictor.{h,cpp}, src/moe_doorbell.{h,cu}, src/models/qwen4exp.cpp, src/llama-context.cpp; write /home/zyxciss/fluxaeros-data/m56_oracle_blueprint.md answering:
+    * Existing Oracle: exact architecture, input tensor, dimensions, params, file format, invoke site, why only 1.2% in M26.
+    * Retraining on UD-IQ2_XS: what to dump from the model, how to train a compact per-layer Oracle locally on RTX 3060.
+    * Piggybacking on dbs[il]: publish Layer il+1 high-confidence (p>=tau) cold-miss predictions inside dbs[il] when KICK(il) fires (100% host delivery via demand doorbell, full ~1460 us overlap window across WAIT(il) + FFN(il) + Attention(il+1)); how to combine Oracle (il->il+1) + PREKICK (il+1 pre-attn) logit confidences so only high-precision cold misses go spec_ring.
+  - Rebuild; .test_moe_pager PASS 9/9 (result: PASS io_ops=27 io_bytes=14778368 pf_hit=4); committed as b90ba2d2b.
+  - Blueprint committed at /home/zyxciss/fluxaeros-data/m56_oracle_blueprint.md.
+    * Existing Oracle (RouterPredictorV2, src/moe_predictor.{h,cu}): per-layer 512->512 FP16 MLP on routing history only (last 4 steps' top-10 one-hot, 2048 dims; Layer 0 gets 4 own-layer steps, Layers 1-47 get 2 own + 2 prev-layer steps); ~62.9M params, 120.05 MiB binary at data/router_predictor_v2.bin; resident-slot mask then top-16 parallel selection; invoked only by llama_context::moe_predict_and_prefetch() (MOE_PRED=1, off by default). ffn_look path (pre-attn lookahead inside the graph) also never armed.
+    * Why 1.2%: no hidden-state input (routing-only signal loss on the GDN hybrid); zero confidence gating; stale history; cold-mask collapse in resident-heavy layers.
+    * Retraining on UD-IQ2_XS: dump ffn_moe_probs[-_masked-|-_biased]-<il> via existing MOE_TRACE_LOGITS hook (llama_moe_page_cb) + topk dumps; 30 prompts x ~200 tok x 48 layers ~ 110 MB; candidate H1 co-activation Jaccard / H2 per-layer logistic probe on post-attn hidden / H3 LoRA-style residual head on pre_attn_logits; hold-out 20%, cold-Top-2 precision target >= 70% >= (baseline 56%); RTX 3060 overnight per head.
+    * dbs piggyback: extend LayerDoorbell with pred_next[8]/pred_next_conf/pred_generation; KICK(il) tid==0 publishes il+1 predictions inline with the demand doorbell (100% delivery, ~1,460-1,800 us overlap window); host worker honours on the same spin path; combined confidence rule min(oracle_top1_prob, p_score-calibrated) >= tau with pk_skip_vram/pk_skip_cache short-circuits; inflight_joined spec ring join handles dedup.
+- [x] Task 2 - One cgroup-wrapped benchmark (unit=bel-m56-oracle-audit, MOE_VRAM_FATE=0 + MOE_CACHE_MIB=8000 + MOE_PREKICK=0)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_VRAM_FATE=0 MOE_CACHE_MIB=8000 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; --moe-slots 4000; exact p1/p2/p3 (T=0, 120 s HTTP timeout); log m56_oracle_audit_bench.log.
+  - After p3 completes and BEFORE SIGTERM: capture live memory.peak/current/events (high/max/oom), smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s).
+  - Verify 472/472 byte-exact parity vs M51, 0 failed reads; report side-by-side vs M51/M55/Estimate: VRAM misses, Fate RAM slots (5023), hits (39,413 -> ?), nvme_cqe_wait_us, TG & PP, VRAM, MemoryPeak, memory.events.high, SIGTERM time, MOE 1-line summary of m56_oracle_blueprint.md design for Mission 57.
+  - Task 2 SESSION RESULTS (unit bel-m56-oracle-audit; log m56_oracle_audit_bench.log):
+    * ALL 3 prompts completed; **472/472 byte-exact parity vs M51 restored** (p1/p3 content_md5=537a71e9 reasoning_md5=23328639; p2 reasoning_md5=acd130f4, empty content as M45+).
+    * TG p1/p2/p3 = **11.77 / 12.29 / 12.46** vs M51 11.68/12.15/12.25 and M55 10.90/12.35/11.30; estimate 11.75-12.0 / 12.2-12.5 / 12.3-12.6 - MET (at estimate edge, comfort points).
+    * PP = 7.16 / 6.28 / 9.46; graphs reused 197/387/577 identical; VRAM misses = **75,485** (identical to M51, 70.99% hit rate - Fate RAM misses do not move NVMe).
+    * Fate RAM: Tier 1 host cache 7.81 GiB, **5,023 slots** (MOE_CACHE_MIB=8000); [moe_victim_cache] saved=71,489 hits=**39,862** (M51 39,413, +449; estimate 39,900-40,400 - just below but positive) bytes=67,131,494,400 cache_evict=27,171.
+    * [moe_prof] nvme_cqe_wait_us=**36,817,247** (37.27 s M51; estimate 36.5-37.0 s - MET); nvme_us=38,310,446; kernel_us=4,196,340 ple_us=71,002 spec_fallback=0 pk_submitted=0 (MOE_PREKICK=0); rfd_direct_count=75,485 (identical); served=22,967 bytes_read=128,988,646,400 (identical - routing unchanged).
+    * 0 failed reads (44/44 served lines failed=0); target_rank0_replaced == 0 (arena untouched).
+    * memory.peak=13,203,496,960 B = **12,592 MiB** (< MemoryHigh 13,824 MiB); events low=0 high=0 max=0 oom=0 sock_throttled=2; smaps_rollup Rss=12,541,360 kB; current=12,861,034,496 B = **12,261 MiB**.
+    * VRAM = **11,581 MiB** (< 11,750); SIGTERM exit_secs=0.8 (< 5 s).
+    * MOE_VRAM_FATE=0 restores the proven config; MOE_PREKICK=0 isolates the Oracle question; Mission 57 should bring back only the dbs-ARMER predictor, not the graph-op PREKICK.
