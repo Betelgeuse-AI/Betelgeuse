@@ -778,3 +778,16 @@ Goal: fix 58.6% slot=-1 victim-cache rejections and complete MOE_CACHE_MIB=6144 
 - [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=6144 benchmark (CUDA_MODULE_LOADING=EAGER, 120 s client timeout per prompt!)
   - p1/p2/p3 (T=0), 192 tokens each, 120 s budget per prompt; log to /home/zyxciss/fluxaeros-data/m44_async_victim_bench.log.
   - Capture memory.peak/current/events/smaps_rollup/nvidia-smi VRAM; SIGTERM < 5 s + full [moe_prof] dump; verify 472/472 parity vs M34; 0 failed reads; report waterfall, [moe_victim_cache] saved/hits/slot=-1/bytes, TG & PP, VRAM, MemoryPeak, safe M45 headroom.
+
+# betelgeuse-v6.1 - Mission 45
+
+Goal: fix Victim-Cache state==1 recycle freeze + audit VRAM scratch; benchmark MOE_CACHE_MIB=7168.
+
+- [x] Task 1 - Fix state==1 slot freeze (cache_reserve_slot_locked) & audit exact VRAM scratch
+  - Inspect cache_reserve_slot_locked, cache_admit_d2h (src/moe_pager.cpp, src/llama-context.cpp) to explain why M44 saw cache_evict=1,760 hits=18,380 saved=22,169 vs slot=-1 rejections.
+  - Ensure cache_reserve_slot_locked checks cudaEventQuery(cache_ev_[s]) == cudaSuccess on any state==1 (in_flight) candidate slot and transitions it to state=2 (ready) so completed DtoH slots are immediately evictable (zero frozen slots, zero bogus slot=-1 rejections).
+  - Inspect & log exact VRAM allocations at load (cudaMemGetInfo deltas / ggml_backend_sched buffer sizes): explain +314 MiB M44 vs M34 and exact breakdown of ~2.87 GiB non-tensor CUDA scratch/context (identify reducible buffers for --moe-slots increase).
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=7168 benchmark (p1/p2/p3 T=0)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3, 120 s HTTP timeout; log m45_victim_fix_bench.log.
+  - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); 472/472 parity vs M44; 0 failed reads; report [moe_victim_cache] saved/hits/cache_evict/slot=-1, nvme_cqe_wait_us, TG & PP, VRAM + scratch list, MemoryPeak, SIGTERM exit time.
