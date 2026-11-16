@@ -161,6 +161,114 @@ static std::atomic<bool> g_doorbell_running{false};
 static std::thread g_doorbell_thread;
 static std::atomic<bool> g_hot_rank_valid{false};
 
+// Optional oracle trace collector. When MOE_ORACLE_TRACE=<file> is set at
+// process start, a small binary writer is opened. Every ubatch emits one
+// record containing h_t^{(checkpoint il)} (fp16) plus per-layer top-k IDs and
+// scores (fp16). Records are streamed through a FILE* with buffered fwrite.
+// When the env var is unset the writer is nullptr and all hooks are no-ops.
+struct OracleTraceWriter {
+    FILE * fp = nullptr;
+    uint64_t magic = 0;             // "ORCTRCE\0"
+    uint16_t n_layer = 48;
+    uint16_t n_expert = 512;
+    uint16_t top_k = 10;
+    uint16_t n_embd = 2048;
+    uint16_t n_checkpoint = 7;
+    int32_t  checkpoints[7] = {0, 7, 15, 23, 31, 39, 47};
+    uint64_t n_records = 0;
+    int32_t  prev_token_id = -1;
+    std::vector<float> hidden_scratch;   // [n_checkpoint][n_embd] fp32 scratch
+    std::vector<float> scores_scratch;    // [n_layer][n_expert] fp32 scratch
+    std::vector<int32_t> ids_scratch;     // [n_layer][top_k] int32 scratch
+};
+static OracleTraceWriter g_oracle_trace;
+
+static bool oracle_trace_enabled() {
+    static int flag = -1;
+    if (flag < 0) { const char * e = getenv("MOE_ORACLE_TRACE"); flag = (e && e[0]) ? 1 : 0; }
+    return flag == 1;
+}
+
+static void oracle_trace_close() {
+    if (g_oracle_trace.fp) {
+        // rewind and stamp n_records
+        std::fflush(g_oracle_trace.fp);
+        if constexpr (sizeof(uint64_t) == 8) {
+            std::fseek(g_oracle_trace.fp, 24, SEEK_SET); // after magic(8)+6x(u16)=24
+            std::fwrite(&g_oracle_trace.n_records, sizeof(uint64_t), 1, g_oracle_trace.fp);
+        }
+        std::fclose(g_oracle_trace.fp);
+        g_oracle_trace.fp = nullptr;
+    }
+}
+
+static bool oracle_trace_open() {
+    if (g_oracle_trace.fp) return true;
+    const char * path = getenv("MOE_ORACLE_TRACE");
+    if (!path || !path[0]) return false;
+    FILE * fp = std::fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "[moe_oracle_trace] cannot open %s for write\n", path);
+        return false;
+    }
+    g_oracle_trace.fp = fp;
+    g_oracle_trace.hidden_scratch.assign((size_t) g_oracle_trace.n_checkpoint *
+                                          (size_t) g_oracle_trace.n_embd, 0.0f);
+    g_oracle_trace.scores_scratch.assign((size_t) g_oracle_trace.n_layer *
+                                         (size_t) g_oracle_trace.n_expert, 0.0f);
+    g_oracle_trace.ids_scratch.assign((size_t) g_oracle_trace.n_layer *
+                                      (size_t) g_oracle_trace.top_k, -1);
+    g_oracle_trace.magic = 0x4f52435452434500ULL; // "ORCTRCE\0" padding-free
+    // File header layout:
+    //   u64 magic
+    //   u16 n_layer, u16 n_expert, u16 top_k, u16 n_embd,
+    //   u16 n_checkpoint (6 u16 = 12 B)
+    //   int32 checkpoints[7]
+    //   u64 n_records (patched at close)
+    std::fwrite(&g_oracle_trace.magic, sizeof(uint64_t), 1, fp);
+    uint16_t u16 = g_oracle_trace.n_layer;    std::fwrite(&u16, sizeof(u16), 1, fp);
+    u16 = g_oracle_trace.n_expert;             std::fwrite(&u16, sizeof(u16), 1, fp);
+    u16 = g_oracle_trace.top_k;                std::fwrite(&u16, sizeof(u16), 1, fp);
+    u16 = g_oracle_trace.n_embd;               std::fwrite(&u16, sizeof(u16), 1, fp);
+    u16 = g_oracle_trace.n_checkpoint;         std::fwrite(&u16, sizeof(u16), 1, fp);
+    for (int i = 0; i < 7; i++) std::fwrite(&g_oracle_trace.checkpoints[i], sizeof(int32_t), 1, fp);
+    uint64_t zero = 0;
+    std::fwrite(&zero, sizeof(uint64_t), 1, fp);
+    std::fflush(fp);
+    fprintf(stderr, "[moe_oracle_trace] opened %s for binary trace (n_layer=%u n_expert=%u top_k=%u n_embd=%u)\n",
+            path, g_oracle_trace.n_layer, g_oracle_trace.n_expert, g_oracle_trace.top_k, g_oracle_trace.n_embd);
+    return true;
+}
+
+static void oracle_trace_write_u16(FILE * fp, uint16_t v) { std::fwrite(&v, sizeof(v), 1, fp); }
+static void oracle_trace_write_int32(FILE * fp, int32_t v) { std::fwrite(&v, sizeof(v), 1, fp); }
+static void oracle_trace_write_u8(FILE * fp, uint8_t v) { std::fputc((int) v, fp); }
+static void oracle_trace_write_fp16(FILE * fp, float v) {
+    // IEEE binary16 bit pattern for memory compactness (matches numpy.float16).
+    uint32_t x = 0;
+    std::memcpy(&x, &v, sizeof(x));
+    uint32_t sign = (x >> 31) & 0x1;
+    int32_t  exponent = (int32_t) ((x >> 23) & 0xff) - 127;
+    uint32_t mantissa = x & 0x7fffff;
+    uint16_t fp16 = 0;
+    int32_t e16;
+    if (((x >> 23) & 0xff) == 0xff) {
+        e16 = 0x1f; fp16 = (uint16_t) ((sign << 15) | 0x7C00 | (mantissa ? 0x200 : 0));
+    } else if (exponent >= -14) {
+        int32_t e = exponent + 15;
+        if (e > 31) e = 31;
+        fp16 = (uint16_t) ((sign << 15) | ((uint16_t) e << 10) | (mantissa >> 13));
+    } else if (exponent >= -24) {
+        // subnormal
+        int32_t drop = -(exponent + 14);
+        uint32_t m = (mantissa | 0x800000) >> (drop + 1);
+        fp16 = (uint16_t) ((sign << 15) | (uint16_t) m);
+    } else {
+        fp16 = (uint16_t) (sign << 15);
+    }
+    std::fwrite(&fp16, sizeof(fp16), 1, fp);
+}
+
 // Refresh the per-layer frequency rank from the decode counters. The doorbell
 // worker is the only place that counts decodes in that mode, so it owns this.
 static void moe_rank_refresh(llama_context * ctx) {
@@ -2485,6 +2593,16 @@ llama_context::llama_context(
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    if (getenv("MOE_ORACLE_TRACE") && getenv("MOE_ORACLE_TRACE")[0]) {
+        const int ck[7] = {0, 7, 15, 23, 31, 39, 47};
+        for (int i = 0; i < 7; i++) {
+            if (ck[i] <= (int) hparams.n_layer()) {
+                cparams.embeddings_layer_inp[(size_t) ck[i]] = true;
+            }
+        }
+        fprintf(stderr, "[moe_oracle_trace] checkpoint layers {%d,%d,%d,%d,%d,%d,%d} enabled at load\n",
+                ck[0], ck[1], ck[2], ck[3], ck[4], ck[5], ck[6]);
+    }
     cparams.embeddings_layer_inp_dev = false;
     cparams.embeddings_nextn_dev     = false;
     cparams.ctx_state_src            = nullptr;
@@ -2939,6 +3057,7 @@ llama_context::llama_context(
                         moe.exp_rank.assign((size_t) n_layer * n_exp, 0);
                         moe.step_sel.assign((size_t) n_layer * n_used, -1);
                         moe.step_topk.assign((size_t) n_layer, nullptr);
+                        moe.step_weights.assign((size_t) n_layer, nullptr);
                         const char * doorbell_env = getenv("MOE_DOORBELL");
                         const char * predictor_env = getenv("MOE_PRED");
                         const bool demand_only = pager.pack_mode() && (!doorbell_env || atoi(doorbell_env) != 0) && (!predictor_env || atoi(predictor_env) == 0);
@@ -3245,6 +3364,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    oracle_trace_close();
     if (moe_prof_enabled()) {
         const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
         (void) us;
@@ -4573,6 +4693,61 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_result * res) {
+    if (!res) return;
+    const int64_t n_tokens = (int64_t) ubatch.n_tokens;
+    if (n_tokens <= 0) return;
+    const int32_t il_ck[7] = {0, 7, 15, 23, 31, 39, 47};
+    if (!extract_layer_inputs(res, 0, (size_t) n_tokens)) {
+        fprintf(stderr, "[moe_oracle_trace] extract_layer_inputs returned false; skipping dump\n");
+        return;
+    }
+    if (!oracle_trace_open()) return;
+    FILE * fp = g_oracle_trace.fp;
+    const int n_embd = (int) model.hparams.n_embd;
+    const int n_used = (int) moe.n_used;
+    const int n_layer = (int) moe.n_layer;
+    const int n_expert = (int) model.hparams.n_expert;
+    for (int64_t row = 0; row < n_tokens; row++) {
+        const bool is_decode = (n_tokens == 1);
+        const int32_t token_id = ubatch.token[(size_t) row];
+        const int32_t prev_id = g_oracle_trace.prev_token_id;
+        oracle_trace_write_u8(fp, is_decode ? 1 : 0);
+        oracle_trace_write_int32(fp, token_id);
+        oracle_trace_write_int32(fp, prev_id);
+        for (int c = 0; c < 7; c++) {
+            const float * srcp = embd_layer_inp[(size_t) il_ck[c]].data + row * n_embd;
+            if (!srcp) continue;
+            for (int i = 0; i < n_embd; i++) oracle_trace_write_fp16(fp, srcp[i]);
+        }
+        for (int il = 0; il < n_layer; il++) {
+            ggml_tensor * topk = moe.step_topk[(size_t) il];
+            ggml_tensor * weights = moe.step_weights[(size_t) il];
+            std::vector<int32_t> ids_host((size_t) n_used);
+            std::vector<float>   weights_host((size_t) n_used);
+            if (topk && row < (int64_t) topk->ne[1]) {
+                ggml_backend_tensor_get(topk, ids_host.data(), (size_t) row * topk->nb[1], (size_t) n_used * sizeof(int32_t));
+            } else {
+                for (size_t i = 0; i < ids_host.size(); i++) ids_host[i] = 0xffff;
+            }
+            if (weights && row < (int64_t) weights->ne[1]) {
+                ggml_backend_tensor_get(weights, weights_host.data(), (size_t) row * weights->nb[1], (size_t) n_used * sizeof(float));
+            } else {
+                for (size_t i = 0; i < weights_host.size(); i++) weights_host[i] = 0.f;
+            }
+            for (int k = 0; k < 10; k++) {
+                const int v = (k < n_used && ids_host[(size_t) k] >= 0 && ids_host[(size_t) k] < n_expert) ? ids_host[(size_t) k] : 0xffff;
+                oracle_trace_write_u16(fp, (uint16_t) v);
+            }
+            for (int k = 0; k < 10; k++) {
+                oracle_trace_write_fp16(fp, k < n_used ? weights_host[(size_t) k] : 0.f);
+            }
+        }
+        g_oracle_trace.n_records++;
+        g_oracle_trace.prev_token_id = token_id;
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -4667,6 +4842,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status = %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    // Mission 64: oracle trace dump (free if MOE_ORACLE_TRACE unset)
+    if (getenv("MOE_ORACLE_TRACE") && getenv("MOE_ORACLE_TRACE")[0]) {
+        oracle_trace_dump(ubatch, res);
     }
 
     {
@@ -6159,7 +6338,12 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
         if (moe_ready && strcmp(name, "ffn_moe_topk") == 0 && il >= 0 && il < moe.n_layer) {
+            ggml_set_output(cur);
             const_cast<llama_context*>(this)->moe.step_topk[(size_t) il] = cur;
+        }
+        if (moe_ready && strcmp(name, "ffn_moe_weights_norm") == 0 && il >= 0 && il < moe.n_layer) {
+            ggml_set_output(cur);
+            const_cast<llama_context*>(this)->moe.step_weights[(size_t) il] = cur;
         }
         const char * verify_path = getenv("MOE_VERIFY_ROUTER");
         if (verify_path && verify_path[0] && strcmp(name, "ffn_moe_logits") == 0) {

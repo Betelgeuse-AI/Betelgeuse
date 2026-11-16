@@ -262,6 +262,10 @@ private:
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    // Mission 64: stream a binary trace of per-token routing + hidden states when
+    // MOE_ORACLE_TRACE=<path> is set. To stays split and behaviorally identical to
+    // the shipping path when the env var is unset.
+    void oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_result * res);
 
     // (re)allocate the device buffer for cparams.embeddings_layer_inp_dev
     void layer_inp_dev_alloc();
@@ -327,6 +331,8 @@ public:
         // ffn_moe_topk-<il> node of the graph in flight, kept so the
         // between-launches refresh can read the routing it just produced
         std::vector<ggml_tensor *> step_topk;
+        // Mission 64 (MOE_ORACLE_TRACE): normalized routing weights per layer per ubatch
+        std::vector<ggml_tensor *> step_weights;
         // last ubatch width seen; used to detect the prefill->decode edge
         uint32_t last_ntok = 0;
         // Direction 1: one extra all-zero slot per layer absorbing cold misses
