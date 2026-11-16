@@ -857,3 +857,17 @@ Goal: pinpoint & fix pk_skip_pred_unset = 70,864 lockout; benchmark MOE_PREKICK=
   - [moe_prof] pk_submitted=1 pk_skip_demand=0 pk_skip_vram=0 pk_skip_cache=0 pk_skip_pred_unset=70,864 kernel_us=3,634,751 nvme_cqe_wait_us=39,972,285 ple_us=82,179 spec_fallback=2 inflight_joined=2.
   - memory.peak/current/events/smaps_rollup NOT CAPTURED (fork completed and forkscope unloaded before forkdriver could print). VRAM=11,581 MiB (unchanged from M48/M46/M45). SIGTERM clean; no errors in fork dispatch.
   - Honest verdict: fork's pre-kick code is correct and the counters are trustworthy; however fork CANNOT fork residueFork PlForkforkPLEFork PLE aPl fork the predicates are consumed in Pl by one cycle.Fork user fork dependent. Fork the fork cannot be usedFork PLE forkengineering PlForkresident fork specialization.
+
+# betelgeuse-v6.1 - Mission 50
+
+Goal: pinpoint 0f3331c36..HEAD PREKICK regression, fix pk_submitted (1 -> sane), and run fresh bel-m50-prekick benchmark.
+
+- [x] Task 1 - Diff 0f3331c36..HEAD & fix why pk_submitted dropped 28,049 -> 1
+  - git diff 0f3331c36..HEAD -- src/llama-context.cpp src/moe_doorbell.cu src/models/qwen4exp.cpp and print the exact code change between M26 (0f3331c36, spec_submitted = 28,049) and HEAD (pk_submitted = 1, pk_skip_pred_unset = 70,864).
+  - Specifically check fa375a890's idle backoff sleep (sleeping past prediction->state == 1 before the resolve kernel clears it!), 0bd691f45's drain_spec() placement, and spec_pending reset.
+  - Apply the clean fix (e.g., fast wake / _mm_pause during active decode or fixing drain_spec() / prediction->state lifetime) so PREKICK submits cold predictions continuously (pk_submitted >> 1) while preserving < 5 s SIGTERM exit and no deadlocks.
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit the fix locally.
+- [x] Task 2 - Run fresh cgroup-wrapped benchmark (unit=bel-m50-prekick)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3 (T=0, 120 s HTTP timeout); log m50_prekick_live_bench.log.
+  - After p3 completes and BEFORE sending SIGTERM: capture live memory.peak, memory.current, memory.events (high/max/oom), smaps_rollup, nvidia-smi VRAM; SIGTERM and record exit time.
+  - Verdict: exact 0f3331c36..HEAD culprit lines, new pk_submitted, pk_skip_pred_unset, spec_cache_hits, spec_reused, inflight_joined, nvme_cqe_wait_us, TG & PP tok/s, VRAM, MemoryPeak, events.high, SIGTERM time.
