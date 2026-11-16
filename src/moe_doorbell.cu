@@ -56,6 +56,12 @@ static size_t g_stage_stride = 0;
 static int g_stage_cap = 0;
 static int g_n_layer = 0;
 static bool g_active = false;
+
+static bool destructor_env_trace() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("MOE_DESTRUCTOR_TRACE"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v == 1;
+}
 static bool g_count_enabled = false;
 static uint64_t g_logged_selected = 0;
 static cudaStream_t g_stream_h2d = nullptr;
@@ -741,11 +747,13 @@ bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
 }
 
 void moe_doorbell_free() {
+    if (destructor_env_trace()) fprintf(stderr, "[~llama_context] moe_doorbell_free: stream sync begin\n");
     if (g_stream_h2d) {
         cudaStreamSynchronize(g_stream_h2d);
         cudaStreamDestroy(g_stream_h2d);
         g_stream_h2d = nullptr;
     }
+    if (destructor_env_trace()) fprintf(stderr, "[~llama_context] moe_doorbell_free: H2D stream dealt, freeing dma/lru buffers\n");
     if (g_dma_done) cudaFree(g_dma_done);
     if (g_dma_one) cudaFreeHost(g_dma_one);
     g_dma_done = g_dma_one = nullptr;

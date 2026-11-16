@@ -179,6 +179,12 @@ static void moe_rank_refresh(llama_context * ctx) {
     g_hot_rank_valid.store(true, std::memory_order_relaxed);
 }
 
+static bool destructor_trace() {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("MOE_DESTRUCTOR_TRACE"); v = (e && atoi(e) != 0) ? 1 : 0; }
+    return v == 1;
+}
+
 static void start_doorbell_worker(llama_context * ctx) {
     if (g_doorbell_running.load()) return;
     g_doorbell_running.store(true);
@@ -326,7 +332,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             for (int r = 0; r < need && ok; r++) {
                 struct io_uring_sqe * cancellation = io_uring_get_sqe(&spec_ring);
                 if (!cancellation) { ok = false; break; }
-                io_uring_prep_cancel64(cancellation, (uint64_t) spec_pending * 4 + r + 1, 0);
+                io_uring_prep_cancel64(cancellation, (uint64_t) spec_pending * 4 + r + 1, IORING_ASYNC_CANCEL_USERDATA);
                 cancellation->user_data = UINT64_MAX;
             }
             if (ok) {
@@ -335,6 +341,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             }
         };
 
+        int64_t idle_iters = 0;
         while (g_doorbell_running.load(std::memory_order_relaxed)) {
             drain_spec();
             bool handled = false;
@@ -1259,19 +1266,37 @@ static void start_doorbell_worker(llama_context * ctx) {
                         if (moe_prof_enabled()) g_moe_prof.prekick_us += (uint64_t) moe_prof_now() - (uint64_t) t_pk0;
                     }
                 }
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#else
-                std::this_thread::yield();
-#endif
+            if (handled) {
+                idle_iters = 0;
+            } else {
+                const int64_t s = std::min<int64_t>(256, (int64_t) 16 << std::min<int64_t>(idle_iters, 4));
+                std::this_thread::sleep_for(std::chrono::microseconds(s));
+                idle_iters++;
+            }
             }
         }
+        if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: main loop exited, ring_ok=%d spec_ok=%d spec_pending=%d\n", ring_ok ? 1 : 0, spec_ok ? 1 : 0, spec_pending);
         if (ring_ok) {
             io_uring_queue_exit(&ring);
         }
         if (spec_ok) {
             cancel_spec();
-            while (spec_pending >= 0 || spec_cancel_pending) drain_spec();
+            if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: cancel_spec done, drain loop enter\n");
+            // bound the spec drain: NVMe reads take ~1 ms; a cancelled SQE that
+            // never produces a CQE must not hang the teardown forever
+            const int64_t drain_deadline_us = moe_prof_now() + 2000 * 1000;
+            while ((spec_pending >= 0 || spec_cancel_pending) &&
+                   moe_prof_now() < drain_deadline_us) {
+                drain_spec();
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            if (spec_pending >= 0 || spec_cancel_pending) {
+                fprintf(stderr, "[~llama_context] spec drain timed out (pending=%d cancel=%d); dropping\n",
+                        spec_pending, (int) spec_cancel_pending);
+                spec_pending = -1;
+                spec_cancel_pending = false;
+            }
+            if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: drain loop exited, pending=%d cancel=%d\n", spec_pending, (int) spec_cancel_pending);
             io_uring_queue_exit(&spec_ring);
             free(spec_stage);
         }
@@ -1280,14 +1305,17 @@ static void start_doorbell_worker(llama_context * ctx) {
         if (fd_gguf >= 0) {
             close(fd_gguf);
         }
+        if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: lambda returning\n");
     });
 }
 
 static void stop_doorbell_worker() {
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] stop_doorbell_worker: setting running=false\n");
     g_doorbell_running.store(false);
     if (g_doorbell_thread.joinable()) {
         g_doorbell_thread.join();
     }
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell worker joined\n");
 }
 
 static void moe_slot_resolve_sync(
@@ -2898,18 +2926,25 @@ llama_context::~llama_context() {
                     (unsigned long long) g_moe_prof.misses[il].load());
         }
     }
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] flush done pid=%d, entering synchronize()\n", (int) getpid());
     synchronize();
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] synchronize() returned\n");
     if (g_moe_resolve_ctx == this) {
         stop_doorbell_worker();
         if (moe_doorbell_is_active()) {
+            if (destructor_trace()) fprintf(stderr, "[~llama_context] entering moe_doorbell_free()\n");
             moe_doorbell_free();
+            if (destructor_trace()) fprintf(stderr, "[~llama_context] moe_doorbell_free() done\n");
         }
     }
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] entering moe_oracle_stop()\n");
     moe_oracle_stop(this);
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] moe_oracle_stop() done\n");
     io_run.store(false);
     io_cv.notify_all();
     for (auto & th : io_thr) if (th.joinable()) th.join();
     io_thr.clear();
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] io workers joined\n");
     if (g_moe_resolve_ctx == this) {
         g_moe_resolve_ctx = nullptr;
     }
