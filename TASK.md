@@ -748,3 +748,9 @@ Goal: capture real hung-thread backtraces via gdb direct child + SIGTRAP; audit 
     set pagination off / set confirm off / handle SIGTRAP stop print nopass / run / thread apply all bt / kill / quit
   - Inside systemd-run --user --scope, start gdb -batch -x m41_gdb.cmds --args build-v1/bin/bel-server <M39 env> > m41_hang_bt.log 2>&1 & (GDB_PID=$!); wait for /health 200; p1 with max_tokens=8; hang ~30-40 s; CHILD_PID=$(pgrep -P "$GDB_PID" | head -1) has comm == bel-server; kill -TRAP "$CHILD_PID"; gdb finishes writing bt log.
   - Confirm m41_hang_bt.log contains full thread apply all bt frames; write exact stuck frames & root cause to /home/zyxciss/fluxaeros-data/m41_hang_triage.md; mark TASK.md [x]; commit docs locally; report exact stuck stack frames (main + doorbell worker + active threads).
+
+# betelgeuse-v6.1 - Mission 42
+
+Goal: verbatim extraction of m41_hang_bt.log frames.
+
+- [x] Task 1 - Extract verbatim frames #0..#26 for Thread 1 (LWP 384740) and Thread 39 (LWP 384843), plus any other thread NOT in idle pthread_cond_wait/epoll_wait/futex/poll/sleep; grep for madvise/page/ple/cudaFuncSetAttribute/rwlock; save to /home/zyxciss/fluxaeros-data/m42_bt_exact.md; commit locally.
