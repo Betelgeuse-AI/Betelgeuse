@@ -791,3 +791,14 @@ Goal: fix Victim-Cache state==1 recycle freeze + audit VRAM scratch; benchmark M
 - [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=7168 benchmark (p1/p2/p3 T=0)
   - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3, 120 s HTTP timeout; log m45_victim_fix_bench.log.
   - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); 472/472 parity vs M44; 0 failed reads; report [moe_victim_cache] saved/hits/cache_evict/slot=-1, nvme_cqe_wait_us, TG & PP, VRAM + scratch list, MemoryPeak, SIGTERM exit time.
+
+# betelgeuse-v6.1 - Mission 46
+
+Goal: exact cudaMemGetInfo VRAM breakdown + verify PREKICK submission; benchmark MOE_PREKICK=1 on M45.
+
+- [x] Task 1 - Exact 3.11 GiB VRAM breakdown + PREKICK submission check & fix
+  - Add clean startup cudaMemGetInfo delta prints (gated on MOE_IO_DIAG=1 or load info) around each major GPU allocation at load (CUDA context, model weights, KV cache, moe.pool_*, moe_doorbell_stage_init, ggml_backend_sched compute reserve at -ub 64, init_cache cudaHostRegister + 8,470 cudaEvents +314 MiB, CUDA Graph capture) — explaining every MiB of the 3,187 MiB (11,579 - 8,392) non-tensor VRAM and identifying how much extra --moe-slots / per-tensor accounting cleans up.
+  - Inspect why M33 only saw spec_submitted=3 (vs M14's 18,934) when MOE_PREKICK=1 ran with MOE_DEMAND_DIRECT=1 (check if M31's PREKICK -> fd_pack_ change or any guard broke PREKICK submission during decode). Fix cleanly if broken so MOE_PREKICK=1 submits decode predictions normally (using 0bd691f45 zero-spin + cache_has RAM skip), rebuild build-v1/bin/bel-server, run .test_moe_pager (PASS 9/9), and commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_PREKICK=1 benchmark on exact M45 config (p1/p2/p3 T=0)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3, 120 s HTTP timeout; log to /home/zyxciss/fluxaeros-data/m46_prekick_victim_bench.log.
+  - Capture VRAM allocations at load via cudaMemGetInfo deltas; capture memory.peak/current/events/smaps_rollup/nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); save full breakdown to /home/zyxciss/fluxaeros-data/m46_vram_prekick_audit.md; 472/472 parity vs M45; report: VRAM table, PREKICK stats (spec_submitted, spec_cache_hits, spec_reused, inflight_joined, spec_fallback), [moe_prof] waterfall, TG & PP, VRAM, MemoryPeak, SIGTERM time.
