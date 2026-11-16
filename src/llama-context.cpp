@@ -234,6 +234,8 @@ static void start_doorbell_worker(llama_context * ctx) {
         bool spec_ok = ring_ok && prekick_env && atoi(prekick_env) != 0 &&
             (!split_env || atoi(split_env) != 0) &&
             io_uring_queue_init(16, &spec_ring, 0) == 0;
+        if (getenv("MOE_IO_DIAG") && atoi(getenv("MOE_IO_DIAG")) != 0) fprintf(stderr, "[doorbell_worker] spec_ring init: ring_ok=%d prekick_env=%s split_env=%s spec_ok=%d\n",
+                ring_ok ? 1 : 0, prekick_env ? prekick_env : "(null)", split_env ? split_env : "(null)", spec_ok ? 1 : 0);
         char * spec_stage = nullptr;
         // 64 MiB backstop for coalesced O_DIRECT span reads (allocated on first use)
         char * stage_bounce_ = nullptr;
@@ -2797,6 +2799,12 @@ llama_context::llama_context(
                 }
             }
         }
+        if (getenv("MOE_IO_DIAG") && atoi(getenv("MOE_IO_DIAG")) != 0) {
+            size_t f, t;
+            ggml_backend_cuda_get_device_memory(0, &f, &t);
+            fprintf(stderr, "[cuda_vmem] after_moe_init: free=%.1f MiB used=%.1f MiB\n",
+                (double) f / 1048576.0, (double) (t - f) / 1048576.0);
+        }
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
@@ -2895,6 +2903,12 @@ llama_context::llama_context(
         }
 
         sched_reserve();
+        if (getenv("MOE_IO_DIAG") && atoi(getenv("MOE_IO_DIAG")) != 0) {
+            size_t f, t;
+            ggml_backend_cuda_get_device_memory(0, &f, &t);
+            fprintf(stderr, "[cuda_vmem] after_sched_reserve: free=%.1f MiB used=%.1f MiB\n",
+                (double) f / 1048576.0, (double) (t - f) / 1048576.0);
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {

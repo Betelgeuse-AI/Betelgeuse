@@ -11,6 +11,7 @@
 #include "llama-model-saver.h"
 #include "llama-model.h"
 
+#include "ggml-cuda.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
@@ -367,6 +368,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+        if (getenv("MOE_IO_DIAG") && atoi(getenv("MOE_IO_DIAG")) != 0) {
+            size_t f, t;
+            ggml_backend_cuda_get_device_memory(0, &f, &t);
+            fprintf(stderr, "[cuda_vmem] after_load_tensors: free=%.1f MiB used=%.1f MiB\n",
+                (double) f / 1048576.0, (double) (t - f) / 1048576.0);
         }
 
         return {0, model_ptr.release()};
