@@ -202,7 +202,7 @@ static void oracle_trace_close() {
     }
 }
 
-static bool oracle_trace_open() {
+static bool oracle_trace_open(int n_layer, int n_expert, int top_k, int n_embd) {
     if (g_oracle_trace.fp) return true;
     const char * path = getenv("MOE_ORACLE_TRACE");
     if (!path || !path[0]) return false;
@@ -212,6 +212,10 @@ static bool oracle_trace_open() {
         return false;
     }
     g_oracle_trace.fp = fp;
+    g_oracle_trace.n_layer = (uint16_t) n_layer;
+    g_oracle_trace.n_expert = (uint16_t) n_expert;
+    g_oracle_trace.top_k = (uint16_t) top_k;
+    g_oracle_trace.n_embd = (uint16_t) n_embd;
     g_oracle_trace.hidden_scratch.assign((size_t) g_oracle_trace.n_checkpoint *
                                           (size_t) g_oracle_trace.n_embd, 0.0f);
     g_oracle_trace.scores_scratch.assign((size_t) g_oracle_trace.n_layer *
@@ -245,6 +249,11 @@ static void oracle_trace_write_int32(FILE * fp, int32_t v) { std::fwrite(&v, siz
 static void oracle_trace_write_u8(FILE * fp, uint8_t v) { std::fputc((int) v, fp); }
 static void oracle_trace_write_fp16(FILE * fp, float v) {
     // IEEE binary16 bit pattern for memory compactness (matches numpy.float16).
+    // Clamp to the finite fp16 range so extreme hc-stream activations cannot
+    // poison the checkpoint hiddens with NaN halves.
+    if (std::isnan(v)) v = 0.0f;
+    else if (v > 65504.0f) v = 65504.0f;
+    else if (v < -65504.0f) v = -65504.0f;
     uint32_t x = 0;
     std::memcpy(&x, &v, sizeof(x));
     uint32_t sign = (x >> 31) & 0x1;
@@ -4704,7 +4713,7 @@ void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_res
         fprintf(stderr, "[moe_oracle_trace] extract_layer_inputs returned false; skipping dump\n");
         return;
     }
-    if (!oracle_trace_open()) return;
+    if (!oracle_trace_open((int) moe.n_layer, (int) model.hparams.n_expert, (int) moe.n_used, (int) model.hparams.n_embd)) return;
     FILE * fp = g_oracle_trace.fp;
     const int n_embd = (int) model.hparams.n_embd;
     const int n_used = (int) moe.n_used;
@@ -9121,6 +9130,18 @@ static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud) {
         return false;
     }
 
+    // oracle trace: keep the CURRENT normalized router weights on decode;
+    // the topk-only capture above leaves step_weights pointing at a freed
+    // prefill arena during decode
+    if (strncmp(nm, "ffn_moe_weights_norm-", 21) == 0) {
+        const int ilw = atoi(nm + 21);
+        if (ilw >= 0 && ilw < ctx->moe.n_layer && t->ne[1] == 1) {
+            ggml_set_output(t);
+            ctx->moe.step_weights[(size_t) ilw] = t;
+        }
+        return false;
+    }
+
     if (strncmp(nm, "ffn_moe_topk-", 13) != 0) {
         return false;
     }
@@ -9153,6 +9174,11 @@ static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud) {
     {
         static int m2 = -1;
         if (t->ne[1] == 1) {
+            // capture the CURRENT routing tensor for the oracle trace and the
+            // post-refresh path; the old code returned before the assignment
+            // below and left step_topk pointing at a freed prefill arena
+            ggml_set_output(t);
+            ctx->moe.step_topk[(size_t) il] = t;
             return true; // Decode: page experts on host during graph build so GPU kernel finds them resident → fast path → no doorbell → no deadlock
         }
         if (m2 < 0) {
