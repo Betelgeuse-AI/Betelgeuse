@@ -127,6 +127,7 @@ __device__ __forceinline__ void doorbell_copy(char * dst, const char * src, size
 // rings the host doorbell and spins until the pager filled the missing slots.
 __global__ void moe_resolve_slots_kernel(
     int layer,
+    int n_layer,
     const char * __restrict__ topk,
     char       * __restrict__ out,
     int32_t    * __restrict__ slot_map,
@@ -234,6 +235,18 @@ __global__ void moe_resolve_slots_kernel(
             const bool cleared = pred_ref.compare_exchange_strong(expected, 0u);
             if (cleared) pre.kick_cas_cleared += 1;
         }
+    }
+
+    if (tid == 0 && op == GGML_OP_MOE_SLOT_RESOLVE_KICK && layer + 1 < n_layer) {
+        // piggyback il -> il+1 lookahead onto this demand doorbell
+        const DoorbellPrekick & pre_next = prekick_plans[layer + 1];
+        const uint32_t npred = pre_next.n > 0 ? (pre_next.n > 2u ? 2u : pre_next.n) : 0u;
+        pci_st_u32(&db.pred_layer, (uint32_t) layer + 1);
+        pci_st_u32(&db.pred_count, npred);
+        pci_st_u32(&db.pred_generation, pre_next.generation);
+        if (npred > 0) pci_st_u32(&db.pred_next[0], (uint32_t) pre_next.experts[0]);
+        if (npred > 1) pci_st_u32(&db.pred_next[1], (uint32_t) pre_next.experts[1]);
+        __threadfence_system();
     }
 
     if (s_miss == 0) {
@@ -520,7 +533,7 @@ void moe_doorbell_resolve_launch(
     if (total64 <= MOE_DOORBELL_PLAN_MAX) {
         const int total = (int) total64;
         moe_resolve_slots_kernel<<<1, 1024, 0, s>>>(
-            il, (const char *) topk, (char *) out, const_cast<int32_t *>(table),
+            il, g_n_layer, (const char *) topk, (char *) out, const_cast<int32_t *>(table),
             g_doorbells_dev, g_plans_dev, g_prekick_dev,
             (int) nk, (int) nt, topk_nb0, topk_nb1, out_nb0, out_nb1,
             n_exp, sentinel, total, op, g_count_enabled, g_dma_done, use_dma, g_lru_dev, g_lru_epoch

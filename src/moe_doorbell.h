@@ -20,6 +20,14 @@ struct alignas(64) LayerDoorbell {
     uint64_t decode_layers;
     uint64_t decode_selected;
     uint64_t decode_misses;
+    // Mission 57 (MOE_ORACLE_DBS=1): cross-layer il -> il+1 lookahead packet,
+    // published by KICK(il) before the demand doorbell is rung; consumed by the
+    // host worker on the same iteration it services the demand batch.
+    volatile uint32_t pred_layer;      // il + 1
+    volatile uint32_t pred_count;      // number of candidate experts written
+    volatile uint32_t pred_next[2];    // up to 2 cold-expert ids for il + 1
+    volatile uint32_t pred_generation; // prekick plans[il + 1] generation
+    uint32_t pad2[10];
 };
 
 bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer);

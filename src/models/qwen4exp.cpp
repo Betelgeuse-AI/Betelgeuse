@@ -510,9 +510,11 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
         const char * prekick_env = getenv("MOE_PREKICK");
         const char * doorbell_env = getenv("MOE_DOORBELL");
         const char * split_env = getenv("MOE_SPLIT");
+        const char * oracle_dbs_env = getenv("MOE_ORACLE_DBS");
+        const bool oracle_dbs = oracle_dbs_env && atoi(oracle_dbs_env) != 0;
         if (n_tokens == 1 && cparams.moe_direct_io &&
             prekick_env && atoi(prekick_env) != 0 && (!doorbell_env || atoi(doorbell_env) != 0) &&
-            (!split_env || atoi(split_env) != 0) &&
+            (!split_env || atoi(split_env) != 0) && !oracle_dbs &&
             moe_n_layer > il && moe_table && moe_table[il] && moe_up && moe_up[il]) {
             hc_mix pre_mix = build_hc_mix(res_hc,
                     model.layers[il].hc_ffn_norm, model.layers[il].hc_ffn_down,
@@ -1280,6 +1282,31 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     ggml_tensor * ffn_shexp = nullptr;
     const char * doorbell_env = getenv("MOE_DOORBELL");
     const char * split_env = getenv("MOE_SPLIT");
+    // Mission 57: cross-layer il -> il+1 lookahead oracle, dispatched before the KICK
+    // so KICK(il) can piggyback the il+1 predictions onto the demand doorbell
+    const char * oracle_env = getenv("MOE_ORACLE_DBS");
+    const bool oracle_dbs = n_tokens == 1 && cparams.moe_direct_io &&
+        oracle_env && atoi(oracle_env) != 0 && (!doorbell_env || atoi(doorbell_env) != 0) &&
+        (!split_env || atoi(split_env) != 0) && il + 1 < (int) model.layers.size() &&
+        model.layers[il + 1].ffn_gate_inp != nullptr &&
+        moe_up && moe_up[il + 1] && moe_table && moe_table[il + 1];
+    if (oracle_dbs) {
+        hc_mix oracle_mix = build_hc_mix(cur,
+                model.layers[il + 1].hc_ffn_norm,
+                model.layers[il + 1].hc_ffn_down,
+                model.layers[il + 1].hc_ffn_up,
+                nullptr, nullptr, il + 1);
+        ggml_tensor * oracle_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, oracle_mix.cur);
+        cb(oracle_logits, "ffn_moe_oracle_logits", il + 1);
+        const int32_t sentinel_next = (int32_t) (((ggml_tensor *) moe_up[il + 1])->ne[2] - 1);
+        const char * ocount_env = getenv("MOE_ORACLE_DBS_M");
+        int ocount = ocount_env ? atoi(ocount_env) : 2;
+        if (ocount < 2 || ocount > 3) ocount = 2;
+        ggml_tensor * oracle_prekick = ggml_moe_slot_prekick(ctx0, oracle_logits,
+                (ggml_tensor *) moe_table[il + 1], il + 1, sentinel_next, ocount);
+        cb(oracle_prekick, "ffn_moe_oracle_prekick", il + 1);
+        ggml_build_forward_expand(gf, oracle_prekick);
+    }
     if (n_tokens == 1 && cur->ne[1] == 1 && cparams.moe_direct_io &&
         (!doorbell_env || atoi(doorbell_env) != 0) && (!split_env || atoi(split_env) != 0) &&
         moe_n_layer > il && moe_table && moe_table[il] &&

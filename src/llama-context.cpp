@@ -1021,6 +1021,96 @@ static void start_doorbell_worker(llama_context * ctx) {
                         fprintf(stderr, "[doorbell_worker] io_uring submit failed, falling back to pread\n");
                     }
 
+                    // Mission 57 (MOE_ORACLE_DBS=1): honor il -> il+1 cross-layer
+                    // predictions published by KICK(il) on the demand doorbell.
+                    if (dbs[il].pred_count > 0 && dbs[il].pred_layer == (uint32_t) il + 1) {
+                        const int tgt = il + 1;
+                        if (tgt < n_layer && spec_ok && spec_pending < 0 && !spec_cancel_pending) {
+                            const uint32_t npred = dbs[il].pred_count > 2u ? 2u : dbs[il].pred_count;
+                            for (uint32_t pi = 0; pi < npred; pi++) {
+                                const int32_t e = (int32_t) dbs[il].pred_next[pi];
+                                if (e < 0 || e >= n_exp) continue;
+                                if (ctx->moe.slot_of[(size_t) tgt * n_exp + e] >= 0) {
+                                    if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
+                                    continue;
+                                }
+                                if (ctx->pager.cache_has(tgt, e)) {
+                                    if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
+                                    continue;
+                                }
+                                const int selected = pi + 1;
+                                for (int z = 0; z < 8; z++) {
+                                    spec_ready[z] = false;
+                                    spec_lengths[z] = 0;
+                                    spec_got_bytes[z] = 0;
+                                    spec_got_roles[z] = 0;
+                                    spec_got_cancel[z] = 0;
+                                }
+                                spec_experts[selected] = e;
+                                const auto submit_started = std::chrono::steady_clock::now();
+                                int n_sqe = 0;
+                                if (ctx->pager.pack_mode()) {
+                                    const auto location = ctx->pager.pack_loc(tgt, e);
+                                    const int spec_fd = ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : location.fd;
+                                    if (spec_fd < 0 || location.len > stride) break;
+                                    spec_lengths[selected] = (uint32_t) location.len;
+                                    struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
+                                    if (!read) break;
+                                    io_uring_prep_read(read, spec_fd,
+                                            spec_stage + (size_t) selected * stride,
+                                            (uint32_t) location.len, (off_t) location.off);
+                                    read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+                                    if (spec_async) read->flags |= IOSQE_ASYNC;
+                                    read->user_data = (uint64_t) selected * 4 + 1;
+                                    n_sqe = 1;
+                                } else {
+                                    const moe_expert_slice * s = ctx->pager.slices(tgt, e);
+                                    const size_t vg = ctx->moe.host_gate[tgt];
+                                    const size_t vu = ctx->moe.host_up[tgt];
+                                    const size_t vd = ctx->moe.host_down[tgt];
+                                    if (vg + vu + vd > stride) break;
+                                    spec_lengths[selected] = (uint32_t) (vg + vu + vd);
+                                    const size_t off[3] = { 0, vg, vg + vu };
+                                    const size_t want[3] = { vg, vu, vd };
+                                    bool ok = true;
+                                    for (int r = 0; r < 3 && ok; r++) {
+                                        const int kfd = s[r].fd >= 0 ? s[r].fd : fd_gguf;
+                                        struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
+                                        if (!read) { ok = false; break; }
+                                        io_uring_prep_read(read, kfd,
+                                                spec_stage + (size_t) selected * stride + off[r],
+                                                (uint32_t) want[r],
+                                                (off_t) (s[r].off + s[r].pre));
+                                        read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+                                        if (spec_async) read->flags |= IOSQE_ASYNC;
+                                        read->user_data = (uint64_t) selected * 4 + r + 1;
+                                        n_sqe++;
+                                    }
+                                    if (!ok) break;
+                                }
+                                if (n_sqe > 0 && io_uring_submit(&spec_ring) == n_sqe) {
+                                    spec_pending = selected;
+                                    spec_layer = tgt;
+                                    spec_ring_inflight += n_sqe;
+                                    spec_next = selected;
+                                    spec_count = selected; // only one candidate per layer-pass
+                                    spec_generation = dbs[il].pred_generation;
+                                    spec_submitted++;
+                                    if (moe_prof_enabled()) g_moe_prof.pk_submitted++;
+                                    spec_layer = tgt;
+                                    if (io_diag) {
+                                        spec_bytes += spec_lengths[selected];
+                                        spec_started = submit_started;
+                                        spec_submit_ms += std::chrono::duration<double, std::milli>(
+                                                std::chrono::steady_clock::now() - submit_started).count();
+                                    }
+                                }
+                                // only one candidate in flight per layer-pass
+                                break;
+                            }
+                        }
+                    }
+
                     // pre-failed experts must release the kernel now
                     for (int ci = 0; ci < ncopy; ++ci) {
                         if (left[(size_t) ci] == 0 && ci != spec_copy) fail_ci(ci);
