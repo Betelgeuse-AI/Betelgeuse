@@ -4752,7 +4752,9 @@ void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_res
     if (!res) return;
     const int64_t n_tokens = (int64_t) ubatch.n_tokens;
     if (n_tokens != 1) {
-        if (n_tokens > 1) g_oracle_trace.prompt_id++; // count prefill chunks as prompt boundaries
+        // pos[0] == 0 marks the FIRST chunk of a prompt; later chunks/batches
+        // keep the count, so decode records can be split by prompt below
+        if (ubatch.pos && ubatch.pos[0] == 0) g_oracle_trace.prompt_id++;
         return;
     }
     if (!oracle_trace_open((int) moe.n_layer, (int) model.hparams.n_expert, (int) moe.n_used, (int) model.hparams.n_embd)) return;
