@@ -1958,7 +1958,7 @@ static const int fate_miss[48] = {
 static bool moe_vram_fate_enabled(int n_layer) {
     if (n_layer != 48) return false;
     static int flag = -1;
-    if (flag < 0) { const char * e = getenv("MOE_VRAM_FATE"); flag = (!e || atoi(e) != 0) ? 1 : 0; }
+    if (flag < 0) { const char * e = getenv("MOE_VRAM_FATE"); flag = (e && atoi(e) != 0) ? 1 : 0; }
     return flag == 1;
 }
 static const int * moe_fate_table(void) {
