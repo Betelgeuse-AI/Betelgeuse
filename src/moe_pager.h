@@ -133,6 +133,7 @@ public:
     long stats_cache_miss()  const { return n_cache_miss_; }
     long stats_cache_fill()  const { return n_cache_fill_; }
     long stats_cache_evict() const { return n_cache_evict_; }
+    long stats_cache_already_resident() const { return n_cache_already_resident_; }
 
     // public for verification: exact file range this pager reads for an expert
     const moe_expert_slice * slices(int il, int e) const { return &idx_[((size_t) il * n_expert_ + e) * 3]; }
@@ -230,6 +231,7 @@ private:
     long cache_tick_ = 0;
     long n_cache_hit_ = 0, n_cache_miss_ = 0, n_cache_fill_ = 0, n_cache_evict_ = 0;
     long n_cache_inflight_ = 0;
+    long n_cache_already_resident_ = 0;
     void * ring_ = nullptr;
     long io_ops_ = 0, io_bytes_ = 0, n_io_fail_ = 0;
     long n_pf_issued_ = 0, n_pf_hit_ = 0;

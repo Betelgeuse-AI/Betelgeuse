@@ -866,6 +866,23 @@ cudaEvent_t moe_pager::cache_admit_d2h(int il, int evicted_expert, const int32_t
         return nullptr;
     }
     if (il < 0 || il >= n_layer_ || evicted_expert < 0 || evicted_expert >= n_expert_) return nullptr;
+    // fast path: expert already resident in the Fate RAM victim cache; skip the DtoH entirely
+    {
+        const size_t key = (size_t) il * n_expert_ + evicted_expert;
+        const int existing = cache_idx_[key];
+        if (existing >= 0) {
+            if (cache_state_[(size_t) existing] == 1) {
+                const cudaEvent_t ev = cache_ev_[(size_t) existing];
+                if (ev && cudaEventQuery(ev) == cudaSuccess) {
+                    cache_state_[(size_t) existing] = 2;
+                    if (n_cache_inflight_ > 0) n_cache_inflight_--;
+                }
+            }
+            cache_stamp_[(size_t) existing] = ++cache_tick_;
+            n_cache_already_resident_++;
+            return nullptr;
+        }
+    }
     const int slot = cache_reserve_slot_locked(il, evicted_expert, selected, count);
     {
         const char * e = getenv("MOE_DESTRUCTOR_TRACE");
