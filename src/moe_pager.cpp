@@ -575,25 +575,93 @@ bool moe_pager::init_cache(size_t bytes) {
         max_layer = std::max(max_layer, per_layer[il]);
     }
     if (max_layer == 0) return false;
-    // equal share per layer, then round-robin so no layer is starved
+    // miss-weighted (Fate) per-layer slots, measured across p1/p2/p3 (M47 audit,
+    // 75,485 misses). Falls back to uniform when not 48 layers or FATE=0.
+    static const int fate_miss[48] = {
+        2060, 1507, 1475,  657,  817, 1922, 1886, 2217,
+        1722, 1314, 2193, 1644, 1804, 2058, 1632,  639,
+         876, 1751, 1870, 1817, 1734, 2054, 2169, 1212,
+        1586, 1343, 1811, 1641, 1882, 1936, 1553,  518,
+         712, 1700, 1926, 1441, 1311, 1616, 1956,  921,
+         984, 1409, 1904, 1205, 1759, 1570, 2002, 1769,
+    };
+    const char * fate_env = getenv("MOE_CACHE_FATE");
+    const bool fate = (fate_env == nullptr || atoi(fate_env) != 0) && n_layer_ == 48;
     std::vector<int> slots_per_layer((size_t) n_layer_, 0);
-    for (int il = 0; il < n_layer_; il++) {
-        slots_per_layer[il] = (int) ((bytes / (size_t) n_layer_) / per_layer[il]);
-    }
-    size_t remaining = bytes;
-    for (int il = 0; il < n_layer_; il++) {
-        remaining -= (size_t) slots_per_layer[il] * per_layer[il];
-    }
-    for (;;) {
-        bool any = false;
-        for (int il = 0; il < n_layer_ && remaining > 0; il++) {
-            if (remaining >= per_layer[il]) {
-                slots_per_layer[il]++;
-                remaining -= per_layer[il];
-                any = true;
+    bool fate_used = false;
+    if (fate) {
+        size_t sum_w = 0;
+        for (int il = 0; il < 48; il++) sum_w += (size_t) fate_miss[il];
+        size_t used = 0;
+        std::vector<double> ideal(n_layer_, 0.0);
+        for (int il = 0; il < n_layer_; il++) {
+            ideal[il] = (double) bytes * ((double) fate_miss[il] / (double) sum_w)
+                      / (double) per_layer[il];
+            int s = (int) ideal[il];
+            if (s < 32) s = 32;
+            if (s > 256) s = 256;
+            slots_per_layer[il] = s;
+            used += (size_t) s * per_layer[il];
+        }
+        if (used > bytes) {
+            // too small for the 32-slot floor everywhere; uniform split instead
+        } else {
+            fate_used = true;
+            // hand out remaining budget, most under-served layer first
+            size_t remaining = bytes - used;
+            for (;;) {
+                int best = -1;
+                double best_deficit = 0.0;
+                for (int il = 0; il < n_layer_; il++) {
+                    if (slots_per_layer[il] >= 256) continue;
+                    if (per_layer[il] > remaining) continue;
+                    const double deficit = ideal[il] - (double) slots_per_layer[il];
+                    if (deficit > best_deficit) {
+                        best_deficit = deficit;
+                        best = il;
+                    }
+                }
+                if (best < 0) break;
+                slots_per_layer[best]++;
+                remaining -= per_layer[best];
             }
         }
-        if (!any) break;
+    }
+    if (!fate_used) {
+        // equal share per layer, then round-robin so no layer is starved
+        for (int il = 0; il < n_layer_; il++) {
+            slots_per_layer[il] = (int) ((bytes / (size_t) n_layer_) / per_layer[il]);
+        }
+        size_t remaining = bytes;
+        for (int il = 0; il < n_layer_; il++) {
+            remaining -= (size_t) slots_per_layer[il] * per_layer[il];
+        }
+        for (;;) {
+            bool any = false;
+            for (int il = 0; il < n_layer_ && remaining > 0; il++) {
+                if (remaining >= per_layer[il]) {
+                    slots_per_layer[il]++;
+                    remaining -= per_layer[il];
+                    any = true;
+                }
+            }
+            if (!any) break;
+        }
+    } else {
+        int mn = slots_per_layer[0], mx = slots_per_layer[0], tot = 0;
+        size_t used = 0;
+        for (int il = 0; il < n_layer_; il++) {
+            mn = std::min(mn, slots_per_layer[il]);
+            mx = std::max(mx, slots_per_layer[il]);
+            tot += slots_per_layer[il];
+            used += (size_t) slots_per_layer[il] * per_layer[il];
+        }
+        fprintf(stderr, "moe_pager: fate miss-weighted slots min=%d max=%d total=%d bytes=%zu\n",
+                mn, mx, tot, used);
+        for (int il = 0; il < n_layer_; il++) {
+            fprintf(stderr, "[moe_fate] layer=%02d miss=%d per_layer_B=%zu slots=%d\n",
+                    il, fate_miss[il], per_layer[il], slots_per_layer[il]);
+        }
     }
     int total_slots = 0;
     for (int il = 0; il < n_layer_; il++) {
