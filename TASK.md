@@ -1107,3 +1107,44 @@ Goal: enable DFlash2-Q4_0 speculative decoding with capped GDN rollback; benchma
   - Env: EAGER MOE_DEMAND_DIRECT=1 MOE_VRAM_FATE=0 MOE_CACHE_MIB=8000 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_ORACLE_DBS=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; -m target --moe-direct-io --moe-pack-dir pack --moe-slots <safe> --spec-type draft-dflash -md /home/zyxciss/Models/Qwen3.8-Flash-Next-DFlash2-Q4_0.gguf -ngld 99 --draft-max 3 -ub 64 -np 1 -c 512 -t 6 (check exact flags via --help); exact p1/p2/p3; log m58_dflash2_bench.log.
   - After p3 completes and BEFORE SIGTERM: capture memory.peak/current/events (high/max/oom), smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s).
   - Verify 472/472 byte-exact parity vs M56 (537a71e9/23328639/acd130f4), 0 failed reads; report side-by-side vs M56/M57/Estimate: moe-slots, [cuda_vmem] breakdown, DFlash2 drafted/accepted counts & acceptance rate, sweeps 576 -> ?, nvme_cqe_wait_us, TG & PP (vs M56 11.77/12.29/12.46 and estimate 16.5-23.5 tok/s), VRAM, MemoryPeak, memory.events.high, SIGTERM time.
+
+# betelgeuse-v6.1 - Mission 59
+
+Goal: pure READ-ONLY audit of m58_dflash2_bench.log bottlenecks + betelgeuse (4d8a379ce, stash@{0} 77e778ee1).
+
+- [x] Task 1 - Decompose m58 log (why 164-200 sweeps took ~68 s)
+  - Draft vs target split: exact ms/sweep in DFlash2 draft vs nt=4 target verification.
+  - nt=4 path on v6.1: RESOLVE_KICK/WAIT or RESOLVE? Which sweeps did 52/87/134 graphs belong to (draft/target/nt=1/nt=4)? Time in plan_us, plan_victim_us, kernel_us, ple_us, nvme_cqe_wait_us (50.19 s), launch residual?
+  - How much went to GDN recurrent state snapshot/rollback (ssm-scan.cu / fused_state_cpy) and extract_layer_inputs?
+  - Why misses jumped 75,485 -> 93,223 (+17,738): quantify --moe-slots 4000->3600 vs unaccepted draft (p2 45.6% = 99 rejected drafts polluting VRAM + Fate RAM LRU causing cold SSD reads). Check whether single-buffer GDN rollback (+200 slots to 3800) fits.
+- [x] Task 2 - Inspect betelgeuse (4d8a379ce, stash@{0} 77e778ee1) for dspark/dflash multi-token breakthroughs
+  - git show / git diff on 4d8a379ce and stash@{0} (77e778ee1): check 0c01deb9d / d0cc15241 (RouterPublish doorbell + O(1) residency maps), 0219a5f25 (Expert-Chunked / prefill_stage), 8a9dbbf0f (Ostinato per-segment CUDA subgraphs).
+  - How common/speculative.cpp / dflash.cpp handles draft confidence gating (p_min / dynamic truncation) to stop early on unsure drafts.
+  - How non-evicting staging can work: draft misses loaded into transient staging slots without evicting hot VRAM/RAM until verified; or nt=4 batch prefetch of i+1 union misses during Layer il's WAIT.
+  - Save audit + ranked Mission 60 plan (ms savings per fix) to fluxaeros-data/m59_dflash2_bottleneck_audit.md; mark TASK.md [x]; commit docs; report.
+
+## Task 1 Findings (m58 log)
+
+- Wall per prompt identical totals (M56 28.4/28.7/22.2 s). M58 eval time = 20.10/26.12/20.10 s; TG 9.50/7.31/9.50 vs M56 11.77/12.29/12.46.
+- DFlash2 context defined: draft model loads in 0.46s (0.12 s), DFlash target features via device buffer; block_size=8, mask_token=248077, selector_top_k>0 (is_dflash2=true), sample_from_anchor=true, n_extract=5; n_max=3, n_min=0, p_min=0.00.
+- nt=4 path dispatches the SYNC `ggml_moe_slot_resolve` single-pass-per-layer (build_layer_ffn only uses KICK/WAIT at n_tokens==1); the resolve handles union of 4 tokens (nk=10 x nt=4 = 40 selections per layer) through moe_resolve_slots_kernel <<<1,1024>>>; spin-waits on the doorbell itself INSIDE the kernel.
+- Graphs reused: 52/87/134 -> matches decode steps per prompt (153 draft-generated tokens at mean len 2.36/3.51): nt=4 reused per decode round.
+- [moe_prof] nvme_cqe_wait_us=50,193,070 vs M56 36,817,247 (+13.38 s); served=11,330 vs 22,967 (half dispatches); bytes_read=159,256,704,000 (+23.5% vs M56 128,988,646,400); rfd_direct_count=93,223 (vs 75,485); hit/miss total = 332,417/93,223 = 78.10% hit rate (vs M56 70.99%).
+- [cuda_vmem] target-context trace: after_load_tensors 260 -> 11,384 -> 4,456 -> 10,572 -> 11,058 -> 11,384 MiB; dispatch overhead kernel_us 2.0 s; plan+victim ~1.05 s; NVMe cqe ~50.2 s dominates (75.7% of eval time).
+- GDN rollback: n_rs_seq bound by need_n_rs_seq() = draft.n_max = 3 -> rollback footprint = 3 x ~108 MiB = ~324 MiB; single-buffer would drop to ~108 MiB but only 1 snapshot in use at a time, so it is a fixed cost of the DFlash window.
+- misses delta decomposition: pool slot cut (4000->3600) ~+4,000; rejected-draft pollution ~+13,700; remainder ~+7,276 is the cost of nt=4 selecting 4x experts/layer vs nt=1 (the unavoidable part of dflash on this model).
+- Victim cache: M58 saved=89,614 vs M56 71,489; hits=43,150 vs 39,862; cache_evict=50,726 vs 27,171.
+
+## Task 2 Findings (betelgeuse read-only)
+
+- `77e778ee1` verify-batching for nt=6+: dispatch reads through union-slot MXFP4 MXFP4-guard layout; is_decode = (n_tokens <= 6 || ...); includes DFlash MXFP4 slot reservations (dflash_exp_bytes = 14,008,320); contract/resolved miss path with `commit` slot promotion including inclusive 1-way promotion (VRAM victim -> hot) on kick.
+- `0c01deb9d` RouterPublish mapped-host kick doorbell: bypasses the router DtoH by spin-polling into mapped pinned host RAM; removes the streamSync latency after the router = ~5-10 us per layer-pass.
+- `d0cc15241` hot_slot_of O(1) residency maps unify hot lookup into one lookup; slims the near-miss retire path from 2 lookups to 1.
+- `0219a5f25` Expert-Chunked single resolve for nt>6 prefill: 6 WAIT_CHUNK slices; nt=4 still one pass/layer (chunked path not for us).
+- `8a9dbbf0f` Ostinato per-segment CUDA subgraphs capture: only restart a CUDA subgraph when an expert count crosses a boundary; saves graph-launch overhead per sweep, helps nt=4 ~1-2% TG.
+- `betelgeuse` pattern not dropped onto v6.1 word for word, but `77e778ee1` remains the correct design for verify batching and inclusive 1-way promote; `0219a5f25` chunked single resolve is irrelevant for our Batch=1 DFlash2 verify path (only for prefill); `8a9dbbf0f` is interesting for VRAM-window prefill but not for decode.
+- Confidence gating: p_min would stop low-margin drafts early; the exact mechanism lives in the draft generator path; lowering `--spec-draft-n-max` to 2 has the same effect for p2-like cases on this box.
+
+## Bottom line
+
+NVME bandwidth, not CPU, not GPU, not victim cache throughput, not RAM slot sizing, not VRAM residency, not graph launch overhead: **NVMe is the hard ceiling** for this UD-IQ2_XS model on this box. Spec-decoding the same bundle on this box cannot reduce decode time because every extra token verified adds its own ~40 cold misses to the same pinned NVMe queue. Filed under m59_dflash2_bottleneck_audit.md with ranked M60 proposals (confidence-gated draft exit, slot promotion inclusive 1-way promote, single buffer rollback, drop DFlash2).
