@@ -1092,3 +1092,18 @@ Goal: implement MOE_ORACLE_DBS=1 (dbs-piggybacked cross-layer il -> il+1 lookahe
     * 0 failed reads (44/44 served lines failed=0); graphs reused 197/387/577 identical; [moe_victim_cache] saved/hits unchanged at 71,489/39,862-ish (m55_victim progression).
     * memory.peak=13,904,433,152 B = **13,260 MiB** (< MemoryHigh 13,824 MiB); current=12,787,310,592 B = 12,198 MiB; events low=0 high=0 max=0 oom=0 sock_throttled=2; smaps_rollup Rss=12,462,680 kB; VRAM = 11,581 MiB (< 11,750); SIGTERM exit_secs=2.8 (< 5 s).
     * HONEST VERDICT: the dbs-piggyback mechanism works, delivers spec work to the host with zero races, and preserves parity. But prediction quality is weak (41% overlap vs 56% baseline) AND the drain submits only 3 experts in 58 s (the spec-ring stays busy the vast majority of the PLE-migration-saturated NVMe window, so the gate spec_pending < 0 almost never opens). Performance REGRESSED ~5-8% TG vs M56 with peak memory +668 MiB (Oracle node adds a GDN-heavy op per layer-pass). The mission's 8,000-15,000 pk_submitted estimate did not materialize; only 1 join_spec (i.e., one predicted expert actually saved a demand read) was realized across all three prompts.
+
+# betelgeuse-v6.1 - Mission 58
+
+Goal: enable DFlash2-Q4_0 speculative decoding with capped GDN rollback; benchmark vs estimate.
+
+- [x] Task 1 - Set MOE_ORACLE_DBS=0 default & configure DFlash2-Q4_0 + GDN rollback inside 11,750 MiB VRAM
+  - Set MOE_ORACLE_DBS default 1 -> 0 (keep opt-in).
+  - Inspect common/speculative.cpp, src/models/dflash.cpp, src/llama-context.cpp (need_n_rs_seq, extract_layer_inputs, 1<n_tokens<=8 MoE resolve path), tools/server; verify UD-IQ2_XS target + DFlash2-Q4_0.gguf (335 MiB, borrows tok_embd via ctx_other, hc_stream_mean path #30927 works without assertion failures).
+  - Check GDN rollback VRAM cost (n_rs_seq x ~108 MiB x 36 layers); bound n_rs_seq to verification need (3-4, NOT 8 / 1,013 MiB); compute safe --moe-slots (3600-3750) so Target + DFlash2 + rollback + pool fits <= 11,700 MiB.
+  - Confirm DFlash2 verification (nt = 4: 1 anchor + 3 drafts) resolves all 4 tokens in ONE pass per layer (MOE_DEMAND_DIRECT=1 + Fate RAM), 0 CPU expert rows.
+  - Rebuild; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped DFlash2 benchmark (unit=bel-m58-dflash2, MOE_CACHE_MIB=8000)
+  - Env: EAGER MOE_DEMAND_DIRECT=1 MOE_VRAM_FATE=0 MOE_CACHE_MIB=8000 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_ORACLE_DBS=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; -m target --moe-direct-io --moe-pack-dir pack --moe-slots <safe> --spec-type draft-dflash -md /home/zyxciss/Models/Qwen3.8-Flash-Next-DFlash2-Q4_0.gguf -ngld 99 --draft-max 3 -ub 64 -np 1 -c 512 -t 6 (check exact flags via --help); exact p1/p2/p3; log m58_dflash2_bench.log.
+  - After p3 completes and BEFORE SIGTERM: capture memory.peak/current/events (high/max/oom), smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s).
+  - Verify 472/472 byte-exact parity vs M56 (537a71e9/23328639/acd130f4), 0 failed reads; report side-by-side vs M56/M57/Estimate: moe-slots, [cuda_vmem] breakdown, DFlash2 drafted/accepted counts & acceptance rate, sweeps 576 -> ?, nvme_cqe_wait_us, TG & PP (vs M56 11.77/12.29/12.46 and estimate 16.5-23.5 tok/s), VRAM, MemoryPeak, memory.events.high, SIGTERM time.
