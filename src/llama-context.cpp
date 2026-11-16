@@ -1940,6 +1940,67 @@ void llama_context::moe_hot_cycle(int fd) {
     }
 }
 
+// Mission 55 (MOE_VRAM_FATE=1, default on for 48-layer qwen4exp): residual-miss
+// VRAM slot rebalancing, relative to the profiled table, using M47's measured
+// miss distribution (sum 75,485, avg 1,573). Excess slots are harvested from
+// low-miss large-byte layers blk.03/04/31/15/32/16/39/40 and redistributed to
+// high-miss layers blk.07/10/22/00/13/21/46/38/05/06, sent max 220/min 36 per
+// layer at table scale; big-byte->small-byte moves grow total slots at constant
+// pool bytes.
+static const int fate_miss[48] = {
+    2060, 1507, 1475,  657,  817, 1922, 1886, 2217,
+    1722, 1314, 2193, 1644, 1804, 2058, 1632,  639,
+     876, 1751, 1870, 1817, 1734, 2054, 2169, 1212,
+    1586, 1343, 1811, 1641, 1882, 1936, 1553,  518,
+     712, 1700, 1926, 1441, 1311, 1616, 1956,  921,
+     984, 1409, 1904, 1205, 1759, 1570, 2002, 1769,
+};
+static bool moe_vram_fate_enabled(int n_layer) {
+    if (n_layer != 48) return false;
+    static int flag = -1;
+    if (flag < 0) { const char * e = getenv("MOE_VRAM_FATE"); flag = (!e || atoi(e) != 0) ? 1 : 0; }
+    return flag == 1;
+}
+static const int * moe_fate_table(void) {
+    static const int donors[8] = { 3, 4, 31, 15, 32, 16, 39, 40 };
+    static const int recips[10] = { 7, 10, 22, 0, 13, 21, 46, 38, 5, 6 };
+    static int table[48] = { 0 };
+    static bool done = false;
+    if (done) return table;
+    static const int profiled[48] = {
+        220, 220, 220, 220, 220, 120, 136, 120, 80, 80, 80, 80,
+        128, 80, 80, 80, 80, 88, 120, 80, 80, 96, 136, 80,
+        80, 80, 96, 80, 112, 80, 80, 80, 80, 80, 112, 80,
+        80, 88, 128, 80, 80, 80, 88, 80, 80, 80, 80, 88,
+    };
+    for (int i = 0; i < 48; i++) table[i] = profiled[i];
+    int resid[48];
+    for (int i = 0; i < 48; i++) resid[i] = fate_miss[i] - 1573;
+    int d_rem[8];
+    for (int j = 0; j < 8; j++) d_rem[j] = -resid[donors[j]];
+    for (;;) {
+        int best_j = -1, best_v = 0;
+        for (int j = 0; j < 8; j++) {
+            if (d_rem[j] > best_v) { best_v = d_rem[j]; best_j = j; }
+        }
+        int best_r = -1, best_rv = 0;
+        for (int k = 0; k < 10; k++) {
+            const int r = recips[k];
+            if (table[r] < 220 && resid[r] > best_rv) { best_rv = resid[r]; best_r = r; }
+        }
+        if (best_j < 0 || best_r < 0) break;
+        if (best_v <= 0 || best_rv <= 0) break;
+        const int d = donors[best_j];
+        if (table[d] <= 36) { d_rem[best_j] = 0; continue; }
+        table[d]--;
+        table[best_r]++;
+        d_rem[best_j]--;
+        resid[best_r]--;
+    }
+    done = true;
+    return table;
+}
+
 // sparse MoE paging callback (defined near the moe_page helpers below)
 static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud);
 
@@ -1959,6 +2020,9 @@ static inline int moe_fixed_slots(int il, int n_layer) {
         if (il >= 5 && il < 43) return 74;   // 2812
         if (il >= 43 && il < n_layer) return 46; // 230
         return 74;
+    }
+    if (moe_vram_fate_enabled(n_layer)) {
+        return moe_fate_table()[il];
     }
     if (n_layer == 48 && il >= 0 && il < n_layer) {
         static const int profiled_slots[48] = {
@@ -2599,6 +2663,16 @@ llama_context::llama_context(
                     moe.slot_table[il] = ggml_new_tensor_2d(moe.ctx, GGML_TYPE_I32, 1, n_exp);
                     expect += ggml_nbytes(moe.pool_gate[il]) + ggml_nbytes(moe.pool_up[il])
                             + ggml_nbytes(moe.pool_down[il]) + ggml_nbytes(moe.slot_table[il]);
+                }
+                {
+                    int tot = 0, mn = INT32_MAX, mx = 0;
+                    for (int il = 0; il < n_layer; il++) {
+                        const int s = moe_get_layer_slots(il, n_layer);
+                        tot += s; mn = std::min(mn, s); mx = std::max(mx, s);
+                    }
+                    fprintf(stderr, "[vram_fate] slots min=%d max=%d total=%d pool_bytes=%zu TRUE-VRAM=%.0f MiB (fate=%d)\n",
+                            mn, mx, tot, expect, (double) expect / 1048576.0,
+                            moe_vram_fate_enabled(n_layer) ? 1 : 0);
                 }
                 if (!pool_ok) {
                     LLAMA_LOG_ERROR("%s: pool incomplete -> moe_direct_io OFF\n", __func__);
