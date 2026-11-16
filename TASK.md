@@ -734,3 +734,17 @@ Goal: capture exact hung-thread backtraces (gdb child launch + SIGTRAP) and audi
   - Inside systemd-run --user --scope, spawn build-v1/bin/bel-server directly as a child of gdb (batch commands / script in /home/zyxciss/fluxaeros-data/, zero /tmp) with exact M39 env & flags; p1 with max_tokens=8.
   - Once /health OK and hang manifests (GPU 100% / CPU ~98% stall ~30-40 s), kill -TRAP <bel_server_pid> so gdb breaks under ptrace_scope=1; dump set pagination off + thread apply all bt -> /home/zyxciss/fluxaeros-data/m40_hang_bt.log; kill/exit gdb cleanly.
   - Write line-by-line root cause in /home/zyxciss/fluxaeros-data/m40_hang_triage.md; mark TASK.md [x]; commit docs locally on betelgeuse-v6.1; report stuck stack frames.
+
+# betelgeuse-v6.1 - Mission 41
+
+Goal: capture real hung-thread backtraces via gdb direct child + SIGTRAP; audit slot=-1 / drop_mmap call sites.
+
+- [x] Task 1 - Read-only inspection of cache_reserve_slot_locked (slot=-1), d2h_admit, & drop_mmap call sites
+  - Inspect src/moe_pager.cpp and src/llama-context.cpp around 2f5207e32 & e770204fc:
+    - trace cache_reserve_slot_locked returning slot = -1 (all slots full/in-flight at layers 44-46), how ev_of_v / cache_ev_ / cudaEventQuery / d2h_stream behave afterward, and whether any loop/wait can spin at 98% CPU or stall db.gpu_ready.
+  - git grep -n "drop_mmap|MADV_DONTNEED" to confirm whether PLE is dropped only once at load or repeatedly during decode/prefill.
+- [x] Task 2 - Capture exact m41_hang_bt.log via gdb direct child (pgrep -P) + SIGTRAP
+  - Put a gdb command file at /home/zyxciss/fluxaeros-data/m41_gdb.cmds:
+    set pagination off / set confirm off / handle SIGTRAP stop print nopass / run / thread apply all bt / kill / quit
+  - Inside systemd-run --user --scope, start gdb -batch -x m41_gdb.cmds --args build-v1/bin/bel-server <M39 env> > m41_hang_bt.log 2>&1 & (GDB_PID=$!); wait for /health 200; p1 with max_tokens=8; hang ~30-40 s; CHILD_PID=$(pgrep -P "$GDB_PID" | head -1) has comm == bel-server; kill -TRAP "$CHILD_PID"; gdb finishes writing bt log.
+  - Confirm m41_hang_bt.log contains full thread apply all bt frames; write exact stuck frames & root cause to /home/zyxciss/fluxaeros-data/m41_hang_triage.md; mark TASK.md [x]; commit docs locally; report exact stuck stack frames (main + doorbell worker + active threads).
