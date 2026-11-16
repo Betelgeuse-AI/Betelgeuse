@@ -4697,7 +4697,8 @@ bool llama_context::set_adapter_cvec(
 void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_result * res) {
     if (!res) return;
     const int64_t n_tokens = (int64_t) ubatch.n_tokens;
-    if (n_tokens <= 0) return;
+    // Mission 65: collect decode steps only
+    if (n_tokens != 1) return;
     const int32_t il_ck[7] = {0, 7, 15, 23, 31, 39, 47};
     if (!extract_layer_inputs(res, 0, (size_t) n_tokens)) {
         fprintf(stderr, "[moe_oracle_trace] extract_layer_inputs returned false; skipping dump\n");
@@ -4746,6 +4747,7 @@ void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_res
         }
         g_oracle_trace.n_records++;
         g_oracle_trace.prev_token_id = token_id;
+        std::fflush(fp);
     }
 }
 
@@ -5897,6 +5899,7 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(backend != nullptr);
         // Tensor-split backends require a zero source offset.
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        ggml_backend_synchronize(backend);
         extracted = true;
     }
     return extracted;
