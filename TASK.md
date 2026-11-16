@@ -836,3 +836,15 @@ Goal: unfreeze PREKICK (pk_submitted 1 -> sane number) & benchmark MOE_PREKICK=1
 - [x] Task 2 - One cgroup-wrapped MOE_PREKICK=1 benchmark on exact M45/M46 config (p1/p2/p3 T=0)
   - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3, 120 s HTTP timeout; log m48_prekick_fixed_bench.log.
   - Capture memory.peak/current/events/smaps_rollup/nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); 472/472 parity vs M45/M46; report pk_submitted, pk_skip_* breakdown, spec_cache_hits, spec_reused, inflight_joined, nvme_cqe_wait_us, TG & PP, VRAM, MemoryPeak, SIGTERM time.
+
+# betelgeuse-v6.1 - Mission 49
+
+Goal: pinpoint & fix pk_skip_pred_unset = 70,864 lockout; benchmark MOE_PREKICK=1 with live PREKICK.
+
+- [x] Task 1 - Pinpoint & Fix pk_skip_pred_unset = 70,864 lockout
+  - Inspect git show ec1f1c169 and compare exact PREKICK gate & spec_pending / prediction->state / drain_spec() path against 0f3331c36 (M26, submitted = 28,049) and 50ddacc8c (M14, submitted = 18,934) to identify why pk_skip_pred_unset fired 70,864 times after pk_submitted = 1.
+  - Fix that exact lockout cleanly (preserving 0bd691f45 deadlock-free spec_ring_inflight and fa375a890 < 5 s SIGTERM) so PREKICK submits cold predictions continuously across decode (pk_submitted >> 1, pk_skip_vram / pk_skip_cache short-circuit arena/RAM hits cleanly).
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped benchmark (exact M48 config with live PREKICK)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3 (T=0, 120 s HTTP timeout); log m49_prekick_live_bench.log.
+  - Capture live memory.peak/current/events (high/max/oom), smaps_rollup, nvidia-smi VRAM before SIGTERM stop (< 5 s + full [moe_prof]); 472/472 parity vs M45/M48; report: exact cause of pk_skip_pred_unset, new pk_submitted, pk_skip_*, spec_cache_hits, spec_reused, inflight_joined, spec_fallback, [moe_prof] waterfall (incl. nvme_cqe_wait_us), TG & PP tok/s, VRAM, MemoryPeak, memory.events.high, SIGTERM time.
