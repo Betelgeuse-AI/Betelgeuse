@@ -7,6 +7,7 @@ extern "C" {
 }
 #include <cuda_runtime.h>
 #include <cuda.h>
+#include <cuda/atomic>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -217,7 +218,12 @@ __global__ void moe_resolve_slots_kernel(
                 }
             }
             pre.compared += pre.n;
-            pci_st_u32(&pre.state, 0);
+            // keep host-claimed predictions (state == 2); only unclaimed
+            // ones are cleared. System-scope CAS mirrors the host's 1 -> 2 claim.
+            cuda::atomic_ref<uint32_t, cuda::thread_scope_system> pred_ref(
+                *const_cast<uint32_t *>(&pre.state));
+            uint32_t expected = 1u;
+            pred_ref.compare_exchange_strong(expected, 0u);
         }
     }
 
