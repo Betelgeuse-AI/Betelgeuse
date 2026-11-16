@@ -765,3 +765,16 @@ Goal: eliminate runtime cudaFuncSetAttribute wrlock contention + benchmark MOE_C
 - [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=6144 + MOE_DEMAND_DIRECT=1 benchmark (CUDA_MODULE_LOADING=EAGER)
   - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=6144 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3 T=0; log to /home/zyxciss/fluxaeros-data/m43_async_victim_bench.log.
   - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM before clean SIGTERM stop (< 5 s exit, full [moe_prof] dump); 472/472 parity vs M34; 0 failed reads; report waterfall vs M16 (27.32 s) / M34 (74.52 s), [moe_victim_cache] saved/hits/bytes, TG & PP, VRAM, MemoryPeak, SIGTERM exit time.
+
+# betelgeuse-v6.1 - Mission 44
+
+Goal: fix 58.6% slot=-1 victim-cache rejections and complete MOE_CACHE_MIB=6144 benchmark (CUDA_MODULE_LOADING=EAGER).
+
+- [x] Task 1 - Fix slot=-1 victim-cache rejections & SIGTERM exit with d2h_stream active
+  - Inspect m43_async_victim_bench.log: confirm decode_layers=8786 in 33 s was live decoding killed prematurely before token 192 returned.
+  - Inspect cache_reserve_slot_locked & cache_admit_d2h (src/moe_pager.cpp, src/llama-context.cpp); why 14,389/24,564 (58.6%) admissions returned slot=-1; ensure clean SIGTERM exit (< 5 s) when d2h_stream / cache_ev_ is active.
+  - Check read-only whether MOE_CACHE_MIB=7680 or 8192 fits safely below MemoryHigh=13824M for M45 (DEMAND_DIRECT=1, pack O_DIRECT).
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=6144 benchmark (CUDA_MODULE_LOADING=EAGER, 120 s client timeout per prompt!)
+  - p1/p2/p3 (T=0), 192 tokens each, 120 s budget per prompt; log to /home/zyxciss/fluxaeros-data/m44_async_victim_bench.log.
+  - Capture memory.peak/current/events/smaps_rollup/nvidia-smi VRAM; SIGTERM < 5 s + full [moe_prof] dump; verify 472/472 parity vs M34; 0 failed reads; report waterfall, [moe_victim_cache] saved/hits/slot=-1/bytes, TG & PP, VRAM, MemoryPeak, safe M45 headroom.
