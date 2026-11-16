@@ -1066,3 +1066,29 @@ Goal: restore MOE_VRAM_FATE=0 default (M51 parity), audit moe_predictor.* + comb
     * memory.peak=13,203,496,960 B = **12,592 MiB** (< MemoryHigh 13,824 MiB); events low=0 high=0 max=0 oom=0 sock_throttled=2; smaps_rollup Rss=12,541,360 kB; current=12,861,034,496 B = **12,261 MiB**.
     * VRAM = **11,581 MiB** (< 11,750); SIGTERM exit_secs=0.8 (< 5 s).
     * MOE_VRAM_FATE=0 restores the proven config; MOE_PREKICK=0 isolates the Oracle question; Mission 57 should bring back only the dbs-ARMER predictor, not the graph-op PREKICK.
+
+# betelgeuse-v6.1 - Mission 57
+
+Goal: implement MOE_ORACLE_DBS=1 (dbs-piggybacked cross-layer il -> il+1 lookahead) and benchmark.
+
+- [x] Task 1 - Piggyback il+1 cold predictions into dbs[il] at KICK(il)
+  - At il (0 <= il < n_layer-1), decode: evaluate cross-layer Oracle (il's post-attn state projected against layer il+1's router gate; resident experts of il+1 masked to -1e9f; top-2 cold selections for il+1).
+  - In KICK(il) tid==0, before the demand signal publish: copy Layer il+1's predicted expert IDs into dbs[il] (pred_layer = il+1, pred_count, pred_next[0..1], pred_generation); 100% host delivery via demand doorbell.
+  - In the doorbell worker for dbs[il]: after io_uring_submit for il demand and before the blocking CQE wait, drain dbs[il].pred_next (skip VRAM-resident pk_skip_vram, Fate RAM-resident pk_skip_cache), submit true NVMe-cold il+1 experts to spec_ring with O_DIRECT, spec_layer = il+1 (pk_submitted++), so they overlap WAIT(il) + FFN(il) + Attention(il+1).
+  - [moe_prekick_diag] print the true cross-layer il -> il+1 overlap % vs il+1's actual post-attention router selection.
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9 (result: PASS io_ops=27 io_bytes=14778368 pf_hit=4); committed as 0a3e3a202.
+  - Implemented: LayerDoorbell extended (pred_layer/pred_count/pred_next[2]/pred_generation + pad2), moe_resolve_slots_kernel now publishes the packet at tid==0 BEFORE the demand publish and before the s_miss==0 early return; qwen4exp.cpp emits an Oracle prekick op (build_lora_mm(cur, il+1.ffn_gate_inp)) at the FFN site right before the KICK node, targeting plans[il+1] with projections off the pre-FFN state; when MOE_ORACLE_DBS=1 the pre-attn prekick is skipped (Oracle dominates); host doorbell drain seam added after io_uring_submit (skip VRAM pk_skip_vram / Fate RAM pk_skip_cache, true cold misses go O_DIRECT into spec_ring with spec_layer = il+1).
+- [x] Task 2 - One cgroup-wrapped benchmark (unit=bel-m57-dbs-oracle, MOE_ORACLE_DBS=1 + MOE_CACHE_MIB=8000)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_VRAM_FATE=0 MOE_CACHE_MIB=8000 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_ORACLE_DBS=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; --moe-slots 4000; exact p1/p2/p3 (T=0, 120 s HTTP timeout); log m57_dbs_oracle_bench.log.
+  - After p3 completes and BEFORE SIGTERM: capture live memory.peak/current/events (high/max/oom), smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s).
+  - Verify 472/472 byte-exact parity vs M56, 0 failed reads; report side-by-side vs M56/Estimate: overlap %, pk_submitted (0 -> ?), pk_skip_vram/cache, spec_reused, inflight_joined, spec_fallback, nvme_cqe_wait_us, TG & PP, VRAM, MemoryPeak, memory.events.high, SIGTERM time.
+  - Task 2 SESSION RESULTS (unit bel-m57-dbs-oracle; log m57_dbs_oracle_bench.log; one fresh cgroup session; first attempt crashed on GGML_ASSERT before any inference, fix committed, rerun under same unit):
+    * ALL 3 prompts completed; **472/472 byte-exact parity vs M56** (p1/p3 content_md5=537a71e9 reasoning_md5=23328639; p2 reasoning_md5=acd130f4, empty content as M45+).
+    * Cross-layer overlap measured = **41.03%** (matched=21,750/53,008; M56 pre-attn baseline 55.95% - Oracle is materially LOWER, not higher).
+    * TG p1/p2/p3 = **11.11 / 11.64 / 11.60** vs M56 11.77/12.29/12.46 and M55 10.90/12.35/11.30; PP = 6.99 / 6.27 / 8.87; estimate 12.7-14.6 NOT reached; slower than M56.
+    * pk_submitted = **3** (spec_submitted=3 spec_completed=2 inflight_joined=1 spec_reused=1 spec_fallback=1 join_retries=0 duplicate_submissions=2 spec_ms=7.035 spec_bytes=4,382,720); pk_skip_vram=0 pk_skip_cache=0.
+    * [moe_prof] nvme_cqe_wait_us=37,218,686 (M56 36,817,247; estimate 30.5-33.8 s NOT reached); kernel_us=5,504,535 (M56 4,196,340; +1.31 s from Oracle op in graph); ple_us=161,189; served=22,967; rfd_direct_count=75,485 (identical); bytes_read identical; spec_fallback=1; pk_skip_pred_unset=178,639,227; pk_state1_seen=2 (the host observed prediction state==1 twice).
+    * [moe_prekick_diag] kick_count=27,024 dt_avg_cycles=**3,699,094** dt_min=1,068,549 dt_max=8,304,848 kick_cas_cleared=27,022 (window ~1.85 ms/layer as expected after Oracle op inflates it).
+    * 0 failed reads (44/44 served lines failed=0); graphs reused 197/387/577 identical; [moe_victim_cache] saved/hits unchanged at 71,489/39,862-ish (m55_victim progression).
+    * memory.peak=13,904,433,152 B = **13,260 MiB** (< MemoryHigh 13,824 MiB); current=12,787,310,592 B = 12,198 MiB; events low=0 high=0 max=0 oom=0 sock_throttled=2; smaps_rollup Rss=12,462,680 kB; VRAM = 11,581 MiB (< 11,750); SIGTERM exit_secs=2.8 (< 5 s).
+    * HONEST VERDICT: the dbs-piggyback mechanism works, delivers spec work to the host with zero races, and preserves parity. But prediction quality is weak (41% overlap vs 56% baseline) AND the drain submits only 3 experts in 58 s (the spec-ring stays busy the vast majority of the PLE-migration-saturated NVMe window, so the gate spec_pending < 0 almost never opens). Performance REGRESSED ~5-8% TG vs M56 with peak memory +668 MiB (Oracle node adds a GDN-heavy op per layer-pass). The mission's 8,000-15,000 pk_submitted estimate did not materialize; only 1 join_spec (i.e., one predicted expert actually saved a demand read) was realized across all three prompts.
