@@ -462,17 +462,15 @@ static void start_doorbell_worker(llama_context * ctx) {
                             const void * sg = (const void *) ((uintptr_t) ctx->moe.pool_gate[il]->data + slot_off * gb);
                             const void * su = (const void *) ((uintptr_t) ctx->moe.pool_up[il]->data   + slot_off * ub);
                             const void * sd = (const void *) ((uintptr_t) ctx->moe.pool_down[il]->data + slot_off * db);
-                            if (!ctx->moe.d2h_stream) {
-                                cudaStreamCreateWithFlags((cudaStream_t *) &ctx->moe.d2h_stream, cudaStreamNonBlocking);
-                            }
                             if (ctx->moe.d2h_stream) {
-                                if ((size_t) v >= ctx->moe.d2h_ev_of_v.size()) ctx->moe.d2h_ev_of_v.resize((size_t) v + 1, nullptr);
                                 cudaEvent_t admev = ctx->pager.cache_admit_d2h(il, old_e, sel.data(), (size_t) n,
                                         sg, su, sd, gb, ub, db,
                                         (cudaStream_t) ctx->moe.d2h_stream);
                                 if (admev) {
-                                    ctx->moe.d2h_ev_of_v[(size_t) v] = (void *) admev;
-                                    victim_saved++;
+                                    if ((size_t) v < ctx->moe.d2h_ev_of_v.size()) {
+                                        ctx->moe.d2h_ev_of_v[(size_t) v] = (void *) admev;
+                                        victim_saved++;
+                                    }
                                 }
                             }
                         }
@@ -1660,10 +1658,10 @@ static void moe_slot_resolve_sync(
     if (!uniq.empty()) {
         cudaStream_t ws = (cudaStream_t) moe_pager::worker_stream();
         if (ws && ws != st) {
-            thread_local cudaEvent_t s_ev = nullptr;
-            if (!s_ev) cudaEventCreateWithFlags(&s_ev, cudaEventDisableTiming);
-            cudaEventRecord(s_ev, ws);
-            cudaStreamWaitEvent(st, s_ev, 0);
+            static thread_local cudaEvent_t s_ev = nullptr;
+            if (!s_ev) s_ev = (cudaEvent_t) moe_pager::worker_event();
+            if (s_ev) cudaEventRecord(s_ev, ws);
+            if (s_ev) cudaStreamWaitEvent(st, s_ev, 0);
         }
     }
     for (int64_t i = 0; i < total; i++) {
@@ -2605,6 +2603,11 @@ llama_context::llama_context(
                         moe.n_layer = n_layer; moe.n_expert = n_exp;
                         moe.n_used = n_used;  moe.s_per_layer = 104;
                         moe.n_slots = total_slots;
+                        if (!moe.d2h_stream) {
+                            cudaStreamCreateWithFlags((cudaStream_t *) &moe.d2h_stream, cudaStreamNonBlocking);
+                            LLAMA_LOG_INFO("%s: d2h_stream created for VRAM->RAM victim cache\n", __func__);
+                        }
+                        moe.d2h_ev_of_v.assign((size_t) total_slots, nullptr);
                         moe.slot_of.assign((size_t) n_layer*n_exp, -1);
                         moe.slot_key.assign((size_t) total_slots, -1);
                         moe.slot_freq.assign((size_t) total_slots, 0);
@@ -2736,6 +2739,10 @@ llama_context::llama_context(
                                 LLAMA_LOG_WARN("%s: RouterPredictorV2 skipped (MOE_PRED=0), +120 MiB for slots\n", __func__);
                             }
                             moe_slot_resolve_register_ctx(this);
+                            // pre-create pager worker stream/event on the main thread so the
+                            // doorbell worker never has to acquire the CUDA context lock on first call
+                            (void) moe_pager::worker_stream();
+                            (void) moe_pager::worker_event();
                             if (moe_doorbell_on(this)) {
                                 if (moe_doorbell_init(moe.n_layer, moe.n_expert, moe.s_per_layer)) {
                                     LLAMA_LOG_INFO("%s: Zero-Split Stream-Ordered Doorbell armed (%d layers, n_splits = 1)\n",
@@ -2971,6 +2978,8 @@ llama_context::~llama_context() {
     if (moe.d2h_stream) { cudaStreamSynchronize((cudaStream_t) moe.d2h_stream); }
     pager.cache_quiesce((cudaStream_t) moe.d2h_stream);
     if (moe.d2h_stream) { cudaStreamDestroy((cudaStream_t) moe.d2h_stream); moe.d2h_stream = nullptr; }
+    moe.d2h_ev_of_v.clear();
+    moe.d2h_ev_of_v.shrink_to_fit();
     if (destructor_trace()) fprintf(stderr, "[~llama_context] d2h stream synced, cache quiesced\n");
     // release the sparse-MoE slot pool (fit-probe contexts must not leak VRAM)
     if (moe.buf) { ggml_backend_buffer_free(moe.buf); moe.buf = nullptr; }

@@ -647,7 +647,15 @@ bool moe_pager::init_cache(size_t bytes) {
     cache_used_.assign((size_t) cache_slots_, 0);
     cache_stamp_.assign((size_t) cache_slots_, 0);
     cache_state_.assign((size_t) cache_slots_, 0);
+    // Pre-create one cudaEvent_t per cache slot on the main thread (init_cache runs from the llama context init path)
+    // Re-armed by cudaEventRecord on every admit; no cudaEventCreate on the doorbell worker thread.
     cache_ev_.assign((size_t) cache_slots_, nullptr);
+    for (size_t k = 0; k < (size_t) cache_slots_; k++) {
+        cudaEvent_t ev = nullptr;
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess) {
+            cache_ev_[k] = ev;
+        }
+    }
     return true;
 }
 
@@ -663,8 +671,6 @@ const char * moe_pager::cache_find(int il, int expert) {
         cudaEvent_t ev = cache_ev_[(size_t) slot];
         const cudaError_t q = ev ? cudaEventQuery(ev) : cudaErrorUnknown;
         if (q == cudaSuccess) {
-            if (ev) cudaEventDestroy(ev);
-            cache_ev_[(size_t) slot] = nullptr;
             cache_state_[(size_t) slot] = 2;
             n_cache_inflight_--;
         } else if (q == cudaErrorNotReady) {
@@ -672,9 +678,7 @@ const char * moe_pager::cache_find(int il, int expert) {
             n_cache_miss_++;
             return nullptr;
         } else {
-            // error: drop the entry so the slot self-heals
-            if (ev) cudaEventDestroy(ev);
-            cache_ev_[(size_t) slot] = nullptr;
+            // error: drop the entry so the slot self-heals; event object remains pre-created and reusable
             cache_idx_[(size_t) (il * n_expert_ + expert)] = -1;
             cache_used_[(size_t) slot] = 0;
             cache_state_[(size_t) slot] = 0;
@@ -741,10 +745,7 @@ int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * sel
         if (cache_used_[(size_t) slot]) {
             const int old_key = cache_slot_key_[(size_t) slot];
             if (old_key >= 0) cache_idx_[(size_t) old_key] = -1;
-            if (cache_ev_[(size_t) slot]) {
-                cudaEventDestroy(cache_ev_[(size_t) slot]);
-                cache_ev_[(size_t) slot] = nullptr;
-            }
+            // Event object is pre-created at init_cache and reusable; do not destroy here (worker thread path).
             cache_state_[(size_t) slot] = 0;
             n_cache_evict_++;
         }
@@ -810,19 +811,28 @@ cudaEvent_t moe_pager::cache_admit_d2h(int il, int evicted_expert, const int32_t
         cache_state_[(size_t) slot] = 0;
         return nullptr;
     }
-    cudaEvent_t ev = nullptr;
-    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
-        cudaStreamSynchronize(d2h_stream); // pay the full cost, refuse to leak the slot
-        cache_ev_[(size_t) slot] = nullptr;
-        cache_state_[(size_t) slot] = 2;
-        return ev; // nullptr on failure path: treat admission as ready-best-effort
+    cudaEvent_t ev = cache_ev_[(size_t) slot];
+    if (ev) {
+        if (cudaEventRecord(ev, d2h_stream) != cudaSuccess) {
+            // Re-arm failed but event object is still reusable next call; not fatal in this path.
+            cache_state_[(size_t) slot] = 2;
+            return nullptr;
+        }
+    } else {
+        // Fallback: pre-create at init_cache failed; do a safe inline create on this call.
+        ev = nullptr;
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+            cudaStreamSynchronize(d2h_stream); // pay the full cost, refuse to leak the slot
+            cache_state_[(size_t) slot] = 2;
+            return nullptr; // nullptr: treat admission as ready-best-effort
+        }
+        if (cudaEventRecord(ev, d2h_stream) != cudaSuccess) {
+            cudaEventDestroy(ev);
+            cache_state_[(size_t) slot] = 2;
+            return nullptr;
+        }
+        cache_ev_[(size_t) slot] = ev;
     }
-    if (cudaEventRecord(ev, d2h_stream) != cudaSuccess) {
-        cudaEventDestroy(ev);
-        cache_state_[(size_t) slot] = 2;
-        return nullptr;
-    }
-    cache_ev_[(size_t) slot] = ev;
     cache_state_[(size_t) slot] = 1;
     n_cache_inflight_++;
     return ev;
@@ -839,9 +849,7 @@ void moe_pager::cache_remove(int il, int expert) {
         const cudaError_t q = ev ? cudaEventQuery(ev) : cudaErrorUnknown;
         if (q != cudaSuccess) {
             if (q != cudaErrorNotReady) {
-                // error: drop the entry so the slot self-heals
-                if (ev) cudaEventDestroy(ev);
-                cache_ev_[(size_t) slot] = nullptr;
+                // error: drop the entry so the slot self-heals; keep pre-created event
                 cache_idx_[key] = -1;
                 cache_slot_key_[(size_t) slot] = -1;
                 cache_used_[(size_t) slot] = 0;
@@ -853,8 +861,7 @@ void moe_pager::cache_remove(int il, int expert) {
             // not ready yet: leave the entry alone; the data is in the pool
             return;
         }
-        cudaEventDestroy(ev);
-        cache_ev_[(size_t) slot] = nullptr;
+        // Ready: event is pre-created at init_cache and reusable by next admission; keep it.
         cache_state_[(size_t) slot] = 2;
         n_cache_inflight_--;
     }
@@ -1124,17 +1131,29 @@ moe_pager::moe_pack_loc moe_pager::pack_loc_buf(int il, int e) {
 }
 
 void * moe_pager::worker_stream() {
-    thread_local cudaStream_t ws = nullptr;
-    thread_local bool tried = false;
-    if (!ws && !tried) {
-        tried = true;
+    static cudaStream_t ws = nullptr;
+    static std::once_flag flag;
+    std::call_once(flag, [&]() {
         cudaError_t e = cudaStreamCreateWithFlags(&ws, cudaStreamNonBlocking);
         if (e != cudaSuccess) {
             fprintf(stderr, "pager worker_stream create failed: %d\n", (int) e);
             ws = nullptr;
         }
-    }
+    });
     return (void *) ws;
+}
+
+void * moe_pager::worker_event() {
+    static cudaEvent_t we = nullptr;
+    static std::once_flag flag;
+    std::call_once(flag, [&]() {
+        cudaError_t e = cudaEventCreateWithFlags(&we, cudaEventDisableTiming);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "pager worker_event create failed: %d\n", (int) e);
+            we = nullptr;
+        }
+    });
+    return (void *) we;
 }
 
 

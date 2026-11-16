@@ -168,6 +168,7 @@ public:
     // same expert arrived (prefetch hit); cumulative
     long stats_pf_hit()   const { return n_pf_hit_; }
     static void * worker_stream();
+    static void * worker_event();
 
 private:
     struct Req { int il, e, stage, done; bool used, demand; long got[3]; };
