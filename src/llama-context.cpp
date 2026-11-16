@@ -185,6 +185,11 @@ static bool destructor_trace() {
     return v == 1;
 }
 
+
+static inline bool moe_phase_tg(const llama_context * ctx) {
+    return ctx && ctx->moe.last_ntok == 1;
+}
+
 static void start_doorbell_worker(llama_context * ctx) {
     if (g_doorbell_running.load()) return;
     g_doorbell_running.store(true);
@@ -557,6 +562,9 @@ static void start_doorbell_worker(llama_context * ctx) {
                 if (dbs[il].state != 1) continue;
                 if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: taking layer %d\n", il);
                 const int64_t t_plan0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
+                if (moe_prof_enabled() && g_moe_prof.doorbell_t0_us.load(std::memory_order_relaxed) == 0) {
+                    g_moe_prof.doorbell_t0_us.store((uint64_t) moe_prof_now(), std::memory_order_relaxed);
+                }
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 dbs[il].state = 2;
 
@@ -639,7 +647,10 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 // pick victims and publish the read plan before the reads start,
                 // so the kernel can copy each expert as soon as its read lands
-                if (moe_prof_enabled()) g_moe_prof.plan_sel_us += (uint64_t) t_sel1 - (uint64_t) t_sel0;
+                if (moe_prof_enabled()) {
+                    const uint64_t v = (uint64_t) t_sel1 - (uint64_t) t_sel0;
+                    g_moe_prof.plan_sel_us += v;
+                }
                 const int64_t t_vic2 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 locs.clear();
                 cached_sources.assign(misses.size(), nullptr);
@@ -715,7 +726,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                     rfd.push_back(demand_fd);
                     if (moe_prof_enabled()) {
-                        if (demand_fd == ctx->pager.pack_fd()) g_moe_prof.rfd_direct_count++;
+                        if (demand_fd == ctx->pager.pack_fd()) {
+                            g_moe_prof.rfd_direct_count++;
+                            if (moe_phase_tg(ctx)) g_moe_prof.tg_rfd_direct_count++; else g_moe_prof.pp_rfd_direct_count++;
+                        }
                         else g_moe_prof.rfd_buf_count++;
                     }
                     } else {
@@ -729,7 +743,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                     ncopy++;
                 }
-                if (moe_prof_enabled()) g_moe_prof.plan_victim_us += (uint64_t) moe_prof_now() - (uint64_t) t_vic2;
+                if (moe_prof_enabled()) {
+                    const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_vic2;
+                    g_moe_prof.plan_victim_us += v;
+                    if (moe_phase_tg(ctx)) g_moe_prof.tg_plan_victim_us += v; else g_moe_prof.pp_plan_victim_us += v;
+                }
                 const int64_t t_as2 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 pl->n_copy = (uint32_t) ncopy;
 
@@ -756,11 +774,27 @@ static void start_doorbell_worker(llama_context * ctx) {
                 }
 
                 if (moe_prof_enabled()) {
-                    g_moe_prof.plan_assign_us += (uint64_t) moe_prof_now() - (uint64_t) t_as2;
-                    g_moe_prof.plan_us += (uint64_t) moe_prof_now() - (uint64_t) t_plan0;
+                    {
+                        const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_as2;
+                        g_moe_prof.plan_assign_us += v;
+                    }
+                    {
+                        const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_plan0;
+                        g_moe_prof.plan_us += v;
+                        if (moe_phase_tg(ctx)) g_moe_prof.tg_plan_us += v; else g_moe_prof.pp_plan_us += v;
+                    }
                     if (misses.size() <= (size_t) n) {
-                        g_moe_prof.hits[il] += (uint64_t) ((size_t) n - misses.size());
-                        g_moe_prof.misses[il] += (uint64_t) misses.size();
+                        const uint64_t hv = (uint64_t) ((size_t) n - misses.size());
+                        const uint64_t mv = (uint64_t) misses.size();
+                        g_moe_prof.hits[il] += hv;
+                        g_moe_prof.misses[il] += mv;
+                        if (moe_phase_tg(ctx)) {
+                            g_moe_prof.tg_hits[il] += hv;
+                            g_moe_prof.tg_misses[il] += mv;
+                        } else {
+                            g_moe_prof.pp_hits[il] += hv;
+                            g_moe_prof.pp_misses[il] += mv;
+                        }
                     }
                 }
                 // publish the plan and ring the doorbell
@@ -798,7 +832,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                     _mm_sfence(); // push the store out for the UVA/PCIe readers (KICK kernel polls copy_ready)
 #endif
                     done[(size_t) ci] = 1;
-                    if (moe_prof_enabled()) g_moe_prof.nvme_publish_h2d_us += (uint64_t) moe_prof_now() - (uint64_t) t_pub0;
+                    if (moe_prof_enabled()) {
+                        const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_pub0;
+                        g_moe_prof.nvme_publish_h2d_us += v;
+                        if (moe_phase_tg(ctx)) g_moe_prof.tg_nvme_publish_h2d_us += v; else g_moe_prof.pp_nvme_publish_h2d_us += v;
+                    }
                     // The expert now lives in the VRAM pool, so its page-cache
                     // copy is a duplicate. Drop it to keep the two tiers
                     // exclusive and leave the RAM for the warm tail.
@@ -848,13 +886,18 @@ static void start_doorbell_worker(llama_context * ctx) {
                         } else {
                             publish_ready(ci, cached);
                         }
-                        if (pl->pad0 && moe_doorbell_dma_enabled()) ctx->pager.cache_remove(il, misses[(size_t) ci]);
+                        // Mission 62: retain the Fate RAM entry on a hit so the
+                        // already_resident fast path skips future DtoH admits
                         left[(size_t) ci] = 0;
                         victim_hits++;
                         victim_bytes += gb + ub + db;
                     }
                 }
-                if (moe_prof_enabled()) g_moe_prof.victim_us += (uint64_t) moe_prof_now() - (uint64_t) t_vic0;
+                if (moe_prof_enabled()) {
+                    const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_vic0;
+                    g_moe_prof.victim_us += v;
+                    if (moe_phase_tg(ctx)) g_moe_prof.tg_victim_us += v; else g_moe_prof.pp_victim_us += v;
+                }
                 drain_spec();
                 int spec_copy = -1, spec_read = -1;
                 DoorbellPrekick * prediction = moe_doorbell_prekick_host(il);
@@ -1244,7 +1287,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 struct io_uring_cqe * scqe = nullptr;
                                 const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                                 const int sr = io_uring_wait_cqe(&spec_ring, &scqe);
-                                if (moe_prof_enabled()) g_moe_prof.nvme_cqe_wait_us += (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
+                                if (moe_prof_enabled()) {
+                                    const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
+                                    g_moe_prof.nvme_cqe_wait_us += v;
+                                    if (moe_phase_tg(ctx)) g_moe_prof.tg_nvme_cqe_wait_us += v; else g_moe_prof.pp_nvme_cqe_wait_us += v;
+                                }
                                 if (moe_prof_enabled()) {
                                     const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                                     int bucket = 4;
@@ -1304,7 +1351,11 @@ static void start_doorbell_worker(llama_context * ctx) {
                         struct io_uring_cqe * cqe = nullptr;
                         const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                         const int ready = io_uring_wait_cqe(&ring, &cqe);
-                        if (moe_prof_enabled()) g_moe_prof.nvme_cqe_wait_us += (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
+                        if (moe_prof_enabled()) {
+                            const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
+                            g_moe_prof.nvme_cqe_wait_us += v;
+                            if (moe_phase_tg(ctx)) g_moe_prof.tg_nvme_cqe_wait_us += v; else g_moe_prof.pp_nvme_cqe_wait_us += v;
+                        }
                         if (moe_prof_enabled()) {
                             const uint64_t d = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                             int bucket = 4;
@@ -1407,9 +1458,14 @@ static void start_doorbell_worker(llama_context * ctx) {
                 }
                 const auto t_read1 = std::chrono::high_resolution_clock::now();
                 if (moe_prof_enabled()) {
-                    g_moe_prof.nvme_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_read1 - t_read0).count();
-                    g_moe_prof.bytes_read += (uint64_t) ncopy * (gb + ub + db);
-                    g_moe_prof.served++;
+                    {
+                        const uint64_t v = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_read1 - t_read0).count();
+                        g_moe_prof.nvme_us += v;
+                        if (moe_phase_tg(ctx)) { g_moe_prof.tg_nvme_us += v; g_moe_prof.tg_bytes_read += (uint64_t) ncopy * (gb + ub + db); g_moe_prof.tg_served++; }
+                        else { g_moe_prof.pp_nvme_us += v; g_moe_prof.pp_bytes_read += (uint64_t) ncopy * (gb + ub + db); g_moe_prof.pp_served++; }
+                        g_moe_prof.bytes_read += (uint64_t) ncopy * (gb + ub + db);
+                        g_moe_prof.served++;
+                    }
                 }
                 t_read += std::chrono::duration<double, std::milli>(t_read1 - t_read0).count();
                 n_read += ncopy;
@@ -1436,8 +1492,12 @@ static void start_doorbell_worker(llama_context * ctx) {
 #endif
                 }
                 if (moe_prof_enabled()) {
-                    g_moe_prof.kernel_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::high_resolution_clock::now() - t_read1).count();
+                    {
+                        const uint64_t v = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::high_resolution_clock::now() - t_read1).count();
+                        g_moe_prof.kernel_us += v;
+                        if (moe_phase_tg(ctx)) g_moe_prof.tg_kernel_us += v; else g_moe_prof.pp_kernel_us += v;
+                    }
                 }
                 t_wait += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_read1).count();
@@ -3218,6 +3278,47 @@ llama_context::~llama_context() {
                 (unsigned long long) g_moe_prof.served.load(),
                 (unsigned long long) g_moe_prof.bytes_read.load(),
                 (unsigned long long) g_moe_prof.spec_fallback.load());
+        {
+            const uint64_t t_end = (uint64_t) moe_prof_now();
+            const uint64_t t_start = g_moe_prof.doorbell_t0_us.load(std::memory_order_relaxed);
+            const double wall_us_pp = (t_start != 0 && g_moe_prof.pp_served.load() > 0) ? (double) (t_end - t_start) : 0.0;
+            const double gpu_compute_ms_tg = (double) (t_end - t_start) / 1000.0 - (double) g_moe_prof.tg_nvme_cqe_wait_us.load() / 1000.0;
+            const double gpu_compute_ms_pp = (double) (t_end - t_start) / 1000.0 - (double) g_moe_prof.pp_nvme_cqe_wait_us.load() / 1000.0;
+            (void) wall_us_pp; (void) gpu_compute_ms_tg; (void) gpu_compute_ms_pp;
+            fprintf(stderr, "[moe_prof_tg] plan_us=%llu plan_victim_us=%llu victim_us=%llu nvme_us=%llu nvme_publish_h2d_us=%llu nvme_cqe_wait_us=%llu kernel_us=%llu served=%llu rfd_direct_count=%llu bytes_read=%llu gpu_compute_ms=%.3f\n",
+                    (unsigned long long) g_moe_prof.tg_plan_us.load(),
+                    (unsigned long long) g_moe_prof.tg_plan_victim_us.load(),
+                    (unsigned long long) g_moe_prof.tg_victim_us.load(),
+                    (unsigned long long) g_moe_prof.tg_nvme_us.load(),
+                    (unsigned long long) g_moe_prof.tg_nvme_publish_h2d_us.load(),
+                    (unsigned long long) g_moe_prof.tg_nvme_cqe_wait_us.load(),
+                    (unsigned long long) g_moe_prof.tg_kernel_us.load(),
+                    (unsigned long long) g_moe_prof.tg_served.load(),
+                    (unsigned long long) g_moe_prof.tg_rfd_direct_count.load(),
+                    (unsigned long long) g_moe_prof.tg_bytes_read.load(),
+                    gpu_compute_ms_tg);
+            fprintf(stderr, "[moe_prof_pp] plan_us=%llu plan_victim_us=%llu victim_us=%llu nvme_us=%llu nvme_publish_h2d_us=%llu nvme_cqe_wait_us=%llu kernel_us=%llu served=%llu rfd_direct_count=%llu bytes_read=%llu gpu_compute_ms=%.3f\n",
+                    (unsigned long long) g_moe_prof.pp_plan_us.load(),
+                    (unsigned long long) g_moe_prof.pp_plan_victim_us.load(),
+                    (unsigned long long) g_moe_prof.pp_victim_us.load(),
+                    (unsigned long long) g_moe_prof.pp_nvme_us.load(),
+                    (unsigned long long) g_moe_prof.pp_nvme_publish_h2d_us.load(),
+                    (unsigned long long) g_moe_prof.pp_nvme_cqe_wait_us.load(),
+                    (unsigned long long) g_moe_prof.pp_kernel_us.load(),
+                    (unsigned long long) g_moe_prof.pp_served.load(),
+                    (unsigned long long) g_moe_prof.pp_rfd_direct_count.load(),
+                    (unsigned long long) g_moe_prof.pp_bytes_read.load(),
+                    gpu_compute_ms_pp);
+            uint64_t tg_hit = 0, tg_miss = 0, pp_hit = 0, pp_miss = 0;
+            for (int il = 0; il < 48; ++il) {
+                tg_hit += g_moe_prof.tg_hits[il].load();
+                tg_miss += g_moe_prof.tg_misses[il].load();
+                pp_hit += g_moe_prof.pp_hits[il].load();
+                pp_miss += g_moe_prof.pp_misses[il].load();
+            }
+            fprintf(stderr, "[moe_prof_pp_hits] hit=%llu miss=%llu\n", (unsigned long long) pp_hit, (unsigned long long) pp_miss);
+            fprintf(stderr, "[moe_prof_tg_hits] hit=%llu miss=%llu\n", (unsigned long long) tg_hit, (unsigned long long) tg_miss);
+        }
         {
             uint64_t dt_sum = 0, kick_count = 0, cleared = 0, mn = ~0ull, mx = 0;
             for (int il = 0; il < 48 && il < (int) model.hparams.n_layer(); ++il) {

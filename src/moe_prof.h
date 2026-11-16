@@ -41,6 +41,32 @@ struct moe_prof_state {
     std::atomic<uint64_t> nvme_cqe_wait_us{0};
     std::atomic<uint64_t> hits[48] = {};
     std::atomic<uint64_t> misses[48] = {};
+    // Mission 62: TG (n_tokens == 1) vs PP (n_tokens > 1) splits.
+    std::atomic<uint64_t> tg_plan_us{0};
+    std::atomic<uint64_t> tg_plan_victim_us{0};
+    std::atomic<uint64_t> tg_victim_us{0};
+    std::atomic<uint64_t> tg_nvme_us{0};
+    std::atomic<uint64_t> tg_nvme_publish_h2d_us{0};
+    std::atomic<uint64_t> tg_nvme_cqe_wait_us{0};
+    std::atomic<uint64_t> tg_kernel_us{0};
+    std::atomic<uint64_t> tg_served{0};
+    std::atomic<uint64_t> tg_rfd_direct_count{0};
+    std::atomic<uint64_t> tg_bytes_read{0};
+    std::atomic<uint64_t> pp_plan_us{0};
+    std::atomic<uint64_t> pp_plan_victim_us{0};
+    std::atomic<uint64_t> pp_victim_us{0};
+    std::atomic<uint64_t> pp_nvme_us{0};
+    std::atomic<uint64_t> pp_nvme_publish_h2d_us{0};
+    std::atomic<uint64_t> pp_nvme_cqe_wait_us{0};
+    std::atomic<uint64_t> pp_kernel_us{0};
+    std::atomic<uint64_t> pp_served{0};
+    std::atomic<uint64_t> pp_rfd_direct_count{0};
+    std::atomic<uint64_t> pp_bytes_read{0};
+    std::atomic<uint64_t> tg_hits[48] = {};
+    std::atomic<uint64_t> tg_misses[48] = {};
+    std::atomic<uint64_t> pp_hits[48] = {};
+    std::atomic<uint64_t> pp_misses[48] = {};
+    std::atomic<uint64_t> doorbell_t0_us{0};
 };
 
 inline moe_prof_state g_moe_prof;
