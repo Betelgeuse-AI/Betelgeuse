@@ -821,3 +821,18 @@ Goal: pure read-only audit — find why PREKICK collapsed (28,049 -> 1) between 
     * Safe --moe-slots ceiling: VRAM available at load: 707 MiB - 150 MiB headroom = 557 MiB free; each slot ~1.0 MiB => maximum +550 slots => --moe-slots <= ~4,550.
     * kernel_us doubled (M44 1.91 s -> M45 3.65 s) key reason: PLE taps became PLE-fault forks from disk instead of RAM; fork PLE-migration goesthroughhost ~2 GiB/s; each fork decode queue seesfork-via host vs fork-via fork page cache bandwidth mismatch.
   - Audit committed to m47_prekick_dead_audit.md; TASK.md [x].
+
+# betelgeuse-v6.1 - Mission 48
+
+Goal: unfreeze PREKICK (pk_submitted 1 -> sane number) & benchmark MOE_PREKICK=1.
+
+- [x] Task 1 - Fix why PREKICK froze after spec_submitted = 1; add pk_* counters
+  - Inspect src/llama-context.cpp around spec_pending, spec_cancel_pending, spec_ring_inflight, drain_spec:
+    - Ensure drain_spec() runs cleanly on doorbell worker loop even on VRAM-hit layers (non-blocking io_uring_peek_cqe when spec_ring_inflight > 0)
+    - Ensure completed/cancelled spec_pending resets to -1 so PREKICK never locks out after submission #1
+  - Add lightweight MOE_PROF=1 counters around PREKICK gate (pk_skip_pending, pk_skip_demand, pk_skip_vram, pk_skip_cache, pk_submitted) to show exact reasons.
+  - Inspect src/moe_doorbell.cu / src/models/qwen4exp.cpp PREKICK selection: verify d_slot_map >= 0 is masked before top-K (Rule A) and report exact PREKICK top-M count & kernel grid.
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_PREKICK=1 benchmark on exact M45/M46 config (p1/p2/p3 T=0)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3, 120 s HTTP timeout; log m48_prekick_fixed_bench.log.
+  - Capture memory.peak/current/events/smaps_rollup/nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); 472/472 parity vs M45/M46; report pk_submitted, pk_skip_* breakdown, spec_cache_hits, spec_reused, inflight_joined, nvme_cqe_wait_us, TG & PP, VRAM, MemoryPeak, SIGTERM time.
