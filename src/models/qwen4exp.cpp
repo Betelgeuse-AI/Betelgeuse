@@ -1291,12 +1291,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         model.layers[il + 1].ffn_gate_inp != nullptr &&
         moe_up && moe_up[il + 1] && moe_table && moe_table[il + 1];
     if (oracle_dbs) {
-        hc_mix oracle_mix = build_hc_mix(cur,
-                model.layers[il + 1].hc_ffn_norm,
-                model.layers[il + 1].hc_ffn_down,
-                model.layers[il + 1].hc_ffn_up,
-                nullptr, nullptr, il + 1);
-        ggml_tensor * oracle_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, oracle_mix.cur);
+        ggml_tensor * oracle_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur);
         cb(oracle_logits, "ffn_moe_oracle_logits", il + 1);
         const int32_t sentinel_next = (int32_t) (((ggml_tensor *) moe_up[il + 1])->ne[2] - 1);
         const char * ocount_env = getenv("MOE_ORACLE_DBS_M");
