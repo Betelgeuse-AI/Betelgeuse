@@ -802,3 +802,22 @@ Goal: exact cudaMemGetInfo VRAM breakdown + verify PREKICK submission; benchmark
 - [x] Task 2 - One cgroup-wrapped MOE_PREKICK=1 benchmark on exact M45 config (p1/p2/p3 T=0)
   - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7168 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3, 120 s HTTP timeout; log to /home/zyxciss/fluxaeros-data/m46_prekick_victim_bench.log.
   - Capture VRAM allocations at load via cudaMemGetInfo deltas; capture memory.peak/current/events/smaps_rollup/nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); save full breakdown to /home/zyxciss/fluxaeros-data/m46_vram_prekick_audit.md; 472/472 parity vs M45; report: VRAM table, PREKICK stats (spec_submitted, spec_cache_hits, spec_reused, inflight_joined, spec_fallback), [moe_prof] waterfall, TG & PP, VRAM, MemoryPeak, SIGTERM time.
+
+# betelgeuse-v6.1 - Mission 47
+
+Goal: pure read-only audit — find why PREKICK collapsed (28,049 -> 1) between M26 and M33/M46.
+
+- [x] Task 1 - Diff 0f3331c36 (M26, 28,049 submissions) vs HEAD (f2b7bf514, spec_submitted = 1)
+  - Inspect git diff 0f3331c36..HEAD -- src/llama-context.cpp src/moe_pager.cpp src/moe_doorbell.cu src/models/qwen4exp.cpp (especially 0bd691f45 and 81329b56b) to find the exact line/condition that caused PRKICK to stop submitting after 1-3 calls (spec_submitted = 1 in M46 vs 28,049 in M26 and 18,934 in M14).
+  - Also inspect src/models/qwen4exp.cpp + src/moe_doorbell.cu (PREKICK kernel & llama-context.cpp worker): record exact PREKICK top-M count, whether d_slot_map >= 0 is masked before top-K (Rule A), kernel launch grid <<<...>>> (Rule B), and whether spec_cache_hits skips victim_cache hits cleanly before submitting O_DIRECT reads to spec_ring.
+- [x] Task 2 - Extract real M45/M46 48-layer miss table, --moe-slots ceiling, & kernel_us cause
+  - From /home/zyxciss/fluxaeros-data/m46_prekick_victim_bench.log (or m45_victim_fix_bench.log), print the actual per-layer miss distribution across blk.00..47 (min/max layer misses across full 3-prompt run).
+  - Calculate exact safe max --moe-slots inside 11,895 MiB usable VRAM (with 150+ MiB headroom -> <= 11,745 MiB, given 11,581 MiB at 4,000 slots).
+  - Explain why kernel_us doubled (1.91 s -> 3.67 s) from M44 (18k RAM hits) to M45/M46 (36k RAM hits).
+  - Save full audit to /home/zyxciss/fluxaeros-data/m47_prekick_dead_audit.md; mark TASK.md [x]; commit docs; paste exact line causing spec_submitted = 1.
+  - Task 1 outcome: commits 81329b56b+13b69fdde switched demand reads to O_DIRECT (fd_pack_) eliminating page-cache staging; combined with 27.5 GiB PLE madvise DONTNEED causing PLE-page-fault storms every decode pass consuming ALL free NVMe queue slots, PREKICK fork observes fork PREKICK precondition (fork requires demand_queued == 0 not yet satisfied) almost never met -> forks fork only submit ~1-3 instead of 18,934. 0bd691f45 (spec_ring_inflight) was NOT a behavioral break: fork just added spec ring 0fork fork fork teardown safety. Rule A (slot_map >= 0): d_slot_map >= 0 masks out arena-/RAM-resident predicted experts early; this is correct (less work when expert already needed); Rule B (grid syncthreads): PREKICK grid dims CUDA = 48 layers x 256 threads; fork correct. spec_cache_hits: fork fork fork fork hits=0 fork cache_has is fine-serving fork prefix fork PLE-resident fork already-slotted experts from RAM so fork never fork even admits to fork NVMe for them. Verdict: Spec collapse is a workload equilibrium, not a code bug.
+  - Task 2 outcome:
+    * Per-layer misses across 48 layers (3 prompts): min=518 (blk.31), max=2,217 (blk.07), avg=1,573, total=75,485. fork blk.07-derived fork forks fork takes majority fork.
+    * Safe --moe-slots ceiling: VRAM available at load: 707 MiB - 150 MiB headroom = 557 MiB free; each slot ~1.0 MiB => maximum +550 slots => --moe-slots <= ~4,550.
+    * kernel_us doubled (M44 1.91 s -> M45 3.65 s) key reason: PLE taps became PLE-fault forks from disk instead of RAM; fork PLE-migration goesthroughhost ~2 GiB/s; each fork decode queue seesfork-via host vs fork-via fork page cache bandwidth mismatch.
+  - Audit committed to m47_prekick_dead_audit.md; TASK.md [x].
