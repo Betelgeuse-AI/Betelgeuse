@@ -626,3 +626,18 @@ Goal: enable MOE_DEMAND_DIRECT=1 (O_DIRECT fd_pack_ for demand reads) to elimina
 - [x] Task 2 - One cgroup-wrapped MOE_DEMAND_DIRECT=1 benchmark (p1/p2/p3 T=0)
   - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; experts.bin; --moe-slots 4000; -ub 64; -np 1; -c 512; -t 6; --port 9931; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m33_demand_direct_bench.log.
   - Capture memory.peak/current/events, nvidia-smi VRAM before clean stop (SIGTERM, fallback SIGINT only if needed); rfd_direct_count > 0, rfd_buf_count == 0; 472/472 parity vs M32; report [moe_prof] waterfall, CQE histogram, TG/PP, VRAM, MemoryPeak, 6.77 GiB + SIGTERM findings.
+
+# betelgeuse-v6.1 - Mission 34
+
+Goal: fix SIGTERM 150 s exit hang + audit O_DIRECT MOE_PREKICK=0 A/B + non-blocking cudaEvent_t Exclusive Victim Cache.
+
+- [x] Task 1 - Fix SIGTERM shutdown hang + audit PREKICK waste & Exclusive Victim Cache
+  - In src/llama-context.cpp / src/moe_doorbell.cu: stop_doorbell_worker() wakes/quits cleanly (no infinite _mm_pause / blocking teardown); rc=0 + full [moe_prof] print on SIGTERM.
+  - Read-only audit -> /home/zyxciss/fluxaeros-data/m34_shutdown_async_audit.md:
+    * PREKICK counters (spec_submitted, spec_reused, overlap, wasted O_DIRECT reads) in m33_demand_direct_bench.log; whether confidence gating (p >= tau) can lift precision above 56%.
+    * Blueprint to convert M16's Exclusive DtoH Victim Cache blocking cudaStreamSynchronize(d2h_ws) into non-blocking per-slot cudaEvent_t full-duplex PCIe DtoH.
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [x] Task 2 - One cgroup-wrapped O_DIRECT MOE_PREKICK=0 verification + SIGTERM exit test
+  - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m34_direct_noprekick_bench.log.
+  - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM; send SIGTERM; measure exact exit time (verify clean < 5 s rc=0 with [moe_prof] printed).
+  - 472/472 parity vs M33; 0 failed reads; report waterfall (nvme_cqe_wait_us, bucket3 avg, drain_spec_us -> 0, kernel_us); TG/PP vs M33 7.06/6.99/7.07; VRAM; MemoryPeak; victim-cache + confidence-gated PREKICK notes.
