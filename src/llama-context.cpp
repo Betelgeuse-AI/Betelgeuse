@@ -194,7 +194,7 @@ static void oracle_trace_close() {
         // rewind and stamp n_records
         std::fflush(g_oracle_trace.fp);
         if constexpr (sizeof(uint64_t) == 8) {
-            std::fseek(g_oracle_trace.fp, 24, SEEK_SET); // after magic(8)+6x(u16)=24
+            std::fseek(g_oracle_trace.fp, 46, SEEK_SET); // bytes 46..53 hold the n_records slot (after magic+5x u16+7x int32 0..45)
             std::fwrite(&g_oracle_trace.n_records, sizeof(uint64_t), 1, g_oracle_trace.fp);
         }
         std::fclose(g_oracle_trace.fp);
