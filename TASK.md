@@ -722,3 +722,15 @@ Goal: fix d2h_stream doorbell-worker deadlock (2f5207e32) and benchmark Non-Bloc
   - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=6144 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; experts.bin --moe-pack-dir; --moe-slots 4000; -ub 64; -np 1; -c 512; -t 6; --port 9931; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m39_async_victim_bench.log.
   - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM before clean SIGTERM stop (< 5 s + full [moe_prof]); 472/472 byte-exact parity vs M33/M34; 0 failed reads.
   - Report: [moe_prof] waterfall (plan_victim_us vs M16 27.32 s, nvme_cqe_wait_us vs M34 74.52 s, nvme_submit_syscall_us), CQE histogram (Bucket 0..4), [moe_victim_cache] saved/hits/bytes, TG & PP tok/s, VRAM, MemoryPeak, smaps_rollup, SIGTERM exit time.
+
+# betelgeuse-v6.1 - Mission 40
+
+Goal: capture exact hung-thread backtraces (gdb child launch + SIGTRAP) and audit 4,330-admission hang.
+
+- [x] Task 1 - Read-only audit of m39_async_victim_bench.log & 2f5207e32/e770204fc recycle/prefill paths
+  - Inspect m39_async_victim_bench.log around n_tokens = 54, t = 7.28 s, and the 4,330 victim admissions.
+  - Inspect git show 2f5207e32 and git show e770204fc for: victim_cache recycle/eviction (cudaEventQuery, mtx_, state == 1 scan), d2h_ev_of_v / stream_h2d / d2h_stream interactions across prefill (t0 += 8 slices), and any while spin / cudaEventQuery / mutex blocking doorbell/main after 4,330 admissions.
+- [ ] Task 2 - Bypass ptrace_scope=1 via gdb child launch + SIGTRAP; dump exact backtraces
+  - Inside systemd-run --user --scope, spawn build-v1/bin/bel-server directly as a child of gdb (batch commands / script in /home/zyxciss/fluxaeros-data/, zero /tmp) with exact M39 env & flags; p1 with max_tokens=8.
+  - Once /health OK and hang manifests (GPU 100% / CPU ~98% stall ~30-40 s), kill -TRAP <bel_server_pid> so gdb breaks under ptrace_scope=1; dump set pagination off + thread apply all bt -> /home/zyxciss/fluxaeros-data/m40_hang_bt.log; kill/exit gdb cleanly.
+  - Write line-by-line root cause in /home/zyxciss/fluxaeros-data/m40_hang_triage.md; mark TASK.md [x]; commit docs locally on betelgeuse-v6.1; report stuck stack frames.
