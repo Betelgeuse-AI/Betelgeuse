@@ -1415,3 +1415,48 @@ Honesty notes:
   - Overclaim guard: these numbers measure a 24-of-48-layer, 1-prompt-code+1-prompt-chat validation on one hybrid MoE; they do not generalize to the full 48-layer oracle until clean full-coverage labels are collected (M66).
 
 - [x] Task 2 - conveyor oracle trained and evaluated on the valid (even-layer) subset; odd-layer supervision unrecoverable from the M65 file (see addendum above); full-coverage evaluation owed in M66 after the C++ fix in 0475a2884.
+
+# betelgeuse-v6.1 - Mission 66
+
+Goal: capture all-48-layer pre-router normalized u_t,l + exact router matrices; train known-router residual-velocity conveyor oracle.
+
+- [ ] Task 1 - MOE_ORACLE_TRACE v2: all-48 u_t,l (fp16[48][2560]) + prompt/token id + topk ids/scores; dump W_gate[48,512,2560] fp16 (125.8 MB) at load; fadvise DONTNEED every 32 tokens
+  - Session bel-m66-trace-all48 (ONE session only), MOE_CACHE_MIB=6800, -c 512, 16 prompts (8 Code + 8 Chat) max_tokens=200 T=0 timeout=600
+  - Verify: 0 NaN/Inf in u; all 48 layers topk_ids < 512; delta_l=0 check top-10(W_gate u) == topk_ids at >= 99.5% Recall@10; SIGTERM < 5 s; memory.events.high == 0
+- [ ] Task 2 - Known-Router Residual-Velocity Conveyor Oracle (nvcc -arch=sm_86 -lcublas)
+  - Split prompts 1..12 train / 13..16 val
+  - Train residual-velocity + low-rank adapter (rank 128/256) predicting u_hat at l=c+delta_l (delta in {1,2,3,4,6,8}) from u_c and v=u_c - u_{max(0,c-2)}; loss = cosine/MSE vs true u + KL/BCE vs z=W u
+  - Save /home/zyxciss/fluxaeros-data/conveyor_oracle_v2.bin
+  - Evaluate val (Code, Chat, Combined) x delta_l {0,1,2,3,4,6,8} x M {10,12,16,20,24}: Recall@M, Gate-Weighted Recall@M, Cold-Miss Recall@M/Precision@M (top-83 mask)
+
+# betelgeuse-v6.1 - Mission 66
+
+Goal: capture all-48-layer pre-router u_t,l + exact router matrices; train known-router residual-velocity conveyor oracle.
+
+- [x] Task 1 - MOE_ORACLE_TRACE v2 built, gates dumped, ONE session consumed
+  - Commits: a8f9bb8c7 (trace v2: ffn_router_inp all-48 capture, prompt_id via pos[0]==0, RTGATE01 dump, per-32-token fadvise, checkpoints 0..47) and c55d47d2a (prompt counting via ubatch.pos[0]==0 so long prompts spanning ubatches count once).
+  - .test_moe_pager PASS 9/9; router gates dumped 48/48 layers OK (q38_router_gates_fp16.bin = 125,829,144 B exact, F32 -> fp16, RTGATE01 ver 1, [48, 512, 2560]).
+  - ONE cgroup session (unit=bel-m66-trace-all48, MOE_CACHE_MIB=6800 -c 512), 16 prompts max_tokens=200: prompts 1 (gen=200, 23.5s) and 2 (gen=200, 23.3s) COMPLETED; prompt 3 crashed the server inside the decode dump path ([ggml] ggml-backend.cpp:556 GGML_ASSERT(offset + size <= ggml_nbytes(tensor)) FAILED -> signal=6 SIGABRT). Log order unreliable at crash; the tail partial record is prompt_id=3, token_id=74 (prompt 3's first decode crashed mid-write).
+  - memory.peak = 13,721,862,144 B = 13,086 MiB (< 13,824 high); memory.current = 13,133,565,952 B; events low=0 high=0 max=0 oom=0; VRAM 11,581 MiB (< 11,750); SIGTERM exited in 0.4 s (scope already dead, rc=134).
+  - Trace file q38_oracle_calib.bin: 99,067,293 B; magic OK; checkpoints 0..47; 399 complete records + 237,568-byte partial (prompt 3, is_dec=1); decode-only records confirmed (is_decode==1 everywhere present).
+  - HONEST VALIDATION FAILURES:
+    * 2,691 NaN halves + 30 Inf across 399 records, confined to buckets {1-6, 15-20, 31-33, 35-38} (whole buckets share arena slots; values cloned or arena-stale; buckets {7,8,9,34} came out all-zeros because the capture predicate rejected them).
+    * topk_ids valid <512 ONLY on even layers (0,2,...,46 - same parity rotation as M65); all 24 odd layers carry fp16 bit-patterns of the normalized router weights (sum ~0.9996, sorted descending), i.e. the arena slot holds softmax data, NOT argsort indices.
+    * scores: odd layers valid softmax (sum ~0.9997); even layers garbage (~2e-4 sums).
+    * GATE VERIFIER (task 1 step 4): top-10(W_gate @ u_t,l) vs captured topk_ids = 0/10 hits on ALL tested layers of all tested records (gate top-10 = [336,351,350,...], degenerate because z contains NaN). The captured u is NOT the pre-router input (or is arena-stale). The >=99.5% Recall@10 gate for Task 1 is FAILED.
+    * Prompt ids: 199 records prompt 1, 199 records prompt 2, 1 record labelled 0, partial record prompt 3. prompts 4-16 never collected.
+  - Fresh-capture fix (M65 0475a2884) assigned step_topk/step_weights fresh per decode ubatch, yet the odd-layer rotation persisted verbatim (bit-identical pattern to M65). Root cause NOT isolated; mechanism unproven without a second session (forbidden by the strict one-session rule).
+  - Verdict: Task 1 INCOMPLETE/FAILED. The trace is unusable for training: u unreliable, odd-layer labels unrecoverable, prompts 4-16 uncollected, gate check failed.
+
+- [ ] Task 2 - NOT RUN (blocked on Task 1 data)
+  - The mission mandates a >=99.5% Recall@10 Delta-l=0 sanity gate before training; it measured 0/10 on every tested layer/record. Training on this file would produce a meaningless oracle. No trainer was written (nvcc or otherwise).
+  - Even-layer ids exist (24/48 layers, 399 decode steps) but the checkpoint input u for Delta-l prediction is unverifiable/corrupt, and odd-layer labels are absent; a "conveyor oracle" trained on this file cannot meet the mission's metrics and would be dishonest to report as success.
+  - conveyor_oracle_v2.bin NOT saved. TASK.md checkboxes honestly NOT checked for Task 2.
+
+[session rule] ONE bel-server session used (--unit=bel-m66-trace-all48). No second session was launched. The mission's strict one-session confinement was respected even though the session crashed.
+[invariants] target_rank0_replaced==0 (no group reported through the crash point), failed==0, cpu_rows==0, cpu_ms==0.0 ms, VRAM 11,581 < 11,750, memory.events.high == 0, SIGTERM < 5 s.
+[required fixes for Task 2, owed in a later mission]
+  1. Isolate the slice of the graph that produces the ODD-layer argsort by name at build time (e.g. capture by graph node id or emit a per-layer sentinel marker for the argsort); verify the captured tensor is the argsort by checking ne[0]==10 && type==I32 && min>=0 && max<512 at write time, and write 0xFFFF otherwise instead of corrupt data.
+  2. Capture u by CLONING the pre-router tensor into a dedicated, per-layer output buffer (ggml_set_output + dedicated host buffer like embeddings_layer_inp) instead of reading the arena after compute; the current after-compute read sees reused slots.
+  3. Reproduce the ggml_backend_tensor_get assert (GGML_ASSERT(offset + size <= ggml_nbytes(tensor))) with a small focused run; the crash fires inside the first decode of each newest prompt's session start (prompt 3 in M66; prompt 9 in M65) and both missions died at the same assert.
+  4. Only then re-collect 16 prompts and run the gate verifier; if and only if >=99.5% Recall@10 passes, train the residual-velocity + low-rank adapter.
