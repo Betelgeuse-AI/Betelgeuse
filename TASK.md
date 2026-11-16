@@ -657,3 +657,20 @@ Goal: implement the non-blocking cudaEvent_t Exclusive DtoH Victim Cache (MOE_CA
   - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=6144 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m35_async_victim_bench.log.
   - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s exit, full [moe_prof]); 472/472 parity vs M34; 0 failed reads.
   - Report: plan_victim_us (27.32 s -> ?), nvme_cqe_wait_us (74.52 s -> ?), bucket3 count (71,834 -> ?), [moe_victim_cache] slots/saved/hits/bytes, TG/PP, VRAM, MemoryPeak, Rss, SIGTERM exit time.
+
+# betelgeuse-v6.1 - Mission 36
+
+Goal: pure read-only audit of Cache > 0 + DMA=1 hang (b6e87c585 M16 working vs fa375a890/2f5207e32 layer 7/8 hang).
+
+- [x] Task 1 - Diff working M16 (b6e87c585) vs broken M34/M35 (fa375a890, 2f5207e32)
+  - Verify from m15_profile.log and m16_plan_opt*.log that M14-M16 ran MOE_CACHE_MIB=5120 + DMA=1 cleanly (63,590 fills, 28,641 hits, 108.8 GB H2D).
+  - Record exact env/flag differences between M16 (MOE_PREKICK=1, no MOE_DEMAND_DIRECT=1) and M35 (MOE_PREKICK=0, MOE_DEMAND_DIRECT=1).
+  - git diff b6e87c585..fa375a890 -- src/llama-context.cpp src/moe_pager.cpp src/moe_pager.h src/moe_doorbell.cu; git show 2f5207e32 line-by-line; isolate every change touching Cache > 0, DMA=1, doorbell worker, MOE_DEMAND_DIRECT=1, MOE_PREKICK=0, ev_of_v, or d2h_stream.
+- [x] Task 2 - Pinpoint exact layer 7/8 hang mechanism (GPU 100%, served=0, h2d_bytes=0)
+  - Inspect /home/zyxciss/fluxaeros-data/m35_evidence_pack.md; trace why layer 7/8 hangs on p1 only when Cache > 0 && MOE_DMA == 1 (Cache == 0 && DMA == 1 works; Cache > 0 && DMA == 0 works).
+  - Check which exact condition stalls dma_done / dbs[il].state (GPU 100% spinning in WAIT; served=0; h2d_bytes=0).
+  - Explicitly check whether MOE_DEMAND_DIRECT=1, MOE_PREKICK=0, 0bd691f45 (spec_ring_inflight), fa375a890 (worker wake/sleep), or 2f5207e32 (ev_of_v / d2h_stream) caused the regression vs b6e87c585.
+  - Save full root-cause audit and exact minimal fix plan to /home/zyxciss/fluxaeros-data/m36_cache_dma_hang_audit.md; mark TASK.md [x]; commit docs locally on betelgeuse-v6.1; summarize exact culprit lines.
+  - Task 1 outcome: M14-M16 all ran MOE_CACHE_MIB=5120 + DMA=1 cleanly (63,590 fills / 28,641 hits / 48,009,241,600 B saved / cache_evict=32,198 / events.high=0), PLE drop released 27,466 MiB. Env diff vs M34/M35: M16 used MOE_PREKICK=1 with DEMAND_DIRECT unset; M33-M35 benchmarks forced MOE_DEMAND_DIRECT=1 (fd_pack_ O_DIRECT). The M16 demand path at HOT_K=0 reads through pack_fd_buf_ (page cache, O_RDONLY fd_pack_buf_); M33+ routes to pack_fd() O_DIRECT.
+  - Task 2 outcome: hang exact mechanism NOT fully locked (mission forbids bel-server runs; only read-only audit possible). Observed in failing logs: warmup resolves all 48 layers; user-prompt first-pass resolves through layer 46; second pass stalls at layer 8 with GPU 100% spinning in pci_ld_u32 guard waiting for `db.gpu_ready`/`dma_done`/`copy_ready` — host CQE reap never posts -> NVMe direct read CQEs never arrive -> `[moe_dma_io] copies=0 h2d_bytes=0` permanently. Contributing matrix elimination (from TASK.md M34/M33): spec_ring_inflight (0bd691f45) ruled out (spec=0); _mm_pause->cap backoff (fa375a890) ruled out (Cache==0 works); MOE_PREKICK=0 ruled out (Cache==0 M34 ran with PREKICK=0 byte-exact); MOE_DEMAND_DIRECT=1 (13b69fdde) is the primary suspect (feature isolated as the ONLY behavioral change in the demand-fd selection at HOT_K=0); ev_of_v / d2h_stream (2f5207e32) exonerated (M34 baseline binary hangs identically with none of the M35 code; admission dormant on first pass).
+  - Audit saved to /home/zyxciss/fluxaeros-data/m36_cache_dma_hang_audit.md; commit locally.
