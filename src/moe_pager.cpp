@@ -783,9 +783,17 @@ cudaEvent_t moe_pager::cache_admit_d2h(int il, int evicted_expert, const int32_t
                                         size_t gate_bytes, size_t up_bytes, size_t down_bytes,
                                         cudaStream_t d2h_stream) {
     std::lock_guard<std::mutex> lock(mtx_);
-    if (!cache_ || !d2h_stream) return nullptr;
+    if (!cache_ || !d2h_stream) {
+        const char * e = getenv("MOE_DESTRUCTOR_TRACE");
+        if (e && atoi(e) != 0) fprintf(stderr, "[d2h_admit] skip cache=%p stream=%p\n", (void *) cache_, (void *) d2h_stream);
+        return nullptr;
+    }
     if (il < 0 || il >= n_layer_ || evicted_expert < 0 || evicted_expert >= n_expert_) return nullptr;
     const int slot = cache_reserve_slot_locked(il, evicted_expert, selected, count);
+    {
+        const char * e = getenv("MOE_DESTRUCTOR_TRACE");
+        if (e && atoi(e) != 0) fprintf(stderr, "[d2h_admit] il=%d e=%d slot=%d\n", il, evicted_expert, slot);
+    }
     if (slot < 0) return nullptr;
     char * dst = cache_ + cache_off_[(size_t) slot];
     cudaError_t error = cudaMemcpyAsync(dst, src_gate, gate_bytes, cudaMemcpyDeviceToHost, d2h_stream);

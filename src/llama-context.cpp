@@ -347,6 +347,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             bool handled = false;
             for (int il = 0; il < n_layer; ++il) {
                 if (dbs[il].state != 1) continue;
+                if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: taking layer %d\n", il);
                 const int64_t t_plan0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 dbs[il].state = 2;
@@ -559,6 +560,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                 // publish the plan and ring the doorbell
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 moe_doorbell_signal_unblock(il, nullptr);
+                if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: layer %d plan published, ncopy=%d\n", il, ncopy);
 
                 left.assign((size_t) ncopy, 0);
                 exp_len.assign((size_t) ncopy * 3, 0);

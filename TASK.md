@@ -641,3 +641,19 @@ Goal: fix SIGTERM 150 s exit hang + audit O_DIRECT MOE_PREKICK=0 A/B + non-block
   - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=0 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m34_direct_noprekick_bench.log.
   - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM; send SIGTERM; measure exact exit time (verify clean < 5 s rc=0 with [moe_prof] printed).
   - 472/472 parity vs M33; 0 failed reads; report waterfall (nvme_cqe_wait_us, bucket3 avg, drain_spec_us -> 0, kernel_us); TG/PP vs M33 7.06/6.99/7.07; VRAM; MemoryPeak; victim-cache + confidence-gated PREKICK notes.
+
+# betelgeuse-v6.1 - Mission 35
+
+Goal: implement the non-blocking cudaEvent_t Exclusive DtoH Victim Cache (MOE_CACHE_MIB=6144).
+
+- [x] Task 1 - Non-blocking cudaEvent_t Exclusive DtoH Victim Cache (src/llama-context.cpp, src/moe_pager.{h,cpp})
+  - Follow /home/zyxciss/fluxaeros-data/m34_shutdown_async_audit.md: replace M16's blocking cudaStreamSynchronize(d2h_ws) (27.32 s) with non-blocking per-slot cudaEvent_t DtoH.
+  - Exclusive DtoH admission (only evicted old_key >= 0 VRAM experts enter victim_cache; no stage_host arrival duplication, no victim_fill_us CPU memcpy).
+  - 3 role cudaMemcpyAsync(..., cudaMemcpyDeviceToHost, d2h_stream) on non-blocking stream; record ev_d2h without cudaStreamSynchronize.
+  - Race guard #1: H2D stream executes cudaStreamWaitEvent(stream_h2d, ev_d2h_of_v, 0) before overwriting VRAM slot v.
+  - Race guard #2: per-slot atomic state + cudaEvent_t; consumers gate via cudaEventQuery; slots recycle only after cudaEventQuery == cudaSuccess; d2h_stream synchronized in teardown.
+  - Exact per-layer mixed-quant role lengths (blk.4 2,176,000 B) safe; rebuild bel-server; .test_moe_pager PASS 9/9; commit locally.
+- [ ] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=6144 verification (p1/p2/p3 T=0)
+  - MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=6144 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m35_async_victim_bench.log.
+  - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s exit, full [moe_prof]); 472/472 parity vs M34; 0 failed reads.
+  - Report: plan_victim_us (27.32 s -> ?), nvme_cqe_wait_us (74.52 s -> ?), bucket3 count (71,834 -> ?), [moe_victim_cache] slots/saved/hits/bytes, TG/PP, VRAM, MemoryPeak, Rss, SIGTERM exit time.
