@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include <cuda_runtime.h>
+
 struct ggml_tensor;
 struct ggml_context;
 struct ggml_backend_buffer;
@@ -113,6 +115,19 @@ public:
     bool cache_has(int il, int expert); // side-effect free probe (no LFU stamp, no hit count)
     char * cache_reserve(int il, int expert, const int32_t * selected, size_t count);
     void cache_remove(int il, int expert);
+    // Exclusive DtoH admission (M35): copies the evicted expert's arena bytes
+    // (src_gate/src_up/src_down, exact per-layer role lengths) into a RAM cache
+    // slot asynchronously on d2h_stream. The slot is marked in-flight until its
+    // recorded event fires and cache_find()/cache_has() gate on cudaEventQuery;
+    // callers order the H2D pool write with cudaStreamWaitEvent(h2d_stream, ev, 0).
+    // Returns the recorded event, or nullptr if the admission was skipped.
+    cudaEvent_t cache_admit_d2h(int il, int evicted_expert, const int32_t * selected, size_t count,
+                                const void * src_gate, const void * src_up, const void * src_down,
+                                size_t gate_bytes, size_t up_bytes, size_t down_bytes,
+                                cudaStream_t d2h_stream);
+    // synchronize d2h_stream usage and destroy all per-slot events; teardown only
+    void cache_quiesce(cudaStream_t d2h_stream);
+    long stats_cache_inflight() const { return n_cache_inflight_; }
     size_t cache_bytes() const { return cache_ ? cache_bytes_ : 0; }
     long stats_cache_hit()   const { return n_cache_hit_; }
     long stats_cache_miss()  const { return n_cache_miss_; }
@@ -204,12 +219,16 @@ private:
     std::vector<uint64_t> cache_off_;    // per-slot offset into cache_
     std::vector<int> layer_slot_base_;   // first arena slot of layer il
     std::vector<int> layer_slot_count_;  // arena slots per layer
+    int cache_reserve_slot_locked(int il, int expert, const int32_t * selected, size_t count); // mtx held
     std::vector<int> cache_slot_key_;    // slot -> il*n_expert+e, -1 = empty
     std::vector<int>  cache_idx_;        // il*n_expert+e -> slot, -1 = absent
     std::vector<char> cache_used_;       // slot occupied
+    std::vector<char> cache_state_;      // 0 = free, 1 = DtoH in-flight, 2 = ready
+    std::vector<cudaEvent_t> cache_ev_;  // per-slot event while state == 1
     std::vector<long> cache_stamp_;      // slot last-use tick (LFU)
     long cache_tick_ = 0;
     long n_cache_hit_ = 0, n_cache_miss_ = 0, n_cache_fill_ = 0, n_cache_evict_ = 0;
+    long n_cache_inflight_ = 0;
     void * ring_ = nullptr;
     long io_ops_ = 0, io_bytes_ = 0, n_io_fail_ = 0;
     long n_pf_issued_ = 0, n_pf_hit_ = 0;

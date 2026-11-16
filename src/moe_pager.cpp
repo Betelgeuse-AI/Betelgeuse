@@ -39,6 +39,11 @@ moe_pager::~moe_pager() {
         }
     }
     if (stage_) { cudaFreeHost(stage_); stage_ = nullptr; }
+    for (size_t k = 0; k < cache_ev_.size(); k++) {
+        if (cache_ev_[k]) { cudaEventDestroy(cache_ev_[k]); cache_ev_[k] = nullptr; }
+    }
+    cache_ev_.clear();
+    cache_ev_.shrink_to_fit();
     if (cache_) {
         if (cache_registered_) {
             cudaHostUnregister(cache_);
@@ -641,6 +646,8 @@ bool moe_pager::init_cache(size_t bytes) {
     cache_idx_.assign((size_t) n_layer_ * n_expert_, -1);
     cache_used_.assign((size_t) cache_slots_, 0);
     cache_stamp_.assign((size_t) cache_slots_, 0);
+    cache_state_.assign((size_t) cache_slots_, 0);
+    cache_ev_.assign((size_t) cache_slots_, nullptr);
     return true;
 }
 
@@ -652,6 +659,33 @@ const char * moe_pager::cache_find(int il, int expert) {
         n_cache_miss_++;
         return nullptr;
     }
+    if (cache_state_[(size_t) slot] == 1) {
+        cudaEvent_t ev = cache_ev_[(size_t) slot];
+        const cudaError_t q = ev ? cudaEventQuery(ev) : cudaErrorUnknown;
+        if (q == cudaSuccess) {
+            if (ev) cudaEventDestroy(ev);
+            cache_ev_[(size_t) slot] = nullptr;
+            cache_state_[(size_t) slot] = 2;
+            n_cache_inflight_--;
+        } else if (q == cudaErrorNotReady) {
+            // DtoH still in flight; the caller falls back to a demand read
+            n_cache_miss_++;
+            return nullptr;
+        } else {
+            // error: drop the entry so the slot self-heals
+            if (ev) cudaEventDestroy(ev);
+            cache_ev_[(size_t) slot] = nullptr;
+            cache_idx_[(size_t) (il * n_expert_ + expert)] = -1;
+            cache_used_[(size_t) slot] = 0;
+            cache_state_[(size_t) slot] = 0;
+            cache_stamp_[(size_t) slot] = 0;
+            cache_slot_key_[(size_t) slot] = -1;
+            n_cache_inflight_--;
+            n_cache_evict_++;
+            n_cache_miss_++;
+            return nullptr;
+        }
+    }
     cache_stamp_[(size_t) slot] = ++cache_tick_;
     n_cache_hit_++;
     return cache_ + cache_off_[(size_t) slot];
@@ -660,12 +694,16 @@ const char * moe_pager::cache_find(int il, int expert) {
 bool moe_pager::cache_has(int il, int expert) {
     if (!cache_ || il < 0 || il >= n_layer_ || expert < 0 || expert >= n_expert_) return false;
     std::lock_guard<std::mutex> lock(mtx_);
-    return cache_idx_[(size_t) il * n_expert_ + expert] >= 0;
+    const int slot = cache_idx_[(size_t) il * n_expert_ + expert];
+    if (slot < 0) return false;
+    if (cache_state_[(size_t) slot] == 1) {
+        const cudaEvent_t ev = cache_ev_[(size_t) slot];
+        return ev && cudaEventQuery(ev) == cudaSuccess;
+    }
+    return true;
 }
 
-char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, size_t count) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    if (!cache_ || il < 0 || il >= n_layer_ || expert < 0 || expert >= n_expert_) return nullptr;
+int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * selected, size_t count) {
     const size_t key = (size_t) il * n_expert_ + expert;
     int slot = cache_idx_[key];
     if (slot < 0) {
@@ -684,22 +722,30 @@ char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, si
             }
         }
         long oldest = std::numeric_limits<long>::max();
+        int chosen = -1;
         for (int current = 0; current < n_slots; ++current) {
             const int gs = base_slot + current;
             if (pinned[(size_t) current]) continue;
+            if (cache_state_[(size_t) gs] == 1) continue; // DtoH in flight: keep it
             if (!cache_used_[(size_t) gs]) {
-                slot = gs;
+                chosen = gs;
                 break;
             }
             if (cache_stamp_[(size_t) gs] < oldest) {
                 oldest = cache_stamp_[(size_t) gs];
-                slot = gs;
+                chosen = gs;
             }
         }
-        if (slot < 0) return nullptr;
+        if (chosen < 0) return -1;
+        slot = chosen;
         if (cache_used_[(size_t) slot]) {
             const int old_key = cache_slot_key_[(size_t) slot];
             if (old_key >= 0) cache_idx_[(size_t) old_key] = -1;
+            if (cache_ev_[(size_t) slot]) {
+                cudaEventDestroy(cache_ev_[(size_t) slot]);
+                cache_ev_[(size_t) slot] = nullptr;
+            }
+            cache_state_[(size_t) slot] = 0;
             n_cache_evict_++;
         }
         cache_slot_key_[(size_t) slot] = (int) key;
@@ -708,7 +754,70 @@ char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, si
         n_cache_fill_++;
     }
     cache_stamp_[(size_t) slot] = ++cache_tick_;
+    return slot;
+}
+
+char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, size_t count) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!cache_ || il < 0 || il >= n_layer_ || expert < 0 || expert >= n_expert_) return nullptr;
+    const int slot = cache_reserve_slot_locked(il, expert, selected, count);
+    if (slot < 0) return nullptr;
     return cache_ + cache_off_[(size_t) slot];
+}
+
+void moe_pager::cache_quiesce(cudaStream_t d2h_stream) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (d2h_stream) cudaStreamSynchronize(d2h_stream);
+    for (size_t k = 0; k < cache_ev_.size(); k++) {
+        if (cache_ev_[k]) {
+            cudaEventDestroy(static_cast<cudaEvent_t>(cache_ev_[k]));
+            cache_ev_[k] = nullptr;
+        }
+    }
+    cache_state_.assign(cache_state_.size(), 0);
+    n_cache_inflight_ = 0;
+}
+
+cudaEvent_t moe_pager::cache_admit_d2h(int il, int evicted_expert, const int32_t * selected, size_t count,
+                                        const void * src_gate, const void * src_up, const void * src_down,
+                                        size_t gate_bytes, size_t up_bytes, size_t down_bytes,
+                                        cudaStream_t d2h_stream) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!cache_ || !d2h_stream) return nullptr;
+    if (il < 0 || il >= n_layer_ || evicted_expert < 0 || evicted_expert >= n_expert_) return nullptr;
+    const int slot = cache_reserve_slot_locked(il, evicted_expert, selected, count);
+    if (slot < 0) return nullptr;
+    char * dst = cache_ + cache_off_[(size_t) slot];
+    cudaError_t error = cudaMemcpyAsync(dst, src_gate, gate_bytes, cudaMemcpyDeviceToHost, d2h_stream);
+    if (error == cudaSuccess)
+        error = cudaMemcpyAsync(dst + gate_bytes, src_up, up_bytes, cudaMemcpyDeviceToHost, d2h_stream);
+    if (error == cudaSuccess)
+        error = cudaMemcpyAsync(dst + gate_bytes + up_bytes, src_down, down_bytes, cudaMemcpyDeviceToHost, d2h_stream);
+    if (error != cudaSuccess) {
+        // roll the slot back so the arena stays consistent
+        cache_idx_[(size_t) (il * n_expert_ + evicted_expert)] = -1;
+        cache_slot_key_[(size_t) slot] = -1;
+        cache_used_[(size_t) slot] = 0;
+        cache_stamp_[(size_t) slot] = 0;
+        cache_state_[(size_t) slot] = 0;
+        return nullptr;
+    }
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+        cudaStreamSynchronize(d2h_stream); // pay the full cost, refuse to leak the slot
+        cache_ev_[(size_t) slot] = nullptr;
+        cache_state_[(size_t) slot] = 2;
+        return ev; // nullptr on failure path: treat admission as ready-best-effort
+    }
+    if (cudaEventRecord(ev, d2h_stream) != cudaSuccess) {
+        cudaEventDestroy(ev);
+        cache_state_[(size_t) slot] = 2;
+        return nullptr;
+    }
+    cache_ev_[(size_t) slot] = ev;
+    cache_state_[(size_t) slot] = 1;
+    n_cache_inflight_++;
+    return ev;
 }
 
 void moe_pager::cache_remove(int il, int expert) {
@@ -717,10 +826,35 @@ void moe_pager::cache_remove(int il, int expert) {
     const size_t key = (size_t) il * n_expert_ + expert;
     const int slot = cache_idx_[key];
     if (slot < 0) return;
+    if (cache_state_[(size_t) slot] == 1) {
+        const cudaEvent_t ev = cache_ev_[(size_t) slot];
+        const cudaError_t q = ev ? cudaEventQuery(ev) : cudaErrorUnknown;
+        if (q != cudaSuccess) {
+            if (q != cudaErrorNotReady) {
+                // error: drop the entry so the slot self-heals
+                if (ev) cudaEventDestroy(ev);
+                cache_ev_[(size_t) slot] = nullptr;
+                cache_idx_[key] = -1;
+                cache_slot_key_[(size_t) slot] = -1;
+                cache_used_[(size_t) slot] = 0;
+                cache_state_[(size_t) slot] = 0;
+                cache_stamp_[(size_t) slot] = 0;
+                n_cache_evict_++;
+                n_cache_inflight_--;
+            }
+            // not ready yet: leave the entry alone; the data is in the pool
+            return;
+        }
+        cudaEventDestroy(ev);
+        cache_ev_[(size_t) slot] = nullptr;
+        cache_state_[(size_t) slot] = 2;
+        n_cache_inflight_--;
+    }
     cache_idx_[key] = -1;
     cache_slot_key_[(size_t) slot] = -1;
     cache_used_[(size_t) slot] = 0;
     cache_stamp_[(size_t) slot] = 0;
+    cache_state_[(size_t) slot] = 0;
 }
 
 bool moe_pager::prefetch(int il, int e) {

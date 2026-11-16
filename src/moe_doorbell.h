@@ -41,6 +41,7 @@ LayerDoorbell * moe_doorbell_get_dev_ptr();
 void moe_doorbell_log_stats();
 void moe_doorbell_signal_unblock(int il, void * stream);
 bool moe_doorbell_dma_enabled();
+void * moe_doorbell_dma_h2d_stream();
 bool moe_doorbell_dma_submit(int il, int copy_index);
 bool moe_doorbell_dma_submit_from(int il, int copy_index, const char * source);
 bool moe_doorbell_dma_store(int il, int slot, char * destination);

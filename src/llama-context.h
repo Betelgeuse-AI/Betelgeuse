@@ -339,6 +339,9 @@ public:
         std::vector<int32_t> adapt_pend_e;  // n_layer * n_expert: pending swap candidate
         long adapt_pass  = 0;               // decode steps seen
         long adapt_swaps = 0, adapt_bytes = 0, adapt_cold = 0;
+        // non-blocking VRAM -> RAM victim-cache copy stream + per-pool-slot events
+        void * d2h_stream = nullptr;              // cudaStream_t
+        std::vector<void *> d2h_ev_of_v;          // cudaEvent_t per global pool slot, or nullptr
     };
     moe_pool moe;
     moe_pager pager;

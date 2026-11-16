@@ -449,7 +449,33 @@ static void start_doorbell_worker(llama_context * ctx) {
                     if (v == (size_t) -1) break;
                     pinned[v - (size_t) base] = 1;
                     const int old_key = ctx->moe.slot_key[v];
-                    if (old_key >= 0) ctx->moe.slot_of[(size_t) old_key] = -1;
+                    if (old_key >= 0) {
+                        ctx->moe.slot_of[(size_t) old_key] = -1;
+                        // Exclusive DtoH admission: copy the evicted expert's bytes
+                        // out of VRAM before the H2D overwrite. Non-blocking: 3 role
+                        // cudaMemcpyAsync on the d2h stream + recorded event; the H2D
+                        // side waits via stream_wait_event at DMA-submit time.
+                        if (victim_cache && moe_doorbell_dma_enabled() && ctx->pager.pack_mode()) {
+                            const int old_e = (int) (old_key % n_exp);
+                            const size_t slot_off = (size_t) (v - (size_t) base);
+                            const void * sg = (const void *) ((uintptr_t) ctx->moe.pool_gate[il]->data + slot_off * gb);
+                            const void * su = (const void *) ((uintptr_t) ctx->moe.pool_up[il]->data   + slot_off * ub);
+                            const void * sd = (const void *) ((uintptr_t) ctx->moe.pool_down[il]->data + slot_off * db);
+                            if (!ctx->moe.d2h_stream) {
+                                cudaStreamCreateWithFlags((cudaStream_t *) &ctx->moe.d2h_stream, cudaStreamNonBlocking);
+                            }
+                            if (ctx->moe.d2h_stream) {
+                                if ((size_t) v >= ctx->moe.d2h_ev_of_v.size()) ctx->moe.d2h_ev_of_v.resize((size_t) v + 1, nullptr);
+                                cudaEvent_t admev = ctx->pager.cache_admit_d2h(il, old_e, sel.data(), (size_t) n,
+                                        sg, su, sd, gb, ub, db,
+                                        (cudaStream_t) ctx->moe.d2h_stream);
+                                if (admev) {
+                                    ctx->moe.d2h_ev_of_v[(size_t) v] = (void *) admev;
+                                    victim_saved++;
+                                }
+                            }
+                        }
+                    }
                     ctx->moe.slot_of[(size_t) il * n_exp + e] = (int) v;
                     ctx->moe.slot_key[v] = il * n_exp + e;
                     ctx->moe.lru.miss(v);
@@ -543,6 +569,14 @@ static void start_doorbell_worker(llama_context * ctx) {
                     const int64_t t_pub0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     if (moe_doorbell_dma_enabled() && pl->pad0 && pl->copy_slot[ci] >= 0) {
+                        // guard #1: never overwrite the VRAM slot while the
+                        // victim-cache DtoH is still reading it
+                        const size_t gv = (size_t) base + (size_t) pl->copy_slot[ci];
+                        if (gv < ctx->moe.d2h_ev_of_v.size() && ctx->moe.d2h_ev_of_v[gv]) {
+                            void * h2d_stream = moe_doorbell_dma_h2d_stream();
+                            if (h2d_stream) cudaStreamWaitEvent((cudaStream_t) h2d_stream, (cudaEvent_t) ctx->moe.d2h_ev_of_v[gv], 0);
+                            ctx->moe.d2h_ev_of_v[gv] = nullptr;
+                        }
                         const bool submitted = cached ? moe_doorbell_dma_submit_from(il, ci, cached)
                                                       : moe_doorbell_dma_submit(il, ci);
                         if (!submitted) GGML_ABORT("demand DMA submission failed");
@@ -550,22 +584,6 @@ static void start_doorbell_worker(llama_context * ctx) {
                             dma_copies++;
                             dma_bytes += gb + ub + db;
                         }
-                    }
-                    // back-fill the arena from the stage buffer; the bytes are already
-                    // there, so this avoids a VRAM<->Host round trip on every fill.
-                    // skip the victim-cache serve path: stage_host does not hold the expert.
-                    if (victim_cache && !cached && pl->copy_slot[ci] >= 0) {
-                        const int64_t t_fill0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-                        const int64_t t_res0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-                        char * destination = ctx->pager.cache_reserve(il, misses[(size_t) ci], sel.data(), (size_t) n);
-                        if (moe_prof_enabled()) g_moe_prof.victim_fill_reserve_us += (uint64_t) moe_prof_now() - (uint64_t) t_res0;
-                        if (destination) {
-                            const int64_t t_cpy0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-                            memcpy(destination, stage_host + (size_t) ci * stride + (size_t) pl->copy_pre[(size_t) ci], gb + ub + db);
-                            if (moe_prof_enabled()) g_moe_prof.victim_fill_memcpy_us += (uint64_t) moe_prof_now() - (uint64_t) t_cpy0;
-                            victim_saved++;
-                        }
-                        if (moe_prof_enabled()) g_moe_prof.victim_fill_us += (uint64_t) moe_prof_now() - (uint64_t) t_fill0;
                     }
                     pl->copy_ready[ci] = 1;
 #if defined(__x86_64__) || defined(_M_X64)
@@ -2948,6 +2966,10 @@ llama_context::~llama_context() {
     if (g_moe_resolve_ctx == this) {
         g_moe_resolve_ctx = nullptr;
     }
+    if (moe.d2h_stream) { cudaStreamSynchronize((cudaStream_t) moe.d2h_stream); }
+    pager.cache_quiesce((cudaStream_t) moe.d2h_stream);
+    if (moe.d2h_stream) { cudaStreamDestroy((cudaStream_t) moe.d2h_stream); moe.d2h_stream = nullptr; }
+    if (destructor_trace()) fprintf(stderr, "[~llama_context] d2h stream synced, cache quiesced\n");
     // release the sparse-MoE slot pool (fit-probe contexts must not leak VRAM)
     if (moe.buf) { ggml_backend_buffer_free(moe.buf); moe.buf = nullptr; }
     if (moe.host_pool) {

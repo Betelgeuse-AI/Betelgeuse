@@ -598,6 +598,8 @@ extern "C" int moe_doorbell_stage_cap() { return g_stage_cap; }
 
 bool moe_doorbell_dma_enabled() { return g_dma_done != nullptr; }
 
+extern "C" void * moe_doorbell_dma_h2d_stream() { return (void *) g_stream_h2d; }
+
 const uint64_t * moe_doorbell_lru_host(int il) {
     return g_lru_host && il >= 0 && il < g_n_layer ? g_lru_host + (size_t) il * g_n_expert : nullptr;
 }
