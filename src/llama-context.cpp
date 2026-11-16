@@ -2602,6 +2602,7 @@ llama_context::llama_context(
         }
         fprintf(stderr, "[moe_oracle_trace] checkpoint layers {%d,%d,%d,%d,%d,%d,%d} enabled at load\n",
                 ck[0], ck[1], ck[2], ck[3], ck[4], ck[5], ck[6]);
+        sched_need_reserve = true;
     }
     cparams.embeddings_layer_inp_dev = false;
     cparams.embeddings_nextn_dev     = false;
