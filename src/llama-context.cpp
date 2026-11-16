@@ -886,8 +886,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                         } else {
                             publish_ready(ci, cached);
                         }
-                        // Mission 62: retain the Fate RAM entry on a hit so the
-                        // already_resident fast path skips future DtoH admits
+                        if (pl->pad0 && moe_doorbell_dma_enabled()) ctx->pager.cache_remove(il, misses[(size_t) ci]);
                         left[(size_t) ci] = 0;
                         victim_hits++;
                         victim_bytes += gb + ub + db;
