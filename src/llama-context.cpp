@@ -1304,9 +1304,14 @@ static void start_doorbell_worker(llama_context * ctx) {
             if (handled) {
                 idle_iters = 0;
             } else {
-                const int64_t s = std::min<int64_t>(256, (int64_t) 16 << std::min<int64_t>(idle_iters, 4));
-                std::this_thread::sleep_for(std::chrono::microseconds(s));
-                idle_iters++;
+                // spin fast - PLE-resident prediction state flips in microseconds;
+                // sleeping past state=1 loses the window and locks PREKICK out
+                (void) idle_iters;
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
             }
             }
         }
