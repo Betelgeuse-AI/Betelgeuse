@@ -1170,12 +1170,22 @@ static void start_doorbell_worker(llama_context * ctx) {
                 }
             }
             if (!handled) {
+                if (moe_prof_enabled()) g_moe_prof.pk_skip_pred_unset++; // gate evaluation marker; fork will fire if demand queue is empty
                 if (spec_ok && ring_ok && spec_pending < 0 && !spec_cancel_pending) {
                     bool demand_pending = false;
                     for (int layer = 0; layer < n_layer; ++layer) {
                         if (dbs[layer].state == 1) demand_pending = true;
                     }
-                    if (demand_pending) continue;
+                    if (demand_pending) {
+                        if (moe_prof_enabled()) g_moe_prof.pk_skip_demand++;
+                        continue;
+                    }
+                    static int pk_skip_layer_iters = 0;
+                    bool demand_arrived = false;
+                    for (int layer = 0; layer < n_layer && !demand_arrived; ++layer) {
+                        if (dbs[layer].state == 1) demand_arrived = true;
+                    }
+                    (void) pk_skip_layer_iters;
                     for (int layer = 0; layer < n_layer; ++layer) {
                         DoorbellPrekick * prediction = moe_doorbell_prekick_host(layer);
                         uint32_t expected_state = 1;
@@ -1202,10 +1212,14 @@ static void start_doorbell_worker(llama_context * ctx) {
                             const int selected = spec_next++;
                             const int expert = spec_experts[selected];
                             if (expert < 0 || expert >= n_exp ||
-                                ctx->moe.slot_of[(size_t) spec_layer * n_exp + expert] >= 0) continue;
+                                ctx->moe.slot_of[(size_t) spec_layer * n_exp + expert] >= 0) {
+                                if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
+                                continue;
+                            }
                             // predicted expert is arena-resident: no NVMe spec read; the
                             // KICK demand path will DMA it arena -> pool without touching NVMe
                             if (ctx->pager.cache_has(spec_layer, expert)) {
+                                if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
                                 spec_cache_hits++;
                                 continue;
                             }
@@ -1273,6 +1287,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 spec_pending = selected;
                                 spec_ring_inflight += n_sqe;
                                 spec_submitted++;
+                                if (moe_prof_enabled()) g_moe_prof.pk_submitted++;
                                 if (io_diag) {
                                     spec_bytes += spec_lengths[selected];
                                     spec_started = submit_started;
@@ -2932,7 +2947,7 @@ llama_context::~llama_context() {
     if (moe_prof_enabled()) {
         const uint64_t us = g_moe_prof.nvme_us + g_moe_prof.kernel_us + g_moe_prof.victim_us + g_moe_prof.victim_fill_us + g_moe_prof.plan_us + g_moe_prof.prekick_us + g_moe_prof.ple_us;
         (void) us;
-        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu nvme_prep_submit_us=%llu nvme_prep_cpu_us=%llu nvme_submit_syscall_us=%llu nvme_drain_spec_us=%llu nvme_publish_h2d_us=%llu nvme_cqe_wait_us=%llu rfd_direct_count=%llu rfd_buf_count=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu spec_fallback=%llu\n",
+        fprintf(stderr, "[moe_prof] plan_us=%llu plan_sel_us=%llu plan_victim_us=%llu plan_assign_us=%llu victim_us=%llu victim_fill_us=%llu victim_fill_reserve_us=%llu victim_fill_memcpy_us=%llu nvme_us=%llu nvme_prep_submit_us=%llu nvme_prep_cpu_us=%llu nvme_submit_syscall_us=%llu nvme_drain_spec_us=%llu nvme_publish_h2d_us=%llu nvme_cqe_wait_us=%llu rfd_direct_count=%llu rfd_buf_count=%llu pk_skip_demand=%llu pk_skip_vram=%llu pk_skip_cache=%llu pk_submitted=%llu pk_skip_pred_unset=%llu kernel_us=%llu ple_us=%llu prekick_us=%llu served=%llu bytes_read=%llu spec_fallback=%llu\n",
                 (unsigned long long) g_moe_prof.plan_us.load(),
                 (unsigned long long) g_moe_prof.plan_sel_us.load(),
                 (unsigned long long) g_moe_prof.plan_victim_us.load(),
@@ -2950,6 +2965,11 @@ llama_context::~llama_context() {
                 (unsigned long long) g_moe_prof.nvme_cqe_wait_us.load(),
                 (unsigned long long) g_moe_prof.rfd_direct_count.load(),
                 (unsigned long long) g_moe_prof.rfd_buf_count.load(),
+                (unsigned long long) g_moe_prof.pk_skip_demand.load(),
+                (unsigned long long) g_moe_prof.pk_skip_vram.load(),
+                (unsigned long long) g_moe_prof.pk_skip_cache.load(),
+                (unsigned long long) g_moe_prof.pk_submitted.load(),
+                (unsigned long long) g_moe_prof.pk_skip_pred_unset.load(),
                 (unsigned long long) g_moe_prof.kernel_us.load(),
                 (unsigned long long) g_moe_prof.ple_us.load(),
                 (unsigned long long) g_moe_prof.prekick_us.load(),

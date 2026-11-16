@@ -29,6 +29,12 @@ struct moe_prof_state {
     std::atomic<uint64_t> nvme_submit_syscall_us{0};
     std::atomic<uint64_t> rfd_direct_count{0};
     std::atomic<uint64_t> rfd_buf_count{0};
+    std::atomic<uint64_t> pk_skip_pending{0};
+    std::atomic<uint64_t> pk_skip_demand{0};
+    std::atomic<uint64_t> pk_skip_vram{0};
+    std::atomic<uint64_t> pk_skip_cache{0};
+    std::atomic<uint64_t> pk_submitted{0};
+    std::atomic<uint64_t> pk_skip_pred_unset{0};
     std::atomic<uint64_t> nvme_drain_spec_us{0};
     std::atomic<uint64_t> nvme_publish_h2d_us{0};
     std::atomic<uint64_t> nvme_cqe_wait_us{0};
