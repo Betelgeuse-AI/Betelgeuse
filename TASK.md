@@ -674,3 +674,26 @@ Goal: pure read-only audit of Cache > 0 + DMA=1 hang (b6e87c585 M16 working vs f
   - Task 1 outcome: M14-M16 all ran MOE_CACHE_MIB=5120 + DMA=1 cleanly (63,590 fills / 28,641 hits / 48,009,241,600 B saved / cache_evict=32,198 / events.high=0), PLE drop released 27,466 MiB. Env diff vs M34/M35: M16 used MOE_PREKICK=1 with DEMAND_DIRECT unset; M33-M35 benchmarks forced MOE_DEMAND_DIRECT=1 (fd_pack_ O_DIRECT). The M16 demand path at HOT_K=0 reads through pack_fd_buf_ (page cache, O_RDONLY fd_pack_buf_); M33+ routes to pack_fd() O_DIRECT.
   - Task 2 outcome: hang exact mechanism NOT fully locked (mission forbids bel-server runs; only read-only audit possible). Observed in failing logs: warmup resolves all 48 layers; user-prompt first-pass resolves through layer 46; second pass stalls at layer 8 with GPU 100% spinning in pci_ld_u32 guard waiting for `db.gpu_ready`/`dma_done`/`copy_ready` — host CQE reap never posts -> NVMe direct read CQEs never arrive -> `[moe_dma_io] copies=0 h2d_bytes=0` permanently. Contributing matrix elimination (from TASK.md M34/M33): spec_ring_inflight (0bd691f45) ruled out (spec=0); _mm_pause->cap backoff (fa375a890) ruled out (Cache==0 works); MOE_PREKICK=0 ruled out (Cache==0 M34 ran with PREKICK=0 byte-exact); MOE_DEMAND_DIRECT=1 (13b69fdde) is the primary suspect (feature isolated as the ONLY behavioral change in the demand-fd selection at HOT_K=0); ev_of_v / d2h_stream (2f5207e32) exonerated (M34 baseline binary hangs identically with none of the M35 code; admission dormant on first pass).
   - Audit saved to /home/zyxciss/fluxaeros-data/m36_cache_dma_hang_audit.md; commit locally.
+
+# betelgeuse-v6.1 - Mission 37
+
+Goal: verify 2f5207e32 (non-blocking Exclusive DtoH victim cache) with MOE_DEMAND_DIRECT=0 + MOE_CACHE_MIB=5120.
+
+- [x] Task 1 - Pre-flight read-only check of 2f5207e32 + MOE_DEMAND_DIRECT=0 vs layer-8 hang
+  - Confirm HEAD rebuilds build-v1/bin/bel-server cleanly; .test_moe_pager passes 9/9.
+  - Briefly inspect src/llama-context.cpp demand io_uring submission (rfd, cached_sources, works, MOE_DEMAND_DIRECT) to note why Cache > 0 + MOE_DEMAND_DIRECT=1 could stall SQEs/CQEs at layer 8 while Cache > 0 + MOE_DEMAND_DIRECT=0 passes (no speculative fixes; keep control clean).
+- [x] Task 2 - One cgroup-wrapped MOE_DEMAND_DIRECT=0 + MOE_CACHE_MIB=5120 benchmark (p1/p2/p3 T=0)
+  - MOE_DEMAND_DIRECT=0 MOE_CACHE_MIB=5120 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3; log to /home/zyxciss/fluxaeros-data/m37_async_victim_direct0.log.
+  - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s exit, full [moe_prof] dump); verify 472/472 parity vs M16/M34; 0 failed reads.
+  - Report: whether 2f5207e32 ran cleanly (0 hangs), [moe_prof] waterfall (plan_victim_us vs M16 27.32 s, nvme_submit_syscall_us, nvme_cqe_wait_us), [moe_victim_cache] saved/hits/bytes, TG & PP tok/s, VRAM, MemoryPeak, events.high, SIGTERM exit time.
+  - Task 1 outcome: HEAD rebuilt clean; .test_moe_pager_m37 PASS 9/9 (io_ops=27, pf_hit=4). Demand-fd path under MOE_DEMAND_DIRECT=0 confirmed: rfd[] = loc.fd = pack_fd_buf_ (page cache, buffered), identical to M16 working code. Fork DMA doorbell never completes with Cache>0 REGARDLESS of DEMAND_DIRECT; fork's PLE-migration storms are the bottleneck (cpu ~100%, gpu 100%, sock_throttled=1 observed). Missing MOE_DESTRUCTOR_TRACE=1 env; doorbell trace prints never fired (no decode progress).
+  - Task 2 SESSION RESULTS (unit bel-m37-asyncvdd0, ONE cgroup-wrapped session, MOE_CACHE_MIB=5120 MOE_DEMAND_DIRECT=0):
+    *** BENCHMARK FAILED - no token output in 6+ minutes with GPU pinned to 100%. ***
+    * memory.peak = 13,409,566,720 B = 12,780 MiB; events: high=0 max=0 oom=0 oom_group_kill=0 sock_throttled=1 (FIRST OBSERVATION of sock_throttled on this fork).
+    * smaps_rollup: Rss=6,906,104 kB; Pss_Anon=5,709,440 kB; Pss_File=1,025,070 kB; anon dirty=5,985,948 kB.
+    * VRAM = 11,245 MiB (< 11,750 MiB). p1 binary_search at T=0 NEVER decoded a token; "[doorbell]" line never printed; plan_us=0 (GPU under continuous resolve spin).
+    * SIGTERM did not exit within 50 s (exited via manual SIGKILL after +SIGINT fallback failed).
+    * Hierarchy: fork with Cache>0 + DMA=1 deadlocks after PLE madvise release + Tier-1 pinned 6 GB anonymous registered to CUDA causes PLE migration storms; MOE_DEMAND_DIRECT=0 does NOT rescue it (this run repeats the M35/M34-baseline hang exactly).
+    * TG & PP tok/s: NOT measurable; plan_victim_us / nvme_cqe_wait_us / [moe_victim_cache] saved/hits bytes: NOT measurable.
+    * See /home/zyxciss/fluxaeros-data/m37_async_victim_direct0_audit.md for full evidence.
+    * M34 baseline (Cache=0, PREKICK=0, DEMAND_DIRECT=1) remains the reference state.
