@@ -208,6 +208,14 @@ __global__ void moe_resolve_slots_kernel(
     if (tid == 0 && op == GGML_OP_MOE_SLOT_RESOLVE_KICK) {
         DoorbellPrekick & pre = prekick_plans[layer];
         if (pre.n > 0) {
+            const uint64_t t_now = clock64();
+            const uint64_t t_pk  = pre.t_pk_cycles;
+            if (t_pk != 0) {
+                const uint64_t dt = t_now - t_pk;
+                pre.kick_dt_cycles = dt;
+                pre.kick_dt_sum += dt;
+                pre.kick_count += 1;
+            }
             for (uint32_t pred = 0; pred < pre.n; ++pred) {
                 for (int selected = 0; selected < total; ++selected) {
                     const int32_t actual = *(const int32_t *) (topk + (size_t) selected * topk_nb0);
@@ -223,7 +231,8 @@ __global__ void moe_resolve_slots_kernel(
             cuda::atomic_ref<uint32_t, cuda::thread_scope_system> pred_ref(
                 *const_cast<uint32_t *>(&pre.state));
             uint32_t expected = 1u;
-            pred_ref.compare_exchange_strong(expected, 0u);
+            const bool cleared = pred_ref.compare_exchange_strong(expected, 0u);
+            if (cleared) pre.kick_cas_cleared += 1;
         }
     }
 
@@ -408,6 +417,8 @@ static __global__ void moe_prekick_kernel(
     }
 
     if (tid == 0) {
+        __threadfence_system();
+        plans[layer].t_pk_cycles = clock64();
         __threadfence_system();
         pci_st_u32(&plans[layer].state, 1);
         __threadfence_system();

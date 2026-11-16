@@ -346,6 +346,138 @@ static void start_doorbell_worker(llama_context * ctx) {
         int64_t idle_iters = 0;
         while (g_doorbell_running.load(std::memory_order_relaxed)) {
             drain_spec();
+            // PREKICK claim sweep hoisted: during the GDN / pre-FFN window of the
+            // next layer the prediction is state == 1 with no dbs flag set; claiming
+            // must not be skipped just because the previous demand is being serviced
+            if (moe_prof_enabled()) g_moe_prof.pk_skip_pred_unset++; // gate evaluation marker
+            if (spec_ok && ring_ok && spec_pending < 0 && !spec_cancel_pending) {
+                bool demand_pending = false;
+                for (int layer = 0; layer < n_layer; ++layer) {
+                    if (dbs[layer].state == 1) demand_pending = true;
+                }
+                if (demand_pending) {
+                    if (moe_prof_enabled()) g_moe_prof.pk_skip_demand++;
+                } else {
+                    bool demand_arrived = false;
+                    for (int layer = 0; layer < n_layer && !demand_arrived; ++layer) {
+                        if (dbs[layer].state == 1) demand_arrived = true;
+                    }
+                    for (int layer = 0; layer < n_layer; ++layer) {
+                        DoorbellPrekick * prediction = moe_doorbell_prekick_host(layer);
+                        uint32_t expected_state = 1;
+                        if (!__atomic_compare_exchange_n(&prediction->state, &expected_state, 2, false,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        spec_layer = layer;
+                        spec_generation = prediction->generation;
+                        spec_count = std::min<int>(prediction->n, 8);
+                        spec_next = 0;
+                        for (int selected = 0; selected < spec_count; ++selected) {
+                            spec_experts[selected] = prediction->experts[selected];
+                            spec_lengths[selected] = 0;
+                            spec_ready[selected] = false;
+                            spec_got_bytes[selected] = 0;
+                            spec_got_roles[selected] = 0;
+                            spec_got_cancel[selected] = 0;
+                        }
+                        break;
+                    }
+                    if (spec_layer >= 0 && moe_doorbell_prekick_host(spec_layer)->state == 2) {
+                        const int64_t t_pk0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
+                        while (spec_next < spec_count && spec_pending < 0) {
+                            const int selected = spec_next++;
+                            const int expert = spec_experts[selected];
+                            if (expert < 0 || expert >= n_exp ||
+                                ctx->moe.slot_of[(size_t) spec_layer * n_exp + expert] >= 0) {
+                                if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
+                                continue;
+                            }
+                            // predicted expert is arena-resident: no NVMe spec read; the
+                            // KICK demand path will DMA it arena -> pool without touching NVMe
+                            if (ctx->pager.cache_has(spec_layer, expert)) {
+                                if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
+                                spec_cache_hits++;
+                                continue;
+                            }
+                            bool demand_arrived = false;
+                            for (int layer = 0; layer < n_layer; ++layer) {
+                                if (dbs[layer].state == 1) demand_arrived = true;
+                            }
+                            if (demand_arrived || moe_doorbell_prekick_host(spec_layer)->state != 2) break;
+                            char * dst = spec_stage + (size_t) selected * stride;
+                            const auto submit_started = std::chrono::steady_clock::now();
+                            int n_sqe = 0;
+                            if (ctx->pager.pack_mode()) {
+                                const auto location = ctx->pager.pack_loc(spec_layer, expert);
+                                const int spec_fd = ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : location.fd;
+                                if (spec_fd < 0 || location.len > stride) continue;
+                                struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
+                                if (!read) break;
+                                // O_DIRECT: mispredicted spec reads must not pollute the page cache
+                                io_uring_prep_read(read, spec_fd, dst,
+                                        location.len, (off_t) location.off);
+                                read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+                                if (spec_async) read->flags |= IOSQE_ASYNC;
+                                read->user_data = (uint64_t) selected * 4 + 1;
+                                n_sqe = 1;
+                                spec_lengths[selected] = location.len;
+                            } else {
+                                const moe_expert_slice * s = ctx->pager.slices(spec_layer, expert);
+                                const size_t gb = ctx->moe.host_gate[spec_layer];
+                                const size_t ub = ctx->moe.host_up[spec_layer];
+                                const size_t db = ctx->moe.host_down[spec_layer];
+                                if (gb + ub + db > stride) continue;
+                                const size_t want[3] = { gb, ub, db };
+                                struct SpecSqeItem { int fd; uint64_t off; uint32_t len; char * dst; };
+                                SpecSqeItem items[3];
+                                size_t pos = 0;
+                                for (int r = 0; r < 3; ++r) {
+                                    items[r].fd = s[r].fd >= 0 ? s[r].fd : fd_gguf;
+                                    items[r].off = (uint64_t) (s[r].off + s[r].pre);
+                                    items[r].len = (uint32_t) want[r];
+                                    items[r].dst = dst + pos;
+                                    pos += want[r];
+                                }
+                                // monotonically increasing offsets within the selected fd(s)
+                                int order[3] = { 0, 1, 2 };
+                                std::sort(order, order + 3, [&](int a, int b) {
+                                    if (items[a].fd != items[b].fd) return items[a].fd < items[b].fd;
+                                    return items[a].off < items[b].off;
+                                });
+                                bool ok = true;
+                                for (int oi = 0; oi < 3 && ok; oi++) {
+                                    const int r = order[oi];
+                                    struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
+                                    if (!read) { ok = false; break; }
+                                    io_uring_prep_read(read, items[r].fd, items[r].dst, items[r].len,
+                                            (off_t) items[r].off);
+                                    read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
+                                    if (spec_async) read->flags |= IOSQE_ASYNC;
+                                    read->user_data = (uint64_t) selected * 4 + r + 1;
+                                    n_sqe++;
+                                }
+                                if (!ok) break;
+                                spec_lengths[selected] = (uint32_t) (gb + ub + db);
+                            }
+                            if (n_sqe > 0 && io_uring_submit(&spec_ring) == n_sqe) {
+                                spec_pending = selected;
+                                spec_ring_inflight += n_sqe;
+                                spec_submitted++;
+                                if (moe_prof_enabled()) g_moe_prof.pk_submitted++;
+                                if (io_diag) {
+                                    spec_bytes += spec_lengths[selected];
+                                    spec_started = submit_started;
+                                    spec_submit_ms += std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - submit_started).count();
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        if (moe_prof_enabled()) g_moe_prof.prekick_us += (uint64_t) moe_prof_now() - (uint64_t) t_pk0;
+                    }
+                }
+            }
             bool handled = false;
             for (int il = 0; il < n_layer; ++il) {
                 if (dbs[il].state != 1) continue;
@@ -1169,138 +1301,6 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                 }
             }
-            if (!handled) {
-                if (moe_prof_enabled()) g_moe_prof.pk_skip_pred_unset++; // gate evaluation marker; fork will fire if demand queue is empty
-                if (spec_ok && ring_ok && spec_pending < 0 && !spec_cancel_pending) {
-                    bool demand_pending = false;
-                    for (int layer = 0; layer < n_layer; ++layer) {
-                        if (dbs[layer].state == 1) demand_pending = true;
-                    }
-                    if (demand_pending) {
-                        if (moe_prof_enabled()) g_moe_prof.pk_skip_demand++;
-                        continue;
-                    }
-                    static int pk_skip_layer_iters = 0;
-                    bool demand_arrived = false;
-                    for (int layer = 0; layer < n_layer && !demand_arrived; ++layer) {
-                        if (dbs[layer].state == 1) demand_arrived = true;
-                    }
-                    (void) pk_skip_layer_iters;
-                    for (int layer = 0; layer < n_layer; ++layer) {
-                        DoorbellPrekick * prediction = moe_doorbell_prekick_host(layer);
-                        uint32_t expected_state = 1;
-                        if (!__atomic_compare_exchange_n(&prediction->state, &expected_state, 2, false,
-                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
-                        std::atomic_thread_fence(std::memory_order_seq_cst);
-                        spec_layer = layer;
-                        spec_generation = prediction->generation;
-                        spec_count = std::min<int>(prediction->n, 8);
-                        spec_next = 0;
-                        for (int selected = 0; selected < spec_count; ++selected) {
-                            spec_experts[selected] = prediction->experts[selected];
-                            spec_lengths[selected] = 0;
-                            spec_ready[selected] = false;
-                            spec_got_bytes[selected] = 0;
-                            spec_got_roles[selected] = 0;
-                            spec_got_cancel[selected] = 0;
-                        }
-                        break;
-                    }
-                    if (spec_layer >= 0 && moe_doorbell_prekick_host(spec_layer)->state == 2) {
-                        const int64_t t_pk0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-                        while (spec_next < spec_count && spec_pending < 0) {
-                            const int selected = spec_next++;
-                            const int expert = spec_experts[selected];
-                            if (expert < 0 || expert >= n_exp ||
-                                ctx->moe.slot_of[(size_t) spec_layer * n_exp + expert] >= 0) {
-                                if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
-                                continue;
-                            }
-                            // predicted expert is arena-resident: no NVMe spec read; the
-                            // KICK demand path will DMA it arena -> pool without touching NVMe
-                            if (ctx->pager.cache_has(spec_layer, expert)) {
-                                if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
-                                spec_cache_hits++;
-                                continue;
-                            }
-                            bool demand_arrived = false;
-                            for (int layer = 0; layer < n_layer; ++layer) {
-                                if (dbs[layer].state == 1) demand_arrived = true;
-                            }
-                            if (demand_arrived || moe_doorbell_prekick_host(spec_layer)->state != 2) break;
-                            char * dst = spec_stage + (size_t) selected * stride;
-                            const auto submit_started = std::chrono::steady_clock::now();
-                            int n_sqe = 0;
-                            if (ctx->pager.pack_mode()) {
-                                const auto location = ctx->pager.pack_loc(spec_layer, expert);
-                                const int spec_fd = ctx->pager.pack_fd() >= 0 ? ctx->pager.pack_fd() : location.fd;
-                                if (spec_fd < 0 || location.len > stride) continue;
-                                struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
-                                if (!read) break;
-                                // O_DIRECT: mispredicted spec reads must not pollute the page cache
-                                io_uring_prep_read(read, spec_fd, dst,
-                                        location.len, (off_t) location.off);
-                                read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
-                                if (spec_async) read->flags |= IOSQE_ASYNC;
-                                read->user_data = (uint64_t) selected * 4 + 1;
-                                n_sqe = 1;
-                                spec_lengths[selected] = location.len;
-                            } else {
-                                const moe_expert_slice * s = ctx->pager.slices(spec_layer, expert);
-                                const size_t gb = ctx->moe.host_gate[spec_layer];
-                                const size_t ub = ctx->moe.host_up[spec_layer];
-                                const size_t db = ctx->moe.host_down[spec_layer];
-                                if (gb + ub + db > stride) continue;
-                                const size_t want[3] = { gb, ub, db };
-                                struct SpecSqeItem { int fd; uint64_t off; uint32_t len; char * dst; };
-                                SpecSqeItem items[3];
-                                size_t pos = 0;
-                                for (int r = 0; r < 3; ++r) {
-                                    items[r].fd = s[r].fd >= 0 ? s[r].fd : fd_gguf;
-                                    items[r].off = (uint64_t) (s[r].off + s[r].pre);
-                                    items[r].len = (uint32_t) want[r];
-                                    items[r].dst = dst + pos;
-                                    pos += want[r];
-                                }
-                                // monotonically increasing offsets within the selected fd(s)
-                                int order[3] = { 0, 1, 2 };
-                                std::sort(order, order + 3, [&](int a, int b) {
-                                    if (items[a].fd != items[b].fd) return items[a].fd < items[b].fd;
-                                    return items[a].off < items[b].off;
-                                });
-                                bool ok = true;
-                                for (int oi = 0; oi < 3 && ok; oi++) {
-                                    const int r = order[oi];
-                                    struct io_uring_sqe * read = io_uring_get_sqe(&spec_ring);
-                                    if (!read) { ok = false; break; }
-                                    io_uring_prep_read(read, items[r].fd, items[r].dst, items[r].len,
-                                            (off_t) items[r].off);
-                                    read->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
-                                    if (spec_async) read->flags |= IOSQE_ASYNC;
-                                    read->user_data = (uint64_t) selected * 4 + r + 1;
-                                    n_sqe++;
-                                }
-                                if (!ok) break;
-                                spec_lengths[selected] = (uint32_t) (gb + ub + db);
-                            }
-                            if (n_sqe > 0 && io_uring_submit(&spec_ring) == n_sqe) {
-                                spec_pending = selected;
-                                spec_ring_inflight += n_sqe;
-                                spec_submitted++;
-                                if (moe_prof_enabled()) g_moe_prof.pk_submitted++;
-                                if (io_diag) {
-                                    spec_bytes += spec_lengths[selected];
-                                    spec_started = submit_started;
-                                    spec_submit_ms += std::chrono::duration<double, std::milli>(
-                                            std::chrono::steady_clock::now() - submit_started).count();
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        if (moe_prof_enabled()) g_moe_prof.prekick_us += (uint64_t) moe_prof_now() - (uint64_t) t_pk0;
-                    }
-                }
             if (handled) {
                 idle_iters = 0;
             } else {
@@ -1312,7 +1312,6 @@ static void start_doorbell_worker(llama_context * ctx) {
 #else
                 std::this_thread::yield();
 #endif
-            }
             }
         }
         if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: main loop exited, ring_ok=%d spec_ok=%d spec_pending=%d\n", ring_ok ? 1 : 0, spec_ok ? 1 : 0, spec_pending);
@@ -2981,6 +2980,26 @@ llama_context::~llama_context() {
                 (unsigned long long) g_moe_prof.served.load(),
                 (unsigned long long) g_moe_prof.bytes_read.load(),
                 (unsigned long long) g_moe_prof.spec_fallback.load());
+        {
+            uint64_t dt_sum = 0, kick_count = 0, cleared = 0, mn = ~0ull, mx = 0;
+            for (int il = 0; il < 48 && il < (int) model.hparams.n_layer(); ++il) {
+                DoorbellPrekick * pkp = moe_doorbell_prekick_host(il);
+                if (!pkp) break;
+                dt_sum += pkp->kick_dt_sum;
+                kick_count += pkp->kick_count;
+                cleared += pkp->kick_cas_cleared;
+                if (pkp->kick_count != 0) {
+                    mn = std::min(mn, pkp->kick_dt_cycles);
+                    mx = std::max(mx, pkp->kick_dt_cycles);
+                }
+            }
+            fprintf(stderr, "[moe_prekick_diag] kick_count=%llu dt_avg_cycles=%llu dt_min=%llu dt_max=%llu kick_cas_cleared=%llu\n",
+                    (unsigned long long) kick_count,
+                    kick_count ? (unsigned long long) (dt_sum / kick_count) : 0ull,
+                    kick_count ? (unsigned long long) mn : 0ull,
+                    (unsigned long long) mx,
+                    (unsigned long long) cleared);
+        }
         for (int i = 0; i < 5; i++) {
             fprintf(stderr, "[moe_prof] cqe_bucket=%d n=%llu us=%llu\n", i,
                     (unsigned long long) g_moe_prof.cqe_n[i].load(),
@@ -4323,6 +4342,37 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             fprintf(stderr, "%s: first decode splits=%d nodes=%d n_tokens=%u n_ubatch=%u compute=%.2f ms\n",
                 __func__, ggml_backend_sched_get_n_splits(sched.get()),
                 ggml_graph_n_nodes(res->get_gf()), ubatch.n_tokens, cparams.n_ubatch, ms);
+            const char * gt = getenv("MOE_GRAPH_TRACE");
+            if (gt && atoi(gt) != 0) {
+                struct ggml_cgraph * gfc = res->get_gf();
+                int pk[64], kick[64], wait[64];
+                int npk = 0, nkick = 0, nwait = 0;
+                for (int i = 0; i < ggml_graph_n_nodes(gfc); i++) {
+                    struct ggml_tensor * t = ggml_graph_node(gfc, i);
+                    if (!t) continue;
+                    if (t->op == GGML_OP_MOE_SLOT_PREKICK && npk < 64) pk[npk++] = i;
+                    else if (t->op == GGML_OP_MOE_SLOT_RESOLVE_KICK && nkick < 64) kick[nkick++] = i;
+                    else if (t->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT && nwait < 64) wait[nwait++] = i;
+                }
+                fprintf(stderr, "[graph_trace] decode nodes=%d prekick=%d kick=%d resolve_wait=%d\n",
+                        ggml_graph_n_nodes(gfc), npk, nkick, nwait);
+                const int npair = std::min(npk, nkick);
+                if (npair > 0) {
+                    int64_t dmin = INT64_MAX, dmax = 0, dsum = 0;
+                    for (int i = 0; i < npair; i++) {
+                        const int64_t d = (int64_t) kick[i] - (int64_t) pk[i];
+                        dmin = std::min(dmin, d);
+                        dmax = std::max(dmax, d);
+                        dsum += d;
+                    }
+                    fprintf(stderr, "[graph_trace] dist PREKICK->KICK min=%lld max=%lld avg=%lld\n",
+                            (long long) dmin, (long long) dmax, (long long) (dsum / npair));
+                    for (int i = 0; i < npair; i++) {
+                        fprintf(stderr, "[graph_trace] layer=%02d prekick_idx=%d kick_idx=%d dist=%d\n",
+                                i, pk[i], kick[i], kick[i] - pk[i]);
+                    }
+                }
+            }
         } else if (ubatch.n_tokens > 1 && !seen_pp) {
             seen_pp = true;
             fprintf(stderr, "%s: first prefill splits=%d nodes=%d n_tokens=%u n_ubatch=%u compute=%.2f ms\n",

@@ -31,6 +31,12 @@ struct alignas(64) DoorbellPrekick {
     uint32_t compared;
     uint32_t overlap;
     int32_t experts[8];
+    uint64_t t_pk_cycles;      // clock64() recorded just before state = 1 publish
+    uint64_t kick_dt_cycles;   // last observed clock64() - t_pk_cycles
+    uint64_t kick_dt_sum;      // accumulated over all KICKs of this layer
+    uint64_t kick_count;       // KICK observations with a valid t_pk_cycles
+    uint32_t kick_cas_cleared; // times KICK's CAS(1->0) actually saw state == 1
+    uint32_t pad0;
 };
 
 DoorbellPrekick * moe_doorbell_prekick_host(int il);
