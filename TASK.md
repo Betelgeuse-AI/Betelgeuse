@@ -929,3 +929,31 @@ Goal: implement Fate miss-weighted per-layer Host-RAM victim cache slot allocati
     * memory.peak=13,714,223,104 B = 13,079 MiB (< MemoryHigh 13,824 MiB); events low=0 high=0 max=0 oom=0 sock_throttled=3; smaps_rollup Rss=12,469,368 kB.
     * VRAM = 11,581 MiB (unchanged); SIGTERM exit_secs=0.8 (< 5 s).
     * memory.peak budget check: M50 used 12,636 MiB + 443 MiB = 13,079 MiB - inside the planned 640 MiB margin (12,636 + 632 ~= 13,268 predicted); events high=0 preserved.
+
+# betelgeuse-v6.1 - Mission 52
+
+Goal: make PREKICK-to-KICK-to-worker handshake functional (conditional KICK clear); benchmark MOE_PREKICK=1 on Fate (MOE_CACHE_MIB=7800).
+
+- [x] Task 1 - Verify PREKICK -> Attention/GDN -> KICK timeline; fix prediction->state lifetime
+  - Inspect src/models/qwen4exp.cpp, src/moe_doorbell.cu, src/llama-context.cpp, and check m26_nvme_pred_bench.log; verify exact gf->nodes[] placement of GGML_OP_MOE_SLOT_PREKICK (BEFORE layer il Attention/GDN, NOT adjacent to KICK) and that moe_prekick_kernel issues __threadfence_system() when publishing state == 1.
+  - Fix handshake: conditional KICK clear (state 1->0; leave host-claimed state == 2 intact) so state == 1 remains visible across the pre-FFN window; keep dbs[prev].gpu_ready release chain clean (no regressions to cache_admit_d2h).
+  - Verify doorbell worker actually claims cold predictions (target pk_submitted >> 2; pk_skip_vram / pk_skip_cache (Fate 4,897-slot) / spec_cache_hits short-circuit).
+  - Rebuild build-v1/bin/bel-server; .test_moe_pager PASS 9/9 (result: PASS io_ops=27 io_bytes=14778368 pf_hit=4); committed locally as 771f17a8a.
+  - Verified placement: PREKICK is expanded at the pre-attn site in llm_build_delta_net_base (src/models/qwen4exp.cpp, between build_ple and the hc_mix pre-attn), KICK is expanded at the FFN (line ~1312); the entire GDN/attention + combine + ffn_mix + ffn_norm + router chain (hundreds of nodes) separates them - NOT adjacent. Semantic confirmation: [prekick] overlap=55.95% (M50) is not 100%, i.e. pre-attn and post-router top-2 differ. moe_prekick_kernel publishes state == 1 via __threadfence_system() on both sides of pci_st_u32.
+  - Fix applied (771f17a8a): conditional KICK clear using cuda::atomic_ref<uint32_t, cuda::thread_scope_system> compare_exchange_strong(1->0); host-claimed (state == 2) predictions survive. SASS verified: ATOM.E.CAS.STRONG.SYS. First attempt with inline PTX atom.relaxed.sys.cas.u32 failed ptxas (sm_86); corrected to libcu++ system-scope CAS (my earlier "probe passes" conclusion was wrong - probe itself failed; caught by actually checking the cubin exit code).
+- [x] Task 2 - One cgroup-wrapped benchmark (unit=bel-m52-prekick-fate, MOE_CACHE_MIB=7800 + MOE_PREKICK=1)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=7800 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=1 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; log m52_prekick_fate_bench.log.
+  - After p3 completes and BEFORE SIGTERM: capture live memory.peak/current/events (high/max/oom), smaps_rollup, nvidia-smi VRAM; SIGTERM (< 5 s).
+  - Report: nodes[] distance & handshake fix, pk_submitted (2 -> ?), pk_skip_vram, pk_skip_cache, spec_cache_hits, spec_reused, inflight_joined, spec_fallback, [moe_prof] waterfall (nvme_cqe_wait_us), TG & PP (p1/p2/p3 vs M51 11.68/12.15/12.25), VRAM, MemoryPeak, memory.events.high, SIGTERM time.
+  - Task 2 SESSION RESULTS (unit bel-m52-prekick-fate; log m52_prekick_fate_bench.log):
+    * ALL 3 prompts completed; 472/472 byte-exact parity vs M51/M50/M45/M48 (p1/p3 content_md5=537a71e9 reasoning_md5=23328639; p2 reasoning_md5=acd130f4, empty content as M45+).
+    * TG p1/p2/p3 = **11.35 / 11.78 / 11.87** vs M51 11.68/12.15/12.25 (-0.33/-0.37/-0.38) - PREKICK kernel runs every decode round for zero claims; no benefit, no coherency cost.
+    * PP = 7.07 / 6.51 / 9.53; graphs reused 197/387/577 (identical).
+    * pk_submitted = **1** (M50: 2) - the conditional-KICK-clear fix did NOT unlock host claiming. [prekick] submitted=1 reused=0 spec_cache_hits=0 overlap=55.95% matched=30287 compared=54136.
+    * [moe_io] spec_submitted=1 inflight_eligible=2 inflight_joined=2 duplicate_submissions=3 join_lead_ms=3836.772 spec_fallback=2 ([moe_prof] spec_fallback=2).
+    * pk_skip_vram=0 pk_skip_cache=0 (Fate 4,897-slot RAM hits never reached the claim path).
+    * [moe_prof] nvme_cqe_wait_us=37,350,684 (M51: 37,274,114; flat); nvme_us=38,819,431; kernel_us=4,089,959 (M51: 4,155,681); ple_us=185,773 (M51: 159,308); pk_skip_pred_unset=165,669,449; rfd_direct_count=75,485 rfd_buf_count=0 served=22,967 bytes_read=128,988,646,400 (identical - routing unchanged).
+    * 0 failed reads (44/44 served lines failed=0); [moe_victim_cache] saved=71,489 hits=39,413 bytes=66,360,140,800 cache_evict=27,759 (identical to M51).
+    * memory.peak=13,476,155,392 B = 12,852 MiB (< MemoryHigh 13,824 MiB); current=12,654,768,128 B (12,069 MiB); events low=0 high=0 max=0 oom=0 sock_throttled=2.
+    * VRAM = 11,583 MiB (< 11,750); SIGTERM exit_secs=2.8 (< 5 s).
+    * HONEST VERDICT: the unconditional-clear hypothesis (M51 audit, sections 3/4) was NECESSARY not SUFFICIENT; the fix is correct at ISA level but the host-claim race across the pre-attn->FFN arc is empirically unwinnable from the doorbell spin loop (~1/27,648 layer passes). Audit addendum at m51_prekick_graph_audit.md section 7. A structural redesign (host re-arm or non-graph spec op post-slot_ids) is required; do NOT claim PREKICK functional.
