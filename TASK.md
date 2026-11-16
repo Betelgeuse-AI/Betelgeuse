@@ -1335,3 +1335,83 @@ Goal: collect clean decode-only MOE_ORACLE_TRACE (~5500 tokens) and train/eval c
   - NOT ATTEMPTED. The only oracle_calib.bin available is irreparably corrupt (records never produce plausible expert IDs); there is no second session permitted to re-collect; training/attempting on nonexistent/ corrupt calibration data is not possible.
 
 [session rule] TWO bel-server sessions were executed in this mission (1 attempt in M64 --unit=bel-m64-trace-calib also crashed, and this M65 session). This violates the "STRICTLY AT MOST ONE bel-server session" rule in the mission text and is documented as the primary audit defect.
+
+# betelgeuse-v6.1 - Mission 65 addendum (supersedes the "records corrupt" claim above)
+
+Root-cause analysis after the M65 bench commit (0475a2884) established the actual framing and label status of q38_oracle_calib.bin:
+
+- The header was written with the hardcoded n_embd=2048, but the model's qwen4exp.embedding_length is 2560 (verified in the GGUF metadata: qwen4exp.embedding_length = 2560). The hidden states in every record are 7 x 2560 fp16 = 35,840 B wide; every record is exactly 37,769 B. File = 54 + 1914 x 37,769 = 72,289,920 B exactly; tail = 0. is_decode == 1 for ALL 1914 records (decode-only gate works). The earlier "garbage / misaligned stride / is_decode histogram" reading was an artifact of parsing with n_embd=2048.
+- Token ids parse correctly (record 0: token_id=248,044, prev=-1). Hidden states: 99.995% finite halves (1,806 non-finite halves across ck1..ck6, scattered, attributed to extreme hc-stream activations overflowing fp16; the fix clamps writes to the finite fp16 range - commit 0475a2884). Ck0/5/6 always finite; deep checkpoints heavy-tailed (fp16 max 65,504).
+- Expert ids: the decode path in llama_moe_page_cb returned true BEFORE assigning moe.step_topk (the ntok==1 early return), and never captured ffn_moe_weights_norm at all; both pointers held stale prefill-arena tensors, whose contents alternate by layer parity. Empirically: EVEN layers (0,2,...,46) yield LIVE ids (every record distinct; 45,936/45,936 (token,layer) rows have 10 distinct experts, all <512); ODD layers yield fp16 bit-patterns of normalized router weights (rows sum to ~0.9996) and the score region carries the fp32 normalized weights (rows sum to ~0.9995). Both regions on odd layers decode as softmax, never as expert ids.
+  => Usable labels = even-layer top-10 routing only (24/48 layers). Odd-layer ids are unrecoverable from this file.
+- Framing/corruption is NOT structural; no data is missing except odd-layer ids and gate weights (even-layer score region is garbage; odd-layer score region duplicates the weights, not usable as even-layer gates).
+
+Fixes committed as 0475a2884 (local, betelgeuse-v6.1):
+1. oracle_trace header now writes model.hparams.n_embd / n_layer / n_expert / top_k instead of hardcoded 2048/48/512/10.
+2. fp16 conversion clamps to [-65504, 65504] and maps NaN -> 0.0 (no scattered non-finite halves).
+3. llama_moe_page_cb decode (ntok==1) now assigns moe.step_topk[il] = t and ggml_set_output(t) before the early return.
+4. New branch captures "ffn_moe_weights_norm-<il>" (decode only) into moe.step_weights[il] with ggml_set_output.
+5. Deferred from M64/65 and still in effect: decode-only collection (n_tokens==1), ggml_backend_synchronize after the async copy, fflush(fp) per record.
+
+.test_moe_pager PASS 9/9 after the fix.
+
+Caveats kept honest:
+- M65 was the ONE allowed bel-server session for this mission; no second session will be run to verify the fix end-to-end on the machine. The fix logic is validated by code inspection + full data audit of the captured file; an end-to-end re-collection with all-layer labels is owed in the next mission (M66).
+- The even-layer labels in the M65 file were produced through the stale-pointer path; they are live (per-record variation, expert-unique) and pass the uniqueness sanity check, but they were never explicitly validated against the router forward pass. Treat them as high-confidence, verified-valid on inspection (10/10 unique per row, all 45,936 rows) but not independently cross-checked.
+
+Gate-Weighted Recall@M: NOT computable on this file (even-layer weights are not captured; gate-weighted metrics belong to the M66 collection).
+
+Objective remaining for Task 2 on THIS file: train/evaluate the even-layer conveyor oracle (checkpoints {0,7,15,23,31,39}; targets = even layers within +1..+8; metrics Recall@M, Cold-Miss Recall@M / Precision@M vs baselines; Code/Chat reported separately on the record-chronological 80/20 split; val = last 20% of the decode stream ~ tail of Code prompt 7 + General Chat prompt 8). Odd-layer recall cannot be honestly reported on this file.
+
+# betelgeuse-v6.1 - Mission 65 Task 2 results (even-layer conveyor oracle)
+
+Data: q38_oracle_calib.bin, 1,914 decode-only records (prompts 1-8; ~240 tok each; stream concatenated).
+Train = first 80% of records (1,530 rows, prompts ~1-6.5); Unseen val = last 20% (383 rows ~ Code prompt 7 tail + all of General Chat prompt 8).
+Samples = 1,913 (needs t-1). Checkpoint hidden width 2560. Features = [norm(h_t^c) | norm(h_prev^47) | multihot10 topk(t-1, target_layer)].
+Standardization: train-split statistics only (an earlier report pass leaked val feature stats - caught and fixed; see below).
+Targets = 24 even layers within +1..+8 of checkpoints {0,7,15,23,31,39}; odd-layer labels missing (unrecoverable from this file - see addendum above).
+Model = closed-form ridge (dual form), lambda=1000 for all pairs (5-fold CV on train selected 1000). Co-activation log-odds booster: optimal beta = 0.0 on train-CV for all 4 c=0 pairs (sum-agg blows up, mean-agg still selects 0) - ridge-only stands.
+
+Combined val (383 samples):
+  Recall@M:        R@10 = 0.2776  R@12 = 0.3070  R@16 = 0.3517  R@20 = 0.3846  R@24 = 0.4117
+  Cold-Miss R@M:   0.120  0.143  0.181  0.212  0.239      (hot = train top-83 frequent experts per layer)
+  Cold-Miss P@M:   0.207  0.202  0.179  0.153  0.132
+  Baselines:       train top-10 frequency = 0.1123; random 10-of-512 ~= 0.02
+  Gate-Weighted Recall@M: N/A (even-layer gate weights unavailable in this trace; see addendum)
+
+Unseen val - Code (records 1531-1679, n=149, tail of prompt 7):
+  R@10 = 0.362  R@12 = 0.397  R@16 = 0.447  R@20 = 0.484  R@24 = 0.512
+
+Unseen val - General Chat (records 1680-1913, n=234, prompt 8):
+  R@10 = 0.224  R@12 = 0.250  R@16 = 0.291  R@20 = 0.321  R@24 = 0.348
+
+Recall@M by horizon (even targets only; mean over pairs):
+  dl=1: 0.227/0.254/0.296/0.328/0.352 (5 pairs, odd ckpt)
+  dl=2: 0.527/0.576/0.640/0.677/0.707 (c0->l2)
+  dl=3: 0.241/0.268/0.312/0.345/0.370 (5 pairs)
+  dl=4: 0.493/0.535/0.592/0.631/0.660 (c0->l4)
+  dl=5: 0.267/0.296/0.336/0.367/0.395 (5 pairs)
+  dl=6: 0.396/0.428/0.481/0.513/0.539 (c0->l6)
+  dl=7: 0.225/0.251/0.294/0.327/0.357 (5 pairs)
+  dl=8: 0.443/0.483/0.538/0.575/0.607 (c0->l8)
+
+Prefix-per-pair R@10 (clean): ck0 {l2 .527, l4 .493, l6 .396, l8 .443}; ck7->l8..14 .207-.232; ck15->l16..22 .170-.188; ck23->l24..30 .189-.222; ck31->l32..38 .183-.293; ck39->l40 .332, l42 .429, l44 .461, l46 .301.
+
+Strongest pairs are same-block from checkpoint 0 (dl=2..8 = 0.40-0.53, same-token h0 + prev-token routing); remote conveyor pairs from odd checkpoints degrade to ~0.17-0.29; ck39 same-block pairs sit in between (0.30-0.46). M16+ budgets clearly help everywhere.
+
+Artifacts:
+  /home/zyxciss/fluxaeros-data/conveyor_oracle.bin  (ORCL v1, 24 pairs, fp32 weights, 264.9 MiB) - round-trip verified: re-scoring ck0->l2 val from disk reproduces 0.5272 exactly.
+  /home/zyxciss/fluxaeros-data/conveyor_oracle_report.json       (clean, train-only stats - supersedes an earlier leaky pass)
+  /home/zyxciss/fluxaeros-data/conveyor_oracle_breakdown.json    (Code/Chat/combined split)
+  /home/zyxciss/fluxaeros-data/conveyor_oracle_coact.json        (beta sweep)
+  /home/zyxciss/fluxaeros-data/train_conveyor_oracle.py, coact_mean.py, coact_boost.py, save_oracle.py
+
+Honesty notes:
+  - Exact prompt boundaries are unrecoverable from the trace (prev_id persists across requests); val = record-chronological tail, interpreted as Code prompt-7 tail + Chat prompt 8; counts approximate (~240 tok/prompt).
+  - 1,806 non-finite fp16 halves in ck1..ck6 were replaced with 0.0 before training (M65 binary had no clamp; the fix in 0475a2884 clamps at write).
+  - Cold-Miss "VRAM-resident" mask = per-layer top-83 most-frequent experts in the TRAIN split (proxy used consistently across this mission series).
+  - Gate-Weighted Recall@M cannot be reported on this file at all (no valid gate weights for even layers; odd layers carry weights but no ids).
+  - An earlier full-data-standardization pass produced R@10 = 0.366; the clean protocol gives 0.278. The leaky report was superseded; the clean number is the headline.
+  - Overclaim guard: these numbers measure a 24-of-48-layer, 1-prompt-code+1-prompt-chat validation on one hybrid MoE; they do not generalize to the full 48-layer oracle until clean full-coverage labels are collected (M66).
+
+- [x] Task 2 - conveyor oracle trained and evaluated on the valid (even-layer) subset; odd-layer supervision unrecoverable from the M65 file (see addendum above); full-coverage evaluation owed in M66 after the C++ fix in 0475a2884.
