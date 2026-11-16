@@ -754,3 +754,14 @@ Goal: capture real hung-thread backtraces via gdb direct child + SIGTRAP; audit 
 Goal: verbatim extraction of m41_hang_bt.log frames.
 
 - [x] Task 1 - Extract verbatim frames #0..#26 for Thread 1 (LWP 384740) and Thread 39 (LWP 384843), plus any other thread NOT in idle pthread_cond_wait/epoll_wait/futex/poll/sleep; grep for madvise/page/ple/cudaFuncSetAttribute/rwlock; save to /home/zyxciss/fluxaeros-data/m42_bt_exact.md; commit locally.
+
+# betelgeuse-v6.1 - Mission 43
+
+Goal: eliminate runtime cudaFuncSetAttribute wrlock contention + benchmark MOE_CACHE_MIB=6144 + MOE_DEMAND_DIRECT=1 (CUDA_MODULE_LOADING=EAGER).
+
+- [x] Task 1 - Guard hot-path cudaFuncSetAttribute calls once per (kernel, device); rebuild bel-server; .test_moe_pager PASS 9/9
+  - Inspect ggml/src/ggml-cuda/fattn-mma-f16.cuh + git grep -n "cudaFuncSetAttribute" ggml/src/ggml-cuda/ to confirm why FlashAttention ext_mma_f16_case and siblings call cudaFuncSetAttribute at runtime.
+  - Add static per-device cache / std::call_once guard around all hot-path cudaFuncSetAttribute calls; rebuild build-v1/bin/bel-server; run .test_moe_pager (PASS 9/9); commit locally.
+- [x] Task 2 - One cgroup-wrapped MOE_CACHE_MIB=6144 + MOE_DEMAND_DIRECT=1 benchmark (CUDA_MODULE_LOADING=EAGER)
+  - CUDA_MODULE_LOADING=EAGER MOE_DEMAND_DIRECT=1 MOE_CACHE_MIB=6144 MOE_STAGE_WC=1 MOE_HOT_K=0 MOE_PREKICK=0 MOE_SEED_BUDGET_MS=0 MOE_IO_DIAG=1 MOE_PROF=1 MOE_CRASH_TRACE=1; exact p1/p2/p3 T=0; log to /home/zyxciss/fluxaeros-data/m43_async_victim_bench.log.
+  - Capture memory.peak/current/events, smaps_rollup, nvidia-smi VRAM before clean SIGTERM stop (< 5 s exit, full [moe_prof] dump); 472/472 parity vs M34; 0 failed reads; report waterfall vs M16 (27.32 s) / M34 (74.52 s), [moe_victim_cache] saved/hits/bytes, TG & PP, VRAM, MemoryPeak, SIGTERM exit time.
