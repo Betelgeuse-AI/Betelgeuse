@@ -730,7 +730,15 @@ int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * sel
         for (int current = 0; current < n_slots; ++current) {
             const int gs = base_slot + current;
             if (pinned[(size_t) current]) continue;
-            if (cache_state_[(size_t) gs] == 1) continue; // DtoH in flight: keep it
+            if (cache_state_[(size_t) gs] == 1) {
+                const cudaEvent_t ev = cache_ev_[(size_t) gs];
+                if (ev && cudaEventQuery(ev) == cudaSuccess) {
+                    cache_state_[(size_t) gs] = 2;
+                    if (n_cache_inflight_ > 0) n_cache_inflight_--;
+                } else {
+                    continue; // still in flight: keep it
+                }
+            }
             if (!cache_used_[(size_t) gs]) {
                 chosen = gs;
                 break;
