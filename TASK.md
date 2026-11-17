@@ -1460,3 +1460,28 @@ Goal: capture all-48-layer pre-router u_t,l + exact router matrices; train known
   2. Capture u by CLONING the pre-router tensor into a dedicated, per-layer output buffer (ggml_set_output + dedicated host buffer like embeddings_layer_inp) instead of reading the arena after compute; the current after-compute read sees reused slots.
   3. Reproduce the ggml_backend_tensor_get assert (GGML_ASSERT(offset + size <= ggml_nbytes(tensor))) with a small focused run; the crash fires inside the first decode of each newest prompt's session start (prompt 3 in M66; prompt 9 in M65) and both missions died at the same assert.
   4. Only then re-collect 16 prompts and run the gate verifier; if and only if >=99.5% Recall@10 passes, train the residual-velocity + low-rank adapter.
+
+# betelgeuse-v6.1 - Mission 67
+
+Goal: replace post-graph trace reads with in-stream KICK capture; collect all-48-layer trace; train conveyor oracle.
+
+- [ ] Task 1 - MOE_ORACLE_TRACE v3: in-stream KICK(il) capture (u via src[3]=cur, ids/scores from tid<10, g_trace_step cudaHostAllocMapped 247,680 B); collect 16 prompts (1 session, bel-m67-trace-instream)
+  - Remove post-compute ggml_backend_tensor_get reads from the dump
+  - Implement in-stream capture in moe_resolve_slots_kernel (ids/scores tid<10; u loop tid step 1024, clamped fp16)
+  - Gate verifier: 48/48 layers distinct u, ids < 512 distinct, delta-l=0 top-10(W_gate u) == topk_ids at >= 99.5% Recall@10
+- [ ] Task 2 - Known-Router Residual-Velocity Conveyor Oracle (nvcc -arch=sm_86 -lcublas)
+  - Train prompts 1..12 (6 Code + 6 Chat), validate prompts 13..16 (2 Code + 2 Chat)
+  - Missions metrics: Recall@M, Gate-Weighted Recall@M, Cold-Miss Recall/Precision@M (top-83 mask) over delta_l {0,1,2,3,4,6,8} x M {10,12,16,20,24}
+  - Save /home/zyxciss/fluxaeros-data/conveyor_oracle_v2.bin
+
+# betelgeuse-v6.1 - Mission 67 Task 1 results (in-stream KICK capture)
+
+- [x] Task 1 - In-stream KICK capture built; 16 prompts collected; gate check PASS
+  - Design (commit 0ed481b26): KICK op now carries src[2]=normalized router weights and src[3]=pre-router cur; ggml-alloc keeps both live until KICK(il) executes. moe_resolve_slots_kernel writes g_trace_step (cudaHostAllocMapped, 247,680 B) in-stream: threads<10 store uint16 ids + fp16 weights; all threads clamp cur into fp16 u[il]. Host dump reads the mapped buffer after sched_synchronize; post-graph ggml_backend_tensor_get reads are GONE (the M65/M66 arena-slot clone + stale-pointer bug is eliminated by construction).
+  - Router bias audit: ffn_gate_inp_b / exp_probs_b are ABSENT from the GGUF; router is bias-free; nothing extra exported (gates dumped as before, RTGATE01 [48,512,2560]).
+  - .test_moe_pager PASS 9/9. ONE cgroup session (unit=bel-m67-trace-instream, MOE_CACHE_MIB=6800, -c 512, 16 Code+Chat prompts, max_tokens=200, T=0).
+  - ALL 16 prompts completed (3,187 decode records, ~199/prompt); memory.peak=13,656,055,808 B = 13,017 MiB (< 13,824); events low=0 high=0 max=0; VRAM 11,581 MiB; SIGTERM exit_secs=0.6; rc=0 (clean shutdown).
+  - File validations: magic OK; checkpoints 0..47; n_records stamped 3,187; framing exact; is_decode==1 everywhere; prompt_id histogram 1..16 = [199,199,200,199,199,199,199,199,199,199,200,199,199,199,199,199].
+  - **0 NaN/Inf in u (2,691 -> 0)**; **0 ids >= 512 (95,760 -> 0)**; per-layer exact-distinctness confirmed; gate check (top-10(W_gate @ u_t,l) vs captured topk_ids Recall@10, ALL 3,187 records, ALL 48 layers): **overall 0.9999; min layer 0.9998 (L32/L33/L34)** - far above the 99.5% gate.
+  - Prompt split: train = prompts 1..12 (2,391 tok), val = prompts 13..16 (796 tok).
+  - Bench driver logs: m67_trace_calib.log / m67_calib.log / m67_driver.log.
