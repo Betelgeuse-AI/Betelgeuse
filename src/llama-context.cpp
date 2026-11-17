@@ -382,6 +382,61 @@ static inline float conv_u16_to_f32(uint16_t h) {
 
 #if defined(__x86_64__) || defined(_M_X64)
 __attribute__((target("avx2,fma")))
+static float conv_hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehl_ps(s, s);
+    s = _mm_add_ps(s, shuf);
+    shuf = _mm_movehdup_ps(s);
+    s = _mm_add_ss(s, shuf);
+    return _mm_cvtss_f32(s);
+}
+// One pass over W produces six dot products (z_hat2, q0..q3, zprev).
+__attribute__((target("avx2,fma")))
+static void conv_matvec6(const float * W, int rows, int cols,
+                         const float * x0, const float * x1, const float * x2,
+                         const float * x3, const float * x4, const float * x5,
+                         float * o0, float * o1, float * o2,
+                         float * o3, float * o4, float * o5) {
+    for (int r = 0; r < rows; r++) {
+        const float * w = W + (size_t) r * cols;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps();
+        __m256 a3 = _mm256_setzero_ps(), a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
+        for (int i = 0; i < cols; i += 8) {
+            const __m256 wv = _mm256_loadu_ps(w + i);
+            a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + i), a0);
+            a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x1 + i), a1);
+            a2 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x2 + i), a2);
+            a3 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x3 + i), a3);
+            a4 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x4 + i), a4);
+            a5 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x5 + i), a5);
+        }
+        o0[r] = conv_hsum256(a0); o1[r] = conv_hsum256(a1); o2[r] = conv_hsum256(a2);
+        o3[r] = conv_hsum256(a3); o4[r] = conv_hsum256(a4); o5[r] = conv_hsum256(a5);
+    }
+}
+#else
+static float conv_hsum256(float v) { return v; }
+static void conv_matvec6(const float * W, int rows, int cols,
+                         const float * x0, const float * x1, const float * x2,
+                         const float * x3, const float * x4, const float * x5,
+                         float * o0, float * o1, float * o2,
+                         float * o3, float * o4, float * o5) {
+    for (int r = 0; r < rows; r++) {
+        const float * w = W + (size_t) r * cols;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f;
+        for (int i = 0; i < cols; i++) {
+            const float wv = w[i];
+            a0 = fmaf(wv, x0[i], a0); a1 = fmaf(wv, x1[i], a1); a2 = fmaf(wv, x2[i], a2);
+            a3 = fmaf(wv, x3[i], a3); a4 = fmaf(wv, x4[i], a4); a5 = fmaf(wv, x5[i], a5);
+        }
+        o0[r] = a0; o1[r] = a1; o2[r] = a2; o3[r] = a3; o4[r] = a4; o5[r] = a5;
+    }
+}
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx2,fma")))
 static void conv_matvec(const float * W, int rows, int cols, const float * x, float * out) {
     for (int r = 0; r < rows; r++) {
         const float * w = W + (size_t) r * cols;
@@ -560,25 +615,16 @@ static void conveyor_predict(llama_context * ctx, int il, int dl) {
 
     const float * Wl = g_conveyor_gates.data() + (size_t) l * CONV_NEXP * CONV_NE;
     float zh2[CONV_NEXP];
-    conv_matvec(Wl, CONV_NEXP, CONV_NE, x_, zh2);
     float qk[5][CONV_NEXP];
-    for (int k = 0; k < 4; k++) {
-        const int src = il - k;
-        float u_f[CONV_NE];
-        if (src >= 0) {
-            const uint16_t * up = (const uint16_t *) step->u[src];
-            for (int i = 0; i < CONV_NE; i++) u_f[i] = conv_u16_to_f32(up[i]);
-        } else {
-            memset(u_f, 0, sizeof(u_f));
-        }
-        conv_matvec(Wl, CONV_NEXP, CONV_NE, u_f, qk[k]);
-    }
+    float uprev_f[CONV_NE];
     {
         const uint16_t * up = (const uint16_t *) g_prev_u.data() + (size_t) l * CONV_NE;
-        float u_f[CONV_NE];
-        for (int i = 0; i < CONV_NE; i++) u_f[i] = conv_u16_to_f32(up[i]);
-        conv_matvec(Wl, CONV_NEXP, CONV_NE, u_f, qk[4]);
+        for (int i = 0; i < CONV_NE; i++) uprev_f[i] = conv_u16_to_f32(up[i]);
     }
+    // v already holds the same four u rows the q^0..q^3 projections need
+    conv_matvec6(Wl, CONV_NEXP, CONV_NE, x_, v + 0 * CONV_NE, v + 1 * CONV_NE,
+                 v + 2 * CONV_NE, v + 3 * CONV_NE, uprev_f,
+                 zh2, qk[0], qk[1], qk[2], qk[3], qk[4]);
 
     const float * mix = p.Mix.data();
     float zhat[CONV_NEXP];
@@ -609,6 +655,7 @@ static void conveyor_predict(llama_context * ctx, int il, int dl) {
             db.pred_next[1] = (e2 >= 0) ? e2 : -1;
             db.pred_count = 2;
             db.pred_generation = ++g_conveyor_gen[il];
+            db.pred_layer = (uint32_t) il + 1u;
             db.conveyor_score[0] = best1;
             db.conveyor_score[1] = best2;
             db.conveyor_score[2] = 0.0f;
@@ -1378,12 +1425,13 @@ static void start_doorbell_worker(llama_context * ctx) {
                         if (read_fail[(size_t) ci] || left[(size_t) ci] == 0) continue;
                         const char * cached = cached_sources[(size_t) ci];
                         if (!cached) continue;
-                        if (!moe_doorbell_dma_enabled() || !pl->pad0) {
-                            memcpy(stage_host + (size_t) ci * stride, cached, gb + ub + db);
-                            publish_ready(ci);
-                        } else {
-                            publish_ready(ci, cached);
-                        }
+                        // never DMA straight out of the Fate arena: its slots can be
+                        // freed by cache_remove() and immediately re-reserved and
+                        // overwritten by a later admission while an async H2D from
+                        // the arena pointer is still in flight. Stage through stage_host
+                        // (slot reuse is fenced by stage events) instead.
+                        memcpy(stage_host + (size_t) ci * stride, cached, gb + ub + db);
+                        publish_ready(ci);
                         if (pl->pad0 && moe_doorbell_dma_enabled()) ctx->pager.cache_remove(il, misses[(size_t) ci]);
                         left[(size_t) ci] = 0;
                         victim_hits++;
@@ -1634,7 +1682,7 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                     // Mission 57 (MOE_ORACLE_DBS=1): honor il -> il+1 cross-layer
                     // predictions published by KICK(il) on the demand doorbell.
-                    if (dbs[il].pred_count > 0 && dbs[il].pred_layer == (uint32_t) il + 1) {
+                    if (!conveyor_on && dbs[il].pred_count > 0 && dbs[il].pred_layer == (uint32_t) il + 1) {
                         const int tgt = il + 1;
                         if (tgt < n_layer && spec_ok && spec_inflight_count() < 4 && !spec_cancel_pending) {
                             const uint32_t npred = dbs[il].pred_count > 2u ? 2u : dbs[il].pred_count;
