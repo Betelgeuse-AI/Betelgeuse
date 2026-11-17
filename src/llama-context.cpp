@@ -2957,7 +2957,8 @@ llama_context::llama_context(
     // Mission 67: allocate the mapped KICK-capture step before any ubatch runs
     {
         const char * e = getenv("MOE_ORACLE_TRACE");
-        moe_doorbell_trace_init(e && e[0]);
+        const char * c = getenv("MOE_CONVEYOR_ORACLE");
+        moe_doorbell_trace_init((e && e[0]) || (c && c[0]));
     }
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
