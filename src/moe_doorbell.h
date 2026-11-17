@@ -4,6 +4,24 @@
 #include <cstddef>
 
 #ifdef __cplusplus
+#include <cstdint>
+#endif
+
+// Mission 67 (MOE_ORACLE_TRACE): permanent in-stream capture buffer written
+// by moe_resolve_slots_kernel (op == KICK, nt == 1) and read by the host
+// dump after the decode stream synchronizes. Layout is fixed; the trace
+// file stores fp16 copies of these fields.
+struct MoeTraceStep {
+    uint16_t topk_ids[48][10];      // 960 B, uint16 expert ids
+    uint16_t topk_scores[48][10];   // 960 B, fp16 bits of normalized weights
+    uint16_t u[48][2560];           // 245,760 B, fp16 bits of pre-router u
+};                                  // total 247,680 B
+
+extern "C" void moe_doorbell_trace_init(bool enable);
+extern "C" void * moe_doorbell_trace_step_host();
+extern "C" void * moe_doorbell_trace_step_dev();
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -81,6 +99,12 @@ void moe_doorbell_resolve_launch(
     size_t full_nb1,
     const int32_t * look,
     int64_t lnk,
+    const float * weights,
+    size_t weights_nb0,
+    size_t weights_nb1,
+    const float * cur,
+    size_t cur_nb0,
+    size_t cur_nb1,
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,

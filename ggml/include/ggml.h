@@ -2535,7 +2535,9 @@ extern "C" {
             struct ggml_tensor  * topk,
             struct ggml_tensor  * table,
             int32_t               il,
-            int32_t               sentinel);
+            int32_t               sentinel,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * cur);
 
     GGML_API struct ggml_tensor * ggml_moe_slot_resolve_wait(
             struct ggml_context * ctx,

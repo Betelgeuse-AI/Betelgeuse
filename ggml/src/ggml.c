@@ -6628,10 +6628,16 @@ struct ggml_tensor * ggml_moe_slot_resolve_kick(
         struct ggml_tensor  * topk,
         struct ggml_tensor  * table,
         int32_t               il,
-        int32_t               sentinel) {
+        int32_t               sentinel,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * cur) {
     GGML_ASSERT(topk->ne[1] == 1);
     struct ggml_tensor * result = ggml_moe_slot_resolve(ctx, topk, table, NULL, NULL, il, sentinel);
     result->op = GGML_OP_MOE_SLOT_RESOLVE_KICK;
+    // Mission 67: keep the pre-router input (cur) and the router weights
+    // alive until KICK(il) executes; KICK writes them to the trace buffer
+    result->src[2] = weights;
+    result->src[3] = cur;
     return result;
 }
 

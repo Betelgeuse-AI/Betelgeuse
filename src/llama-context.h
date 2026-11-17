@@ -333,9 +333,6 @@ public:
         std::vector<ggml_tensor *> step_topk;
         // Mission 64 (MOE_ORACLE_TRACE): normalized routing weights per layer per ubatch
         std::vector<ggml_tensor *> step_weights;
-        // Mission 66: the exact pre-router normalized vector fed into the
-        // router matmul (build_lora_mm(ffn_gate_inp, cur)); captured fresh per ubatch
-        std::vector<ggml_tensor *> step_router_inp;
         // last ubatch width seen; used to detect the prefill->decode edge
         uint32_t last_ntok = 0;
         // Direction 1: one extra all-zero slot per layer absorbing cold misses

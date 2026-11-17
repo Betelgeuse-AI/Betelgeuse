@@ -1245,9 +1245,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
-    // Mission 66: capture the exact pre-router normalized vector (the input
-    // to build_lora_mm(ffn_gate_inp, cur)) for the oracle trace
-    cb(cur, "ffn_router_inp", il);
+    // Mission 67: the pre-router vector `cur` is captured in-stream at KICK(il)
 
     ggml_tensor * lookahead = nullptr;
     {
@@ -1335,7 +1333,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         ggml_build_forward_expand(gf, router_weights);
         const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
         ggml_tensor * kick = ggml_moe_slot_resolve_kick(ctx0, ggml_cont(ctx0, selected),
-                (ggml_tensor *) moe_table[il], il, sentinel);
+                (ggml_tensor *) moe_table[il], il, sentinel, router_weights, cur);
         cb(kick, "ffn_moe_kick", il);
         ggml_build_forward_expand(gf, kick);
         ffn_shexp = build_shared();

@@ -181,7 +181,6 @@ struct OracleTraceWriter {
     uint32_t prompt_id = 0;          // count of prefill ubatches seen so far
     uint64_t decode_tokens = 0;      // for fadvise cadence
     bool     router_dumped = false;  // router-gate one-shot dump guard
-    std::vector<float> scratch_float;
 };
 static OracleTraceWriter g_oracle_trace;
 
@@ -221,7 +220,6 @@ static bool oracle_trace_open(int n_layer, int n_expert, int top_k, int n_embd) 
     g_oracle_trace.n_embd = (uint16_t) n_embd;
     g_oracle_trace.n_checkpoint = (uint16_t) n_layer;
     for (uint32_t i = 0; i < (uint32_t) n_layer; i++) g_oracle_trace.checkpoints[i] = (int32_t) i;
-    g_oracle_trace.scratch_float.assign((size_t) n_embd, 0.0f);
     g_oracle_trace.magic = 0x4f52435452434500ULL; // "ORCTRCE\0" padding-free
     // File header layout:
     //   u64 magic
@@ -291,36 +289,6 @@ static void dump_router_gates(const llama_model & model) {
 static void oracle_trace_write_u16(FILE * fp, uint16_t v) { std::fwrite(&v, sizeof(v), 1, fp); }
 static void oracle_trace_write_int32(FILE * fp, int32_t v) { std::fwrite(&v, sizeof(v), 1, fp); }
 static void oracle_trace_write_u8(FILE * fp, uint8_t v) { std::fputc((int) v, fp); }
-static void oracle_trace_write_fp16(FILE * fp, float v) {
-    // IEEE binary16 bit pattern for memory compactness (matches numpy.float16).
-    // Clamp to the finite fp16 range so extreme hc-stream activations cannot
-    // poison the checkpoint hiddens with NaN halves.
-    if (std::isnan(v)) v = 0.0f;
-    else if (v > 65504.0f) v = 65504.0f;
-    else if (v < -65504.0f) v = -65504.0f;
-    uint32_t x = 0;
-    std::memcpy(&x, &v, sizeof(x));
-    uint32_t sign = (x >> 31) & 0x1;
-    int32_t  exponent = (int32_t) ((x >> 23) & 0xff) - 127;
-    uint32_t mantissa = x & 0x7fffff;
-    uint16_t fp16 = 0;
-    int32_t e16;
-    if (((x >> 23) & 0xff) == 0xff) {
-        e16 = 0x1f; fp16 = (uint16_t) ((sign << 15) | 0x7C00 | (mantissa ? 0x200 : 0));
-    } else if (exponent >= -14) {
-        int32_t e = exponent + 15;
-        if (e > 31) e = 31;
-        fp16 = (uint16_t) ((sign << 15) | ((uint16_t) e << 10) | (mantissa >> 13));
-    } else if (exponent >= -24) {
-        // subnormal
-        int32_t drop = -(exponent + 14);
-        uint32_t m = (mantissa | 0x800000) >> (drop + 1);
-        fp16 = (uint16_t) ((sign << 15) | (uint16_t) m);
-    } else {
-        fp16 = (uint16_t) (sign << 15);
-    }
-    std::fwrite(&fp16, sizeof(fp16), 1, fp);
-}
 
 // Refresh the per-layer frequency rank from the decode counters. The doorbell
 // worker is the only place that counts decodes in that mode, so it owns this.
@@ -1759,6 +1727,12 @@ static void moe_slot_resolve_sync(
     size_t full_nb1,
     const int32_t * look,
     int64_t lnk,
+    const float * weights,
+    size_t weights_nb0,
+    size_t weights_nb1,
+    const float * cur,
+    size_t cur_nb0,
+    size_t cur_nb1,
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
@@ -1788,6 +1762,12 @@ static void moe_slot_resolve_sync(
     size_t full_nb1,
     const int32_t * look,
     int64_t lnk,
+    const float * weights,
+    size_t weights_nb0,
+    size_t weights_nb1,
+    const float * cur,
+    size_t cur_nb0,
+    size_t cur_nb1,
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
@@ -1799,6 +1779,8 @@ static void moe_slot_resolve_sync(
     (void) out_nb0;
     (void) out_nb1;
     (void) count;
+    (void) weights; (void) weights_nb0; (void) weights_nb1;
+    (void) cur; (void) cur_nb0; (void) cur_nb1;
     if (op == GGML_OP_MOE_SLOT_PREKICK) {
         // the CUDA doorbell path runs PREKICK on device; when this fallback is
         // active no PREKICK nodes are emitted, so there is nothing to do
@@ -2597,6 +2579,11 @@ llama_context::llama_context(
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd(),
                 llm_arch_supports_mixed_batch(model.arch) && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT)) {
     moe_crash_trace_init();
+    // Mission 67: allocate the mapped KICK-capture step before any ubatch runs
+    {
+        const char * e = getenv("MOE_ORACLE_TRACE");
+        moe_doorbell_trace_init(e && e[0]);
+    }
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
@@ -3112,7 +3099,6 @@ llama_context::llama_context(
                         moe.step_sel.assign((size_t) n_layer * n_used, -1);
                         moe.step_topk.assign((size_t) n_layer, nullptr);
                         moe.step_weights.assign((size_t) n_layer, nullptr);
-                        moe.step_router_inp.assign((size_t) n_layer, nullptr);
                         const char * doorbell_env = getenv("MOE_DOORBELL");
                         const char * predictor_env = getenv("MOE_PRED");
                         const bool demand_only = pager.pack_mode() && (!doorbell_env || atoi(doorbell_env) != 0) && (!predictor_env || atoi(predictor_env) == 0);
@@ -4762,53 +4748,33 @@ void llama_context::oracle_trace_dump(const llama_ubatch & ubatch, llm_graph_res
         dump_router_gates(model);
         g_oracle_trace.router_dumped = true;
     }
+    // let this ubatch's KICK kernels finish writing g_trace_step before reading it
+    ggml_backend_sched_synchronize(sched.get());
+    MoeTraceStep * step = (MoeTraceStep *) moe_doorbell_trace_step_host();
+    if (!step) {
+        fprintf(stderr, "[moe_oracle_trace] trace step buffer not allocated; skipping\n");
+        return;
+    }
     FILE * fp = g_oracle_trace.fp;
     const int n_embd = (int) model.hparams.n_embd;
     const int n_used = (int) moe.n_used;
     const int n_layer = (int) moe.n_layer;
-    const int n_expert = (int) model.hparams.n_expert;
     for (int64_t row = 0; row < n_tokens; row++) {
-        const bool is_decode = true;
         const int32_t token_id = ubatch.token[(size_t) row];
         const int32_t prev_id = g_oracle_trace.prev_token_id;
-        oracle_trace_write_u8(fp, is_decode ? 1 : 0);
+        oracle_trace_write_u8(fp, 1);
         oracle_trace_write_int32(fp, (int32_t) g_oracle_trace.prompt_id);
         oracle_trace_write_int32(fp, token_id);
         oracle_trace_write_int32(fp, prev_id);
-        // all-48 pre-router normalized vectors u_t,l (fp16), captured fresh per ubatch
+        // all-48 fp16 pre-router vectors, captured in-stream at KICK(il)
         for (int il = 0; il < n_layer; il++) {
-            ggml_tensor * t = moe.step_router_inp[(size_t) il];
-            const bool good = t && (int) t->ne[0] == n_embd && row < (int64_t) t->ne[1] &&
-                              t->nb[0] == sizeof(float) && t->nb[1] == (size_t) n_embd * sizeof(float);
-            if (good) {
-                ggml_backend_tensor_get(t, g_oracle_trace.scratch_float.data(), (size_t) row * t->nb[1], (size_t) n_embd * sizeof(float));
-            } else {
-                g_oracle_trace.scratch_float.assign((size_t) n_embd, 0.0f);
-            }
-            for (int i = 0; i < n_embd; i++) oracle_trace_write_fp16(fp, g_oracle_trace.scratch_float[(size_t) i]);
+            std::fwrite(step->u[il], sizeof(uint16_t), (size_t) n_embd, fp);
         }
         for (int il = 0; il < n_layer; il++) {
-            ggml_tensor * topk = moe.step_topk[(size_t) il];
-            ggml_tensor * weights = moe.step_weights[(size_t) il];
-            std::vector<int32_t> ids_host((size_t) n_used);
-            std::vector<float>   weights_host((size_t) n_used);
-            if (topk && row < (int64_t) topk->ne[1]) {
-                ggml_backend_tensor_get(topk, ids_host.data(), (size_t) row * topk->nb[1], (size_t) n_used * sizeof(int32_t));
-            } else {
-                for (size_t i = 0; i < ids_host.size(); i++) ids_host[i] = 0xffff;
-            }
-            if (weights && row < (int64_t) weights->ne[1]) {
-                ggml_backend_tensor_get(weights, weights_host.data(), (size_t) row * weights->nb[1], (size_t) n_used * sizeof(float));
-            } else {
-                for (size_t i = 0; i < weights_host.size(); i++) weights_host[i] = 0.f;
-            }
-            for (int k = 0; k < 10; k++) {
-                const int v = (k < n_used && ids_host[(size_t) k] >= 0 && ids_host[(size_t) k] < n_expert) ? ids_host[(size_t) k] : 0xffff;
-                oracle_trace_write_u16(fp, (uint16_t) v);
-            }
-            for (int k = 0; k < 10; k++) {
-                oracle_trace_write_fp16(fp, k < n_used ? weights_host[(size_t) k] : 0.f);
-            }
+            std::fwrite(step->topk_ids[il], sizeof(uint16_t), (size_t) n_used, fp);
+        }
+        for (int il = 0; il < n_layer; il++) {
+            std::fwrite(step->topk_scores[il], sizeof(uint16_t), (size_t) n_used, fp);
         }
         g_oracle_trace.n_records++;
         g_oracle_trace.decode_tokens++;
@@ -9191,19 +9157,8 @@ static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud) {
         return false;
     }
 
-    // oracle trace: capture the exact pre-router normalized vector (Mission 66)
-    if (strncmp(nm, "ffn_router_inp-", 15) == 0) {
-        const int ilr = atoi(nm + 15);
-        if (ilr >= 0 && ilr < ctx->moe.n_layer && t->ne[1] == 1) {
-            ggml_set_output(t);
-            ctx->moe.step_router_inp[(size_t) ilr] = t;
-        }
-        return false;
-    }
-
-    // oracle trace: keep the CURRENT normalized router weights on decode;
-    // the topk-only capture above leaves step_weights pointing at a freed
-    // prefill arena during decode
+    // oracle trace: keep the CURRENT normalized router weights fresh on
+    // decode for the post-refresh path (M67 capture is in-stream at KICK)
     if (strncmp(nm, "ffn_moe_weights_norm-", 21) == 0) {
         const int ilw = atoi(nm + 21);
         if (ilw >= 0 && ilw < ctx->moe.n_layer && t->ne[1] == 1) {

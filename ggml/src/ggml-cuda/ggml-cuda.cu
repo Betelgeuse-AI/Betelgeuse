@@ -3053,6 +3053,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * table = dst->src[1];
                 const ggml_tensor * full  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[2] : nullptr;
                 const ggml_tensor * look  = dst->op == GGML_OP_MOE_SLOT_RESOLVE ? dst->src[3] : nullptr;
+                const ggml_tensor * wk    = dst->op == GGML_OP_MOE_SLOT_RESOLVE_KICK ? dst->src[2] : nullptr;
+                const ggml_tensor * cur3  = dst->op == GGML_OP_MOE_SLOT_RESOLVE_KICK ? dst->src[3] : nullptr;
                 ggml_cuda_moe_slot_resolve_fn(ctx.stream(),
                     (const int32_t *) topk->data, (const int32_t *) table->data, (int32_t *) dst->data,
                     topk->ne[0], topk->ne[1], topk->nb[0], topk->nb[1], table->nb[0], dst->nb[0], dst->nb[1],
@@ -3061,6 +3063,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     full ? full->nb[1] : 0,
                     look ? (const int32_t *) look->data : nullptr,
                     look ? look->ne[0] * look->ne[1] : 0,
+                    wk ? (const float *) wk->data : nullptr, wk ? wk->nb[0] : 0, wk ? wk->nb[1] : 0,
+                    cur3 ? (const float *) cur3->data : nullptr, cur3 ? cur3->nb[0] : 0, cur3 ? cur3->nb[1] : 0,
                     ggml_get_op_params_i32(dst, 0), (int32_t) (table->ne[0] * table->ne[1]),
                     ggml_get_op_params_i32(dst, 1), dst->op, ggml_get_op_params_i32(dst, 2));
             } break;

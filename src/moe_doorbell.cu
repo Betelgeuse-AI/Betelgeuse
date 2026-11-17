@@ -122,6 +122,41 @@ __device__ __forceinline__ void doorbell_copy(char * dst, const char * src, size
     }
 }
 
+// Mission 67 (MOE_ORACLE_TRACE): mapped trace capture buffer, written by the
+// KICK kernel in-stream and read by the host dump after the stream syncs.
+static MoeTraceStep * g_trace_step_host = nullptr;
+static MoeTraceStep * g_trace_step_dev  = nullptr;
+
+extern "C" void moe_doorbell_trace_init(bool enable) {
+    if (g_trace_step_host || !enable) return;
+    void * p = nullptr;
+    cudaError_t err = cudaHostAlloc(&p, sizeof(MoeTraceStep), cudaHostAllocMapped);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[moe_doorbell] cudaHostAlloc for MoeTraceStep failed: %s\n", cudaGetErrorString(err));
+        return;
+    }
+    memset(p, 0, sizeof(MoeTraceStep));
+    g_trace_step_host = (MoeTraceStep *) p;
+    void * dp = nullptr;
+    if (cudaHostGetDevicePointer(&dp, p, 0) != cudaSuccess) {
+        cudaFreeHost(p);
+        g_trace_step_host = nullptr;
+        fprintf(stderr, "[moe_doorbell] cudaHostGetDevicePointer for MoeTraceStep failed\n");
+        return;
+    }
+    g_trace_step_dev = (MoeTraceStep *) dp;
+    fprintf(stderr, "[moe_doorbell] oracle trace step enabled (%zu B mapped)\n", sizeof(MoeTraceStep));
+}
+
+extern "C" void * moe_doorbell_trace_step_host() { return (void *) g_trace_step_host; }
+extern "C" void * moe_doorbell_trace_step_dev()  { return (void *) g_trace_step_dev; }
+
+static __device__ __forceinline__ uint16_t moe_f2h_clamped(float v) {
+    v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+    __half h = __float2half_rn(v);
+    return *reinterpret_cast<uint16_t *>(&h);
+}
+
 // Resolve top-k experts to pool slots on the compute stream. On a hit this is
 // pure device work. On a cold miss the kernel publishes the whole batch plan,
 // rings the host doorbell and spins until the pager filled the missing slots.
@@ -148,7 +183,12 @@ __global__ void moe_resolve_slots_kernel(
     uint32_t * dma_done,
     bool use_dma,
     uint64_t * lru_touch,
-    uint64_t * lru_epoch
+    uint64_t * lru_epoch,
+    const float * __restrict__ weights,   // [n_used, nt] F32 normalized router weights
+    size_t   weights_nb0, size_t weights_nb1,
+    const float * __restrict__ cur,       // [n_embd, nt] F32 pre-router vector
+    size_t   cur_nb0, size_t cur_nb1,
+    MoeTraceStep * __restrict__ trace_step
 ) {
     const int tid = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     LayerDoorbell & db = doorbells[layer];
@@ -247,6 +287,30 @@ __global__ void moe_resolve_slots_kernel(
         if (npred > 0) pci_st_u32(&db.pred_next[0], (uint32_t) pre_next.experts[0]);
         if (npred > 1) pci_st_u32(&db.pred_next[1], (uint32_t) pre_next.experts[1]);
         __threadfence_system();
+    }
+
+    // Mission 67 (MOE_ORACLE_TRACE): capture this layer's routing data
+    // in-stream, before the graph continues. Runs on both the fast path and
+    // the full resolve path; decode ubatches only. No host reads needed.
+    if (op == GGML_OP_MOE_SLOT_RESOLVE_KICK && nt == 1 && trace_step != nullptr && cur != nullptr) {
+        const int li = layer;
+        if (tid < total) {
+            const int k = tid % nk;
+            const int t = tid / nk;
+            const int32_t e = *(const int32_t *) (topk + (size_t) t * topk_nb1 + (size_t) k * topk_nb0);
+            const uint16_t v = (e >= 0 && e < n_exp) ? (uint16_t) e : (uint16_t) 0xffff;
+            if (li >= 0 && li < 48 && k < 10) trace_step->topk_ids[li][k] = v;
+            uint16_t hbits = 0;
+            if (weights != nullptr && weights_nb0 != 0 && k < 10) {
+                const float w = *(const float *) ((const char *) weights + (size_t) t * weights_nb1 + (size_t) k * weights_nb0);
+                if (w == w) hbits = moe_f2h_clamped(w); // NaN guard; 0 otherwise
+            }
+            if (li >= 0 && li < 48 && k < 10) trace_step->topk_scores[li][k] = hbits;
+        }
+        for (int i = tid; i < 2560; i += 1024) {
+            const float v = *(const float *) ((const char *) cur + (size_t) i * cur_nb0);
+            if (li >= 0 && li < 48 && i < 2560) trace_step->u[li][i] = moe_f2h_clamped(v);
+        }
     }
 
     if (s_miss == 0) {
@@ -508,6 +572,12 @@ void moe_doorbell_resolve_launch(
     size_t full_nb1,
     const int32_t * look,
     int64_t lnk,
+    const float * weights,
+    size_t weights_nb0,
+    size_t weights_nb1,
+    const float * cur,
+    size_t cur_nb0,
+    size_t cur_nb1,
     int32_t il,
     int32_t n_exp,
     int32_t sentinel,
@@ -550,7 +620,9 @@ void moe_doorbell_resolve_launch(
             il, g_n_layer, (const char *) topk, (char *) out, const_cast<int32_t *>(table),
             g_doorbells_dev, g_plans_dev, g_prekick_dev,
             (int) nk, (int) nt, topk_nb0, topk_nb1, out_nb0, out_nb1,
-            n_exp, sentinel, total, op, g_count_enabled, g_dma_done, use_dma, g_lru_dev, g_lru_epoch
+            n_exp, sentinel, total, op, g_count_enabled, g_dma_done, use_dma, g_lru_dev, g_lru_epoch,
+            weights, weights_nb0, weights_nb1, cur, cur_nb0, cur_nb1,
+            (op == GGML_OP_MOE_SLOT_RESOLVE_KICK) ? (MoeTraceStep *) g_trace_step_dev : nullptr
         );
     } else {
         const int total = (int) total64;
