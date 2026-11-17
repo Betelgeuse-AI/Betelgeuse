@@ -1511,3 +1511,33 @@ Goal: replace post-graph trace reads with in-stream KICK capture; collect all-48
   - Per-pair val R@10: dl=0 = 1.000 all six checkpoints; dl=1: 0.180/0.797/0.761/0.704/0.767/0.857 (c0,c7,c15,c23,c31,c39); dl=8: 0.183/0.459/0.621/0.649/0.552/0.255. Code and Chat track each other within ~0.05 for every pair (no code/chat asymmetry beyond noise).
   - Artifact + trainer live in /home/zyxciss/fluxaeros-data (train_conveyor_oracle.cu, train.log conveyor_oracle_v2_train.log); verify_orcl2.py re-validates the .bin.
   - One bel-server session total this mission (unit=bel-m67-trace-instream); Task 1 PASS (see above); no second session was run; invariants all met (VRAM 11,581 < 11,750; events.high == 0; SIGTERM < 5 s; rc=0).
+
+# betelgeuse-v6.1 - Mission 68
+
+Goal: v3 4-stream spatiotemporal conveyor oracle + live rolling conveyor prefetch in bel-server.
+
+- [x] Task 1 - Train 4-stream spatiotemporal Conveyor Oracle v3 (offline, no server)
+  - Trainer: /home/zyxciss/fluxaeros-data/train_conveyor_oracle_v3.cu (sm_86), 30 epochs, Adam lr 1e-3, batch 64, rank r=128
+  - Artifact: /home/zyxciss/fluxaeros-data/conveyor_oracle_v3.bin - ORCL3 v1, npairs=182 (47/46/45/44 per dl 1..4), 1,198,348,453 B; header verified (magic ORCL3, r=128, c+dl==l for all pairs, size exact)
+  - NOTE: initial fseek bug in the trainer wrote npairs at offset 10 (npairs lives at offset 9) clobbering r's low byte; fixed in trainer; artifact header repaired in-place (offsets 9 and 13); pair records were never corrupted (write order intact, size identity exact)
+  - Unseen Validation table (val = prompts 13-16, 796 records; train = 1-12, 2391):
+    dl=1: R@10 0.699 R@12 0.758 R@16 0.828 R@20 0.867 R@24 0.891 | GW@10 0.770 GW@12 0.815 GW@16 0.867 GW@20 0.896 GW@24 0.914 | ColdR@10 0.549 ColdP@10 0.535 | Code 0.697 Chat 0.700 | baseFreqR@10 0.191
+    dl=2: R@10 0.623 R@12 0.677 R@16 0.749 R@20 0.793 R@24 0.823 | GW@10 0.699 GW@12 0.742 GW@16 0.799 GW@20 0.834 GW@24 0.857 | ColdR@10 0.487 ColdP@10 0.446 | Code 0.623 Chat 0.622 | baseFreqR@10 0.193
+    dl=3: R@10 0.585 R@12 0.636 R@16 0.705 R@20 0.750 R@24 0.781 | GW@10 0.659 GW@12 0.701 GW@16 0.757 GW@20 0.792 GW@24 0.817 | ColdR@10 0.450 ColdP@10 0.410 | Code 0.588 Chat 0.583 | baseFreqR@10 0.193
+    dl=4: R@10 0.569 R@12 0.619 R@16 0.688 R@20 0.735 R@24 0.767 | GW@10 0.646 GW@12 0.687 GW@16 0.744 GW@20 0.781 GW@24 0.807 | ColdR@10 0.426 ColdP@10 0.387 | Code 0.571 Chat 0.566 | baseFreqR@10 0.194
+    overall R@10 (mean over all pairs) = 0.6199
+  - codeR/chatR: the trainer's first FINAL REPORT divided code/chat sums by nval instead of (n_subset * npairs) and printed 16.4/16.1; corrected values above (trainer fixed). Code ~= Chat ~= overall everywhere.
+  - vs M67 (2-tap [u_c, u_{c-2}]): dl=1 R@20/24 0.822/0.841 -> 0.867/0.891 (+4.5/+5.0); dl=2 0.803/0.830 -> 0.793/0.823 (-1.0/-0.7, slightly worse); dl=3 0.528/0.559 -> 0.750/0.781 (+22.2); dl=4 (M67 dl=4 0.518/0.530) -> 0.735/0.767 (+20.5). GW@24 dl=1 0.914 vs M67 0.855 (gate-weighted @M=24, dl=1).
+  - vs mission M68 estimates: MISS. Estimate dl=1 89-95 R@20/24 (GW 92-97) vs measured 0.867/0.891 (GW 0.914); dl=2 87-94 vs 0.793/0.823 (GW 0.857); dl=3 82-90 vs 0.750/0.781 (GW 0.817). The 4-stream + focal adapter did not reach the mission bands; dl=1/dl=3 beat M67, dl=2 slightly regressed.
+  - Why: the trace shows only modest marginal structure in the odd HC streams for dl>=2; capacity went to sub-top experts via focal weighting but raw top-k recall saturated around base+margin; the estimator over-predicted what a frozen router-gate residual can recover from u alone.
+  - Cold-miss recall notably higher than M67 at dl=1/3 (0.549/0.450 vs M67 ~0.19-0.565 band across dl=1..8) - useful for prefetch.
+
+- [ ] Task 1 (archive sanity) - see above
+  - Arch per (layer l in 1..47, horizon dl in {1,2,3,4}): direct 4-stream basis q^(k)=W_l u_{t,max(0,c-k)} (k=0..3) + z_{t-1,l}, per-expert mixing alpha[512][5]; focal-weighted low-rank residual drift adapter dU = B A [u_c;u_{c-1};u_{c-2};u_{c-3}] (rank 128), loss = weighted ||sqrt(w) (z_hat - z)||^2 with w = 1 + 12*softmax(z)_e (focal on top logits) + cosine(uh, u_l)
+  - Same Prompts 1..12 train / 13..16 val split; save /home/zyxciss/fluxaeros-data/conveyor_oracle_v3.bin
+  - Report R@10/12/16/20/24, GW@10-24, Cold R/P, Code/Chat across dl {1,2,3,4}; compare vs M67 (dl1 82.2/84.1, dl2 80.3/83.0, dl3 52.8/55.9) and M68 estimates
+- [ ] Task 2 - Rolling conveyor prefetch wired into bel-server (ONE session, bel-m68-conveyor)
+  - MOE_CONVEYOR_ORACLE=<v3.bin> evaluated at KICK time for c+1,c+2; mask VRAM-resident (-1e9f); write pred_* into dbs[c]
+  - Fate RAM cache + pk_skip_cache / pk_skip_vram filtering; multi-slot spec_stage[8] so multiple conveyor reads are in flight
+  - drain_spec admits completed conveyor reads into Fate cache
+  - ONE p1/p2/p3 bench session vs M61 (11.85/12.47/12.77 tok/s, nvme_cqe_wait_us=35.69s, 472/472 parity)
