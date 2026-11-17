@@ -1532,10 +1532,6 @@ Goal: v3 4-stream spatiotemporal conveyor oracle + live rolling conveyor prefetc
   - Why: the trace shows only modest marginal structure in the odd HC streams for dl>=2; capacity went to sub-top experts via focal weighting but raw top-k recall saturated around base+margin; the estimator over-predicted what a frozen router-gate residual can recover from u alone.
   - Cold-miss recall notably higher than M67 at dl=1/3 (0.549/0.450 vs M67 ~0.19-0.565 band across dl=1..8) - useful for prefetch.
 
-- [ ] Task 1 (archive sanity) - see above
-  - Arch per (layer l in 1..47, horizon dl in {1,2,3,4}): direct 4-stream basis q^(k)=W_l u_{t,max(0,c-k)} (k=0..3) + z_{t-1,l}, per-expert mixing alpha[512][5]; focal-weighted low-rank residual drift adapter dU = B A [u_c;u_{c-1};u_{c-2};u_{c-3}] (rank 128), loss = weighted ||sqrt(w) (z_hat - z)||^2 with w = 1 + 12*softmax(z)_e (focal on top logits) + cosine(uh, u_l)
-  - Same Prompts 1..12 train / 13..16 val split; save /home/zyxciss/fluxaeros-data/conveyor_oracle_v3.bin
-  - Report R@10/12/16/20/24, GW@10-24, Cold R/P, Code/Chat across dl {1,2,3,4}; compare vs M67 (dl1 82.2/84.1, dl2 80.3/83.0, dl3 52.8/55.9) and M68 estimates
 - [ ] Task 2 - Rolling conveyor prefetch wired into bel-server (ONE session, bel-m68-conveyor)
   - MOE_CONVEYOR_ORACLE=<v3.bin> evaluated at KICK time for c+1,c+2; mask VRAM-resident (-1e9f); write pred_* into dbs[c]
   - Fate RAM cache + pk_skip_cache / pk_skip_vram filtering; multi-slot spec_stage[8] so multiple conveyor reads are in flight
