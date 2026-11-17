@@ -1512,6 +1512,22 @@ Goal: replace post-graph trace reads with in-stream KICK capture; collect all-48
   - Artifact + trainer live in /home/zyxciss/fluxaeros-data (train_conveyor_oracle.cu, train.log conveyor_oracle_v2_train.log); verify_orcl2.py re-validates the .bin.
   - One bel-server session total this mission (unit=bel-m67-trace-instream); Task 1 PASS (see above); no second session was run; invariants all met (VRAM 11,581 < 11,750; events.high == 0; SIGTERM < 5 s; rc=0).
 
+# betelgeuse-v6.1 - Mission 69
+
+- [ ] Task 1 - Audit edbc6b3d2 and M68; restore direct Fate H2D with source lifetime protection; correct speculative target/join ownership; evaluate Delta-l=1 device predictor against VRAM and latency limits; rebuild build-v1 and verify pager tests before local commit.
+- [ ] Task 2 - After Task 1 validation, run at most one bel-m69-conveyor-v2 scope with MOE_CACHE_MIB=8600; compare all three response contents/reasoning to M61; capture live cgroup, process RSS and VRAM before SIGTERM; record measured counters, timings, parity and exit status here and in /home/zyxciss/fluxaeros-data/m69_conveyor_v2_bench.log.
+
+Verified partial Task 1 results:
+  - edbc6b3d2 copied every Fate hit on the CPU. Direct H2D is restored for graph DMA; cache_remove is deferred until dbs[il].state==0 (the GPU waits for all dma_done flags before acknowledging). drain_spec admissions pass this layer's selected experts to the existing cache reservation protection throughout the transfer. The non-DMA path retains its required staging copy.
+  - Additional corruption bug: spec reads include pack alignment padding, but Fate slots contain only gate+up+down bytes. L4 pack stride=2,179,072 B versus payload/cache slot=2,176,000 B: the old admission overwrote the next slot by 3,072 B. drain_spec now admits exactly the logical payload; cache_admit_from rejects null sources and incorrect byte counts before reserving/writing.
+  - Join bugs: the generic claim path used source layer c instead of pred_layer=c+1; a legacy PREKICK sweep could claim conveyor packets as same-layer predictions; spec_count stayed 0 for conveyor submissions so the reuse loop scanned no slots; reuse omitted a layer check; legacy generation matching could reject conveyor joins. Corrected target, ownership, all-eight-slot scan and layer matching. Preserve future conveyor reads instead of cancelling at an unrelated demand; suppress duplicate submissions; top-1 only with at most two outstanding ring reads; remove Delta-l=2 evaluation/submission.
+  - Loader validates ORCL3 v1 framing/dimensions/layer indices and requires all 47 Delta-l=1 pairs; skips the other 135 pair payloads. File=1,198,348,453 B, exact framing confirmed. Unused adapters eliminated=847.705078125 MiB; selected FP32 adapters=295.126953125 MiB. This is a weight-storage calculation, NOT a measured process-memory reduction.
+  - build-v1/bin/bel-server rebuild PASS; fresh /home/zyxciss/fluxaeros-data/.test_moe_pager_m69 PASS 9/9 (5 fetch + 4 async, io_ops=27, io_bytes=14,778,368, pf_hit=4). Logs: m69_build.log, m69_pager_test.log.
+  - Focused GPU regression /home/zyxciss/fluxaeros-data/m69_cache_dma_probe.cpp PASS: hold the H2D stream, admit 511 competing same-layer experts with selected-source protection, verify source unchanged, release the stream, verify exact 2,176,000-byte DMA and exclusive removal; reject 2,179,072-byte padded admission and null source. Log: m69_cache_dma_probe.log. This tests cache source protection, not end-to-end conveyor parity.
+  - M61 full content/reasoning reference hashes confirmed from .m61_p1/p2/p3.json: p1/p3 472 B 537a71e9f9f9db3a436cd5cfed468fed / 313 B 23328639d2f14bf91f2f68cc50e93538; p2 0 B d41d8cd98f00b204e9800998ecf8427e / 912 B acd130f4e1b98875c6928f180941d154.
+  - Remaining: predictor is still CPU-side and not graph-captured. All 47 FP32 adapters exceed approximately 169 MiB of measured-baseline VRAM headroom. User decision requested: FP16 predictor weights (147.5634765625 MiB) and reuse existing device router matrices; expert weights/inference arithmetic remain unchanged. Predictor accuracy/latency must be measured independently; <15 us/layer is not established.
+  - Task 2 NOT RUN; ZERO M69 bel-server sessions used. No M69 TG/PP, parity, cgroup, VRAM or shutdown claims. Benchmark slot remains unused pending the device predictor decision and validation. Both mission checkboxes intentionally remain open.
+
 # betelgeuse-v6.1 - Mission 68
 
 Goal: v3 4-stream spatiotemporal conveyor oracle + live rolling conveyor prefetch in bel-server.

@@ -846,6 +846,9 @@ bool moe_pager::cache_admit_from(int il, int expert, const void * src, size_t by
                                  const int32_t * selected, size_t count) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (!cache_ || il < 0 || il >= n_layer_ || expert < 0 || expert >= n_expert_) return false;
+    const size_t row_bytes = role_bytes_[(size_t) il * 3] + role_bytes_[(size_t) il * 3 + 1] + role_bytes_[(size_t) il * 3 + 2];
+    // Pack reads include alignment padding; cache slots hold only the expert bytes.
+    if (!src || bytes != row_bytes) return false;
     const size_t key = (size_t) il * n_expert_ + expert;
     const int existing = cache_idx_[key];
     if (existing >= 0) {

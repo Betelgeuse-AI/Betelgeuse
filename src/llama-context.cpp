@@ -482,7 +482,7 @@ static bool moe_conveyor_init() {
         return false;
     }
     uint32_t ver = 0, npairs = 0;
-    if (fread(&ver, 4, 1, f) != 1 || fread(&npairs, 4, 1, f) != 1 || ver != 1 || npairs < 1) {
+    if (fread(&ver, 4, 1, f) != 1 || fread(&npairs, 4, 1, f) != 1 || ver != 1 || npairs != 182) {
         fprintf(stderr, "[conveyor] bad header (ver=%u npairs=%u)\n", ver, npairs);
         fclose(f);
         return false;
@@ -495,6 +495,13 @@ static bool moe_conveyor_init() {
     }
     if (r != CONV_R || ne != CONV_NE || nexpv != CONV_NEXP || nk != CONV_NK) {
         fprintf(stderr, "[conveyor] dim mismatch r=%u ne=%u nexpv=%u nk=%u\n", r, ne, nexpv, nk);
+        fclose(f);
+        return false;
+    }
+    const size_t pair_bytes = sizeof(float) * (2 * CONV_NE + CONV_R * CONV_V + CONV_NE * CONV_R + CONV_NEXP * 5);
+    struct stat file_stat;
+    if (fstat(fileno(f), &file_stat) != 0 || file_stat.st_size != (off_t) (29 + npairs * (12 + pair_bytes))) {
+        fprintf(stderr, "[conveyor] invalid file size\n");
         fclose(f);
         return false;
     }
@@ -540,7 +547,16 @@ static bool moe_conveyor_init() {
             fclose(f);
             return false;
         }
-        if (l < 0 || l >= CONV_NL || dl < 1 || dl > 4 || c != l - dl) continue;
+        if (c < 0 || l < 0 || l >= CONV_NL || dl < 1 || dl > 4 || c != l - dl) {
+            fprintf(stderr, "[conveyor] pair %u: invalid layer indices\n", i);
+            fclose(f);
+            return false;
+        }
+        if (dl != 1) {
+            if (fseek(f, (long) pair_bytes, SEEK_CUR) != 0) { fclose(f); return false; }
+            continue;
+        }
+        if (g_conveyor_map[(size_t) l * 4].c >= 0) { fclose(f); return false; }
         ConveyorPair p;
         p.c = c; p.l = l; p.dl = dl;
         p.alphaU.resize(CONV_NE);
@@ -557,6 +573,7 @@ static bool moe_conveyor_init() {
         loaded++;
     }
     fclose(f);
+    if (loaded != CONV_NL - 1) return false;
     g_prev_u.resize((size_t) CONV_NL * CONV_NE, 0);
     g_conveyor_ok = true;
     fprintf(stderr, "[conveyor] loaded %u pairs from %s\n", loaded, path);
@@ -711,6 +728,7 @@ static void start_doorbell_worker(llama_context * ctx) {
         std::vector<int>     left;
         std::vector<uint32_t> exp_len;
         std::vector<char>    read_fail, done;
+        int dma_source_layer = -1;
         long served = 0, failed = 0;
         long n_hit = 0, n_sel = 0;
         double t_read = 0.0, t_wait = 0.0;
@@ -823,11 +841,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 const int se = spec_experts[selected];
                                 if (sl >= 0 && sl < n_layer && se >= 0 && se < n_exp &&
                                     ctx->moe.slot_of[(size_t) sl * n_exp + se] < 0) {
-                                    const size_t row_bytes = ctx->pager.pack_mode()
-                                            ? (size_t) spec_lengths[selected]
-                                            : (size_t) (ctx->moe.host_gate[sl] + ctx->moe.host_up[sl] + ctx->moe.host_down[sl]);
+                                    const size_t row_bytes = ctx->moe.host_gate[sl] + ctx->moe.host_up[sl] + ctx->moe.host_down[sl];
                                     ctx->pager.cache_admit_from(sl, se, spec_stage + (size_t) selected * stride,
-                                                                row_bytes, nullptr, 0);
+                                                                row_bytes, sl == dma_source_layer ? sel.data() : nullptr,
+                                                                sl == dma_source_layer ? sel.size() : 0);
                                 }
                             }
                             spec_pending[selected] = -1;
@@ -867,7 +884,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             // next layer the prediction is state == 1 with no dbs flag set; claiming
             // must not be skipped just because the previous demand is being serviced
             if (moe_prof_enabled()) g_moe_prof.pk_skip_pred_unset++; // gate evaluation marker
-            if (spec_ok && ring_ok && spec_inflight_count() == 0 && !spec_cancel_pending) {
+            if (!conveyor_on && spec_ok && ring_ok && spec_inflight_count() == 0 && !spec_cancel_pending) {
                 bool demand_pending = false;
                 for (int layer = 0; layer < n_layer; ++layer) {
                     if (dbs[layer].state == 1) demand_pending = true;
@@ -1006,6 +1023,10 @@ static void start_doorbell_worker(llama_context * ctx) {
             // Mission 68: submit one conveyor candidate (cold expert) into a free slot.
             auto submit_conveyor_read = [&](int sl, int expert) -> bool {
                 if (!ctx->pager.pack_mode()) return false; // pack mode only (same as PREKICK path)
+                if (sl < 0 || sl >= n_layer || expert < 0 || expert >= n_exp || spec_ring_inflight >= 2) return false;
+                for (int s = 0; s < 8; s++) {
+                    if (spec_pending[s] >= 0 && spec_layer[s] == sl && spec_experts[s] == expert) return false;
+                }
                 const int slot = find_free_spec_slot();
                 if (slot < 0) return false;
                 const auto location = ctx->pager.pack_loc(sl, expert);
@@ -1040,59 +1061,39 @@ static void start_doorbell_worker(llama_context * ctx) {
                 return true;
             };
 
-            if (spec_ok && !spec_cancel_pending && spec_inflight_count() < 4) {
+            if (conveyor_on && spec_ok && !spec_cancel_pending && spec_ring_inflight < 2) {
                 for (int layer = 0; layer < n_layer; ++layer) {
                     if (dbs[layer].pred_state == 1) {
                         uint32_t expected_pred = 1;
                         if (__atomic_compare_exchange_n(&dbs[layer].pred_state, &expected_pred, 2, false,
                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
                             std::atomic_thread_fence(std::memory_order_seq_cst);
-                            const uint32_t npred = dbs[layer].pred_count > 2u ? 2u : dbs[layer].pred_count;
-                            for (uint32_t pi = 0; pi < npred && spec_inflight_count() < 4; pi++) {
+                            const int target = (int) dbs[layer].pred_layer;
+                            if (target != layer + 1 || target >= n_layer) continue;
+                            const uint32_t npred = dbs[layer].pred_count > 0 ? 1u : 0u;
+                            for (uint32_t pi = 0; pi < npred && spec_ring_inflight < 2; pi++) {
                                 const int32_t e = (int32_t) dbs[layer].pred_next[pi];
                                 if (e < 0 || e >= n_exp) continue;
-                                if (ctx->moe.slot_of[(size_t) layer * n_exp + e] >= 0) {
+                                if (ctx->moe.slot_of[(size_t) target * n_exp + e] >= 0) {
                                     if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
                                     continue;
                                 }
-                                if (ctx->pager.cache_has(layer, e)) {
+                                if (ctx->pager.cache_has(target, e)) {
                                     if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
                                     spec_cache_hits++;
                                     continue;
                                 }
-                                submit_conveyor_read(layer, e);
+                                submit_conveyor_read(target, e);
                             }
                         }
-                    }
-                    ConveyorH2 & cp = g_conveyor2_[layer];
-                    if (cp.generation == 0) continue;
-                    const int target = layer + 2;
-                    if (target >= n_layer) { cp.generation = 0; continue; }
-                    cp.generation = 0; // consume once
-                    for (int k = 0; k < 2 && spec_inflight_count() < 4; k++) {
-                        const int e = cp.expert[k];
-                        if (e < 0 || e >= n_exp) continue;
-                        if (ctx->moe.slot_of[(size_t) target * n_exp + e] >= 0) {
-                            if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
-                            continue;
-                        }
-                        if (ctx->pager.cache_has(target, e)) {
-                            if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
-                            continue;
-                        }
-                        submit_conveyor_read(target, e);
                     }
                 }
             }
             bool handled = false;
             for (int il = 0; il < n_layer; ++il) {
                 if (dbs[il].state != 1) continue;
-                // Mission 68: evaluate the rolling conveyor for il+1 and il+2 before
-                // servicing this layer's demand; results land in dbs[il] (il+1) and
-                // g_conveyor2_[il] (il+2) and are picked up by the claim path below.
                 if (g_conveyor_ok && ctx->moe_enabled() && ctx->moe.last_ntok == 1) {
                     conveyor_predict(ctx, il, 1);
-                    conveyor_predict(ctx, il, 2);
                 }
                 if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: taking layer %d\n", il);
                 const int64_t t_plan0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
@@ -1160,9 +1161,9 @@ static void start_doorbell_worker(llama_context * ctx) {
                 // additionally require the prediction generation.
                 int join_slot = -1;
                 for (int s = 0; s < 8; s++) {
-                    if (spec_pending[s] < 0) continue;
+                    if (spec_pending[s] < 0 && !spec_ready[s]) continue;
                     if (spec_layer[s] != il) continue;
-                    if (pre_plan && pre_plan->generation != spec_generation[s]) continue;
+                    if (!conveyor_on && pre_plan && pre_plan->generation != spec_generation[s]) continue;
                     if (std::find(misses.begin(), misses.end(), spec_experts[s]) != misses.end()) {
                         join_slot = s;
                         break;
@@ -1175,7 +1176,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     join_lead_ms += std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - spec_started).count();
                 }
-                if (!join_spec) cancel_spec();
+                if (!conveyor_on && !join_spec) cancel_spec();
 
                 const size_t gb = ctx->moe.host_gate[il];
                 const size_t ub = ctx->moe.host_up[il];
@@ -1420,19 +1421,18 @@ static void start_doorbell_worker(llama_context * ctx) {
 
                 const int64_t t_vic0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 const auto t_read0 = std::chrono::high_resolution_clock::now();
+                dma_source_layer = il;
                 if (victim_cache) {
                     for (int ci = 0; ci < ncopy; ++ci) {
                         if (read_fail[(size_t) ci] || left[(size_t) ci] == 0) continue;
                         const char * cached = cached_sources[(size_t) ci];
                         if (!cached) continue;
-                        // never DMA straight out of the Fate arena: its slots can be
-                        // freed by cache_remove() and immediately re-reserved and
-                        // overwritten by a later admission while an async H2D from
-                        // the arena pointer is still in flight. Stage through stage_host
-                        // (slot reuse is fenced by stage events) instead.
-                        memcpy(stage_host + (size_t) ci * stride, cached, gb + ub + db);
-                        publish_ready(ci);
-                        if (pl->pad0 && moe_doorbell_dma_enabled()) ctx->pager.cache_remove(il, misses[(size_t) ci]);
+                        if (pl->pad0 && moe_doorbell_dma_enabled()) {
+                            publish_ready(ci, cached);
+                        } else {
+                            memcpy(stage_host + (size_t) ci * stride, cached, gb + ub + db);
+                            publish_ready(ci);
+                        }
                         left[(size_t) ci] = 0;
                         victim_hits++;
                         victim_bytes += gb + ub + db;
@@ -1447,14 +1447,16 @@ static void start_doorbell_worker(llama_context * ctx) {
                 int spec_copy = -1, spec_read = -1;
                 if (spec_ok && join_slot >= 0) {
                     for (int ci = 0; ci < ncopy; ++ci) {
-                        if (read_fail[(size_t) ci]) continue;
+                        if (read_fail[(size_t) ci] || done[(size_t) ci]) continue;
                         // pack: loc.len is the aligned blob; direct-GGUF: compact role sum
                         const size_t demand_blob = ctx->pager.pack_mode()
                                 ? (size_t) locs[(size_t) ci].len
                                 : (size_t) gb + (size_t) ub + (size_t) db;
-                        for (int selected = 0; selected < spec_count; ++selected) {
-                            if (spec_experts[selected] != misses[(size_t) ci] ||
+                        for (int selected = 0; selected < 8; ++selected) {
+                            if (spec_layer[selected] != il ||
+                                spec_experts[selected] != misses[(size_t) ci] ||
                                 spec_lengths[selected] != demand_blob) continue;
+                            if (!conveyor_on && pre_plan && pre_plan->generation != spec_generation[selected]) continue;
                             if (!spec_ready[selected]) {
                                 if (join_spec && join_slot == selected) {
                                     spec_copy = ci;
@@ -1468,6 +1470,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                                     spec_stage + (size_t) selected * stride, spec_lengths[selected]);
                             left[(size_t) ci] = 0;
                             publish_ready(ci);
+                            spec_ready[selected] = false;
                             spec_reused++;
                             ready_reused++;
                             if (selected == pending_on_demand) inflight_joined++;
@@ -1784,6 +1787,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                                     memcpy(stage_host + (size_t) spec_copy * stride,
                                             spec_stage + (size_t) spec_read * stride, spec_lengths[spec_read]);
                                     publish_ready(spec_copy);
+                                    spec_ready[spec_read] = false;
                                     spec_reused++;
                                 } else {
                                     join_retries++;
@@ -2036,6 +2040,13 @@ static void start_doorbell_worker(llama_context * ctx) {
                     std::this_thread::yield();
 #endif
                 }
+                // The GPU clears state only after all H2D sources have been consumed.
+                if (pl->pad0 && moe_doorbell_dma_enabled()) {
+                    for (int ci = 0; ci < ncopy; ++ci) {
+                        if (cached_sources[(size_t) ci]) ctx->pager.cache_remove(il, misses[(size_t) ci]);
+                    }
+                }
+                dma_source_layer = -1;
                 if (moe_prof_enabled()) {
                     {
                         const uint64_t v = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
