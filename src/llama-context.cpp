@@ -3348,7 +3348,7 @@ llama_context::llama_context(
                                 if (moe_doorbell_init(moe.n_layer, moe.n_expert, moe.s_per_layer)) {
                                     LLAMA_LOG_INFO("%s: Zero-Split Stream-Ordered Doorbell armed (%d layers, n_splits = 1)\n",
                                                    __func__, moe.n_layer);
-                                    if (!moe_conveyor_init(this)) GGML_ABORT("conveyor initialization failed");
+                                    if (!model.no_alloc() && !moe_conveyor_init(this)) throw std::runtime_error("conveyor initialization failed");
                                     start_doorbell_worker(this);
                                 }
                             }
