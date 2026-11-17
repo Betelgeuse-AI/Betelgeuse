@@ -81,6 +81,13 @@ bool moe_doorbell_dma_submit_from(int il, int copy_index, const char * source);
 bool moe_doorbell_dma_store(int il, int slot, char * destination);
 const uint64_t * moe_doorbell_lru_host(int il);
 
+bool moe_conveyor_device_init();
+bool moe_conveyor_pair_upload(int target, const uint16_t * weights, size_t count,
+                              const float * router, const int32_t * slots, int sentinel);
+void moe_conveyor_launch(void * stream, const float * cur, size_t stride, int layer);
+void * moe_conveyor_history_dev();
+void * moe_conveyor_scores_dev();
+
 
 void moe_doorbell_resolve_launch(
     void * stream,

@@ -8,6 +8,7 @@ extern "C" {
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <cuda/atomic>
+#include <cooperative_groups.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -157,6 +158,175 @@ static __device__ __forceinline__ uint16_t moe_f2h_clamped(float v) {
     return *reinterpret_cast<uint16_t *>(&h);
 }
 
+static constexpr int CONVEYOR_NE = 2560;
+static constexpr int CONVEYOR_R = 128;
+static constexpr int CONVEYOR_V = 4 * CONVEYOR_NE;
+static constexpr int CONVEYOR_EX = 512;
+static constexpr size_t CONVEYOR_PARAMS = 2 * CONVEYOR_NE + CONVEYOR_R * CONVEYOR_V + CONVEYOR_NE * CONVEYOR_R + 5 * CONVEYOR_EX;
+static __half * g_conveyor_weights = nullptr;
+static __half * g_conveyor_history = nullptr;
+static float * g_conveyor_scratch = nullptr;
+static const float * g_conveyor_router[48] = {};
+static const int32_t * g_conveyor_slots[48] = {};
+static int g_conveyor_sentinel[48] = {};
+static int g_conveyor_blocks = 0;
+
+static __device__ __forceinline__ float conveyor_warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) value += __shfl_down_sync(0xffffffff, value, offset);
+    return value;
+}
+
+__global__ void moe_conveyor_kernel(const float * cur, size_t stride, int layer,
+                                    const __half * params, const float * router,
+                                    const int32_t * slots, int sentinel,
+                                    __half * history, float * scratch, LayerDoorbell * packets) {
+    const auto grid = cooperative_groups::this_grid();
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int threads = gridDim.x * blockDim.x;
+    const int lane = threadIdx.x % 32;
+    const int warp = tid / 32;
+    const int warps = threads / 32;
+    float * v = scratch;
+    float * h = v + CONVEYOR_V;
+    float * x = h + CONVEYOR_R;
+    float * scores = x + CONVEYOR_NE;
+    float * norm = scores + CONVEYOR_EX;
+    for (int i = tid; i < CONVEYOR_NE; i += threads) {
+        history[layer * CONVEYOR_NE + i] = __ushort_as_half(moe_f2h_clamped(*(const float *) ((const char *) cur + i * stride)));
+    }
+    if (layer == 47) return;
+    if (tid == 0) *norm = 0.0f;
+    grid.sync();
+    for (int i = tid; i < CONVEYOR_V; i += threads) {
+        const int source = layer - i / CONVEYOR_NE;
+        v[i] = source >= 0 ? __half2float(history[source * CONVEYOR_NE + i % CONVEYOR_NE]) : 0.0f;
+    }
+    grid.sync();
+    const __half * alpha = params;
+    const __half * bias = alpha + CONVEYOR_NE;
+    const __half * a = bias + CONVEYOR_NE;
+    const __half * b = a + CONVEYOR_R * CONVEYOR_V;
+    const __half * mix = b + CONVEYOR_NE * CONVEYOR_R;
+    for (int row = warp; row < CONVEYOR_R; row += warps) {
+        float sum = 0.0f;
+        for (int i = lane; i < CONVEYOR_V; i += 32) sum = fmaf(__half2float(a[row * CONVEYOR_V + i]), v[i], sum);
+        sum = conveyor_warp_sum(sum);
+        if (lane == 0) h[row] = sum;
+    }
+    grid.sync();
+    float squares = 0.0f;
+    for (int row = warp; row < CONVEYOR_NE; row += warps) {
+        float sum = 0.0f;
+        for (int i = lane; i < CONVEYOR_R; i += 32) sum = fmaf(__half2float(b[row * CONVEYOR_R + i]), h[i], sum);
+        sum = conveyor_warp_sum(sum);
+        if (lane == 0) {
+            sum += __half2float(alpha[row]) * v[row] + __half2float(bias[row]);
+            x[row] = sum;
+            squares = fmaf(sum, sum, squares);
+        }
+    }
+    __shared__ float block_squares[8];
+    if (lane == 0) block_squares[threadIdx.x / 32] = squares;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < 8; i++) sum += block_squares[i];
+        atomicAdd(norm, sum);
+    }
+    grid.sync();
+    const float inv_norm = rsqrtf(*norm / CONVEYOR_NE + 1e-5f);
+    for (int expert = warp; expert < CONVEYOR_EX; expert += warps) {
+        float sums[6] = {};
+        for (int i = lane; i < CONVEYOR_NE; i += 32) {
+            const float w = router[expert * CONVEYOR_NE + i];
+            sums[0] = fmaf(w, x[i] * inv_norm, sums[0]);
+            for (int k = 0; k < 4; k++) sums[k + 1] = fmaf(w, v[k * CONVEYOR_NE + i], sums[k + 1]);
+            sums[5] = fmaf(w, __half2float(history[(layer + 1) * CONVEYOR_NE + i]), sums[5]);
+        }
+        for (int k = 0; k < 6; k++) sums[k] = conveyor_warp_sum(sums[k]);
+        if (lane == 0) {
+            float score = sums[0];
+            for (int k = 0; k < 5; k++) score += __half2float(mix[expert * 5 + k]) * sums[k + 1];
+            scores[expert] = score;
+        }
+    }
+    grid.sync();
+    if (tid == 0) {
+        int best = -1;
+        float score = -INFINITY;
+        for (int expert = 0; expert < CONVEYOR_EX; expert++) {
+            if (slots[expert] >= 0 && slots[expert] < sentinel) continue;
+            if (isfinite(scores[expert]) && scores[expert] > score) {
+                score = scores[expert];
+                best = expert;
+            }
+        }
+        int rank = 0;
+        for (int expert = 0; expert < CONVEYOR_EX; expert++) rank += scores[expert] > score;
+        if (rank >= 10) best = -1;
+        LayerDoorbell & packet = packets[layer];
+        packet.pred_layer = layer + 1;
+        packet.pred_count = best >= 0 ? 1 : 0;
+        packet.pred_next[0] = best;
+        packet.conveyor_score[0] = score;
+        packet.pred_generation++;
+        __threadfence_system();
+        pci_st_u32(&packet.pred_state, 1);
+    }
+}
+
+bool moe_conveyor_device_init() {
+    if (g_conveyor_weights) return true;
+    int device = 0;
+    cudaDeviceProp props;
+    if (cudaGetDevice(&device) != cudaSuccess || cudaGetDeviceProperties(&props, device) != cudaSuccess || !props.cooperativeLaunch) return false;
+    int active = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, moe_conveyor_kernel, 256, 0) != cudaSuccess || active < 1) return false;
+    g_conveyor_blocks = props.multiProcessorCount * active;
+    if (g_conveyor_blocks > 64) g_conveyor_blocks = 64;
+    cudaError_t error = cudaMalloc((void **) &g_conveyor_weights, 47 * CONVEYOR_PARAMS * sizeof(__half));
+    if (error == cudaSuccess) error = cudaMalloc((void **) &g_conveyor_history, 48 * CONVEYOR_NE * sizeof(__half));
+    if (error == cudaSuccess) error = cudaMalloc((void **) &g_conveyor_scratch, (CONVEYOR_V + CONVEYOR_R + CONVEYOR_NE + CONVEYOR_EX + 1) * sizeof(float));
+    if (error == cudaSuccess) error = cudaMemset(g_conveyor_history, 0, 48 * CONVEYOR_NE * sizeof(__half));
+    if (error != cudaSuccess) {
+        cudaFree(g_conveyor_weights);
+        cudaFree(g_conveyor_history);
+        cudaFree(g_conveyor_scratch);
+        g_conveyor_weights = g_conveyor_history = nullptr;
+        g_conveyor_scratch = nullptr;
+        return false;
+    }
+    fprintf(stderr, "[conveyor] device weights=%.6f MiB blocks=%d, one cooperative kernel per decode layer\n", 47.0 * CONVEYOR_PARAMS * sizeof(__half) / 1048576.0, g_conveyor_blocks);
+    return true;
+}
+
+bool moe_conveyor_pair_upload(int target, const uint16_t * weights, size_t count,
+                              const float * router, const int32_t * slots, int sentinel) {
+    if (!g_conveyor_weights || target < 1 || target >= 48 || count != CONVEYOR_PARAMS || !weights || !router || !slots || sentinel <= 0) return false;
+    if (cudaMemcpy(g_conveyor_weights + (target - 1) * CONVEYOR_PARAMS, weights, count * sizeof(__half), cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    g_conveyor_router[target] = router;
+    g_conveyor_slots[target] = slots;
+    g_conveyor_sentinel[target] = sentinel;
+    return true;
+}
+
+void moe_conveyor_launch(void * stream, const float * cur, size_t stride, int layer) {
+    if (!g_conveyor_weights || !cur || layer < 0 || layer >= 48) return;
+    const int target = layer < 47 ? layer + 1 : 47;
+    const __half * params = g_conveyor_weights + (target - 1) * CONVEYOR_PARAMS;
+    const float * router = g_conveyor_router[target];
+    const int32_t * slots = g_conveyor_slots[target];
+    int sentinel = g_conveyor_sentinel[target];
+    GGML_ASSERT(router && slots && g_doorbells_dev);
+    void * args[] = {&cur, &stride, &layer, &params, &router, &slots, &sentinel,
+                    &g_conveyor_history, &g_conveyor_scratch, &g_doorbells_dev};
+    const cudaError_t error = cudaLaunchCooperativeKernel((void *) moe_conveyor_kernel, g_conveyor_blocks, 256, args, 0, (cudaStream_t) stream);
+    if (error != cudaSuccess) GGML_ABORT("conveyor launch failed: %s", cudaGetErrorString(error));
+}
+
+void * moe_conveyor_history_dev() { return g_conveyor_history; }
+void * moe_conveyor_scores_dev() { return g_conveyor_scratch ? g_conveyor_scratch + CONVEYOR_V + CONVEYOR_R + CONVEYOR_NE : nullptr; }
+
 // Resolve top-k experts to pool slots on the compute stream. On a hit this is
 // pure device work. On a cold miss the kernel publishes the whole batch plan,
 // rings the host doorbell and spins until the pager filled the missing slots.
@@ -188,7 +358,8 @@ __global__ void moe_resolve_slots_kernel(
     size_t   weights_nb0, size_t weights_nb1,
     const float * __restrict__ cur,       // [n_embd, nt] F32 pre-router vector
     size_t   cur_nb0, size_t cur_nb1,
-    MoeTraceStep * __restrict__ trace_step
+    MoeTraceStep * __restrict__ trace_step,
+    bool conveyor_on
 ) {
     const int tid = (int) (blockIdx.x * blockDim.x + threadIdx.x);
     LayerDoorbell & db = doorbells[layer];
@@ -277,7 +448,7 @@ __global__ void moe_resolve_slots_kernel(
         }
     }
 
-    if (tid == 0 && op == GGML_OP_MOE_SLOT_RESOLVE_KICK && layer + 1 < n_layer) {
+    if (tid == 0 && op == GGML_OP_MOE_SLOT_RESOLVE_KICK && layer + 1 < n_layer && !conveyor_on) {
         // piggyback il -> il+1 lookahead onto this demand doorbell
         const DoorbellPrekick & pre_next = prekick_plans[layer + 1];
         const uint32_t npred = pre_next.n > 0 ? (pre_next.n > 2u ? 2u : pre_next.n) : 0u;
@@ -616,13 +787,15 @@ void moe_doorbell_resolve_launch(
     }
     if (total64 <= MOE_DOORBELL_PLAN_MAX) {
         const int total = (int) total64;
+        if (op == GGML_OP_MOE_SLOT_RESOLVE_KICK && nt == 1) moe_conveyor_launch(stream, cur, cur_nb0, il);
         moe_resolve_slots_kernel<<<1, 1024, 0, s>>>(
             il, g_n_layer, (const char *) topk, (char *) out, const_cast<int32_t *>(table),
             g_doorbells_dev, g_plans_dev, g_prekick_dev,
             (int) nk, (int) nt, topk_nb0, topk_nb1, out_nb0, out_nb1,
             n_exp, sentinel, total, op, g_count_enabled, g_dma_done, use_dma, g_lru_dev, g_lru_epoch,
             weights, weights_nb0, weights_nb1, cur, cur_nb0, cur_nb1,
-            (op == GGML_OP_MOE_SLOT_RESOLVE_KICK) ? (MoeTraceStep *) g_trace_step_dev : nullptr
+            (op == GGML_OP_MOE_SLOT_RESOLVE_KICK) ? (MoeTraceStep *) g_trace_step_dev : nullptr,
+            g_conveyor_weights != nullptr
         );
     } else {
         const int total = (int) total64;
@@ -869,6 +1042,13 @@ bool moe_doorbell_init(int n_layer, int n_expert, int s_per_layer) {
 }
 
 void moe_doorbell_free() {
+    cudaFree(g_conveyor_weights);
+    cudaFree(g_conveyor_history);
+    cudaFree(g_conveyor_scratch);
+    g_conveyor_weights = g_conveyor_history = nullptr;
+    g_conveyor_scratch = nullptr;
+    memset(g_conveyor_router, 0, sizeof(g_conveyor_router));
+    memset(g_conveyor_slots, 0, sizeof(g_conveyor_slots));
     if (destructor_env_trace()) fprintf(stderr, "[~llama_context] moe_doorbell_free: stream sync begin\n");
     if (g_stream_h2d) {
         cudaStreamSynchronize(g_stream_h2d);

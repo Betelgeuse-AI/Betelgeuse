@@ -319,376 +319,69 @@ static inline bool moe_phase_tg(const llama_context * ctx) {
     return ctx && ctx->moe.last_ntok == 1;
 }
 
-// ---------------- Mission 68: Conveyor Oracle (MOE_CONVEYOR_ORACLE) ----------------
-//
-// The rolling conveyor predicts a layer's cold expert demand two layers
-// ahead of time, so the doorbell worker can submit non-blocking reads
-// while the decode is still working through the earlier layers. Trained
-// weights live in conveyor_oracle_v3.bin (ORCL3). Layout happens once at
-// context creation; per decode step the doorbell worker evaluates il+1
-// (written into dbs[il].pred_next) and il+2 (g_conveyor2_) directly on the
-// host, reading u vectors out of g_trace_step (written in-stream by KICK).
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
-
-static const int CONV_NL = 48;
-static const int CONV_NE = 2560;
-static const int CONV_NEXP = 512;
-static const int CONV_NK = 10;
-static const int CONV_V = 10240;
-static const int CONV_R = 128;
-
-struct ConveyorPair {
-    int c = -1, l = -1, dl = 0;
-    std::vector<float> alphaU, bvec, Ap, Bp, Mix;
-};
-struct ConveyorH2 {
-    int32_t expert[2] = { -1, -1 };
-    float score[2] = {};
-    uint32_t generation = 0;
-};
-static ConveyorPair g_conveyor_map[CONV_NL * 4]; // l*4 + (dl-1)
-static ConveyorH2 g_conveyor2_[CONV_NL];
-static bool g_conveyor_ok = false;
-static std::vector<float> g_conveyor_gates;     // [NL][NEXP*NE] f32, from q38_router_gates_fp16.bin
-static std::vector<uint16_t> g_prev_u;          // previous ubatch's u (fp16 bits), NL*NE
-static uint32_t g_conveyor_gen[CONV_NL] = {};
-static double g_conveyor_eval_ms = 0.0;
-static long g_conveyor_eval_n = 0;
-
-// Snapshot the previous ubatch's per-layer u into g_prev_u (fp16 bits).
-// Must be called before this ubatch's KICK kernels overwrite g_trace_step.
-static void conveyor_snapshot_prev_step() {
-    MoeTraceStep * step = (MoeTraceStep *) moe_doorbell_trace_step_host();
-    if (!step) return;
-    memcpy(g_prev_u.data(), step->u, (size_t) CONV_NL * CONV_NE * sizeof(uint16_t));
-}
-
-static inline float conv_u16_to_f32(uint16_t h) {
-    const uint32_t s = (uint32_t) (h & 0x8000u) << 16;
-    uint32_t e = (h >> 10) & 0x1fu;
-    uint32_t m = h & 0x3ffu;
-    if (e == 0) {
-        if (m == 0) return (s ? -0.0f : 0.0f);
-        return s ? -(float) m * 5.96046448e-08f : (float) m * 5.96046448e-08f;
-    }
-    if (e == 0x1f) return (s ? -65504.0f : 65504.0f);
-    const float f = (float) (m + 1024) / 1024.0f;
-    const float v = ldexpf(f, (int) e - 15);
-    return s ? -v : v;
-}
-
-#if defined(__x86_64__) || defined(_M_X64)
-__attribute__((target("avx2,fma")))
-static float conv_hsum256(__m256 v) {
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 s = _mm_add_ps(lo, hi);
-    __m128 shuf = _mm_movehl_ps(s, s);
-    s = _mm_add_ps(s, shuf);
-    shuf = _mm_movehdup_ps(s);
-    s = _mm_add_ss(s, shuf);
-    return _mm_cvtss_f32(s);
-}
-// One pass over W produces six dot products (z_hat2, q0..q3, zprev).
-__attribute__((target("avx2,fma")))
-static void conv_matvec6(const float * W, int rows, int cols,
-                         const float * x0, const float * x1, const float * x2,
-                         const float * x3, const float * x4, const float * x5,
-                         float * o0, float * o1, float * o2,
-                         float * o3, float * o4, float * o5) {
-    for (int r = 0; r < rows; r++) {
-        const float * w = W + (size_t) r * cols;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps();
-        __m256 a3 = _mm256_setzero_ps(), a4 = _mm256_setzero_ps(), a5 = _mm256_setzero_ps();
-        for (int i = 0; i < cols; i += 8) {
-            const __m256 wv = _mm256_loadu_ps(w + i);
-            a0 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x0 + i), a0);
-            a1 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x1 + i), a1);
-            a2 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x2 + i), a2);
-            a3 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x3 + i), a3);
-            a4 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x4 + i), a4);
-            a5 = _mm256_fmadd_ps(wv, _mm256_loadu_ps(x5 + i), a5);
-        }
-        o0[r] = conv_hsum256(a0); o1[r] = conv_hsum256(a1); o2[r] = conv_hsum256(a2);
-        o3[r] = conv_hsum256(a3); o4[r] = conv_hsum256(a4); o5[r] = conv_hsum256(a5);
-    }
-}
-#else
-static float conv_hsum256(float v) { return v; }
-static void conv_matvec6(const float * W, int rows, int cols,
-                         const float * x0, const float * x1, const float * x2,
-                         const float * x3, const float * x4, const float * x5,
-                         float * o0, float * o1, float * o2,
-                         float * o3, float * o4, float * o5) {
-    for (int r = 0; r < rows; r++) {
-        const float * w = W + (size_t) r * cols;
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f, a5 = 0.0f;
-        for (int i = 0; i < cols; i++) {
-            const float wv = w[i];
-            a0 = fmaf(wv, x0[i], a0); a1 = fmaf(wv, x1[i], a1); a2 = fmaf(wv, x2[i], a2);
-            a3 = fmaf(wv, x3[i], a3); a4 = fmaf(wv, x4[i], a4); a5 = fmaf(wv, x5[i], a5);
-        }
-        o0[r] = a0; o1[r] = a1; o2[r] = a2; o3[r] = a3; o4[r] = a4; o5[r] = a5;
-    }
-}
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-__attribute__((target("avx2,fma")))
-static void conv_matvec(const float * W, int rows, int cols, const float * x, float * out) {
-    for (int r = 0; r < rows; r++) {
-        const float * w = W + (size_t) r * cols;
-        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps(), acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-        for (int i = 0; i < cols; i += 32) {
-            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i), _mm256_loadu_ps(x + i), acc0);
-            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 8), _mm256_loadu_ps(x + i + 8), acc1);
-            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 16), _mm256_loadu_ps(x + i + 16), acc2);
-            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 24), _mm256_loadu_ps(x + i + 24), acc3);
-        }
-        acc0 = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-        __m128 lo = _mm256_castps256_ps128(acc0);
-        __m128 hi = _mm256_extractf128_ps(acc0, 1);
-        __m128 s = _mm_add_ps(lo, hi);
-        __m128 shuf = _mm_movehl_ps(s, s);
-        s = _mm_add_ps(s, shuf);
-        shuf = _mm_movehdup_ps(s);
-        s = _mm_add_ss(s, shuf);
-        out[r] = _mm_cvtss_f32(s);
-    }
-}
-#else
-static void conv_matvec(const float * W, int rows, int cols, const float * x, float * out) {
-    for (int r = 0; r < rows; r++) {
-        const float * w = W + (size_t) r * cols;
-        float acc = 0.0f;
-        for (int i = 0; i < cols; i++) acc = fmaf(w[i], x[i], acc);
-        out[r] = acc;
-    }
-}
-#endif
-
-static bool moe_conveyor_init() {
-    if (g_conveyor_ok) return true;
+static bool moe_conveyor_init(llama_context * ctx) {
     const char * path = getenv("MOE_CONVEYOR_ORACLE");
-    if (!path || !path[0]) return false;
+    if (!path || !path[0]) return true;
+    if (ctx->moe.n_layer != 48 || ctx->moe.n_expert != 512 || ctx->get_model().hparams.n_embd != 2560) return false;
     FILE * f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "[conveyor] cannot open %s\n", path); return false; }
-    char magic[6];
-    if (fread(magic, 1, 5, f) != 5 || memcmp(magic, "ORCL3", 5) != 0) {
-        fprintf(stderr, "[conveyor] bad magic in %s\n", path);
+    if (!f) return false;
+    char magic[5];
+    uint32_t header[6];
+    if (fread(magic, 1, 5, f) != 5 || memcmp(magic, "ORCL3", 5) != 0 ||
+        fread(header, sizeof(uint32_t), 6, f) != 6 || header[0] != 1 || header[1] != 182 ||
+        header[2] != 128 || header[3] != 2560 || header[4] != 512 || header[5] != 10) {
         fclose(f);
         return false;
     }
-    uint32_t ver = 0, npairs = 0;
-    if (fread(&ver, 4, 1, f) != 1 || fread(&npairs, 4, 1, f) != 1 || ver != 1 || npairs != 182) {
-        fprintf(stderr, "[conveyor] bad header (ver=%u npairs=%u)\n", ver, npairs);
-        fclose(f);
-        return false;
-    }
-    uint32_t r, ne, nexpv, nk;
-    if (fread(&r, 4, 1, f) != 1 || fread(&ne, 4, 1, f) != 1 || fread(&nexpv, 4, 1, f) != 1 || fread(&nk, 4, 1, f) != 1) {
-        fprintf(stderr, "[conveyor] bad dims\n");
-        fclose(f);
-        return false;
-    }
-    if (r != CONV_R || ne != CONV_NE || nexpv != CONV_NEXP || nk != CONV_NK) {
-        fprintf(stderr, "[conveyor] dim mismatch r=%u ne=%u nexpv=%u nk=%u\n", r, ne, nexpv, nk);
-        fclose(f);
-        return false;
-    }
-    const size_t pair_bytes = sizeof(float) * (2 * CONV_NE + CONV_R * CONV_V + CONV_NE * CONV_R + CONV_NEXP * 5);
+    const size_t count = 2 * 2560 + 128 * 10240 + 2560 * 128 + 512 * 5;
+    const size_t pair_bytes = count * sizeof(float);
     struct stat file_stat;
-    if (fstat(fileno(f), &file_stat) != 0 || file_stat.st_size != (off_t) (29 + npairs * (12 + pair_bytes))) {
-        fprintf(stderr, "[conveyor] invalid file size\n");
+    if (fstat(fileno(f), &file_stat) != 0 || file_stat.st_size != (off_t) (29 + 182 * (12 + pair_bytes))) {
         fclose(f);
         return false;
     }
-    // Router gates for the CPU-side matmuls (fp16 on disk -> f32 in memory).
-    const char * gates_path = getenv("MOE_CONVEYOR_GATES");
-    if (!gates_path || !gates_path[0]) gates_path = "/home/zyxciss/fluxaeros-data/q38_router_gates_fp16.bin";
-    {
-        FILE * gf = fopen(gates_path, "rb");
-        if (!gf) { fprintf(stderr, "[conveyor] cannot open gates %s\n", gates_path); fclose(f); return false; }
-        char gmagic[8];
-        if (fread(gmagic, 1, 8, gf) != 8 || memcmp(gmagic, "RTGATE01", 8) != 0) {
-            fprintf(stderr, "[conveyor] bad gates magic in %s\n", gates_path);
-            fclose(gf); fclose(f);
+    for (int target = 1; target < 48; target++) {
+        const ggml_tensor * router = ctx->get_model().layers[target].ffn_gate_inp;
+        const ggml_tensor * slots = ctx->moe.slot_table[target];
+        if (!router || router->type != GGML_TYPE_F32 || router->ne[0] != 2560 || router->ne[1] != 512 ||
+            !ggml_is_contiguous(router) || !router->data || ggml_backend_buffer_is_host(router->buffer) ||
+            !slots || slots->type != GGML_TYPE_I32 || !ggml_is_contiguous(slots) || !slots->data || ggml_backend_buffer_is_host(slots->buffer)) {
+            fclose(f);
             return false;
         }
-        uint32_t gver, gnl, gemd, gexp;
-        if (fread(&gver, 4, 1, gf) != 1 || fread(&gnl, 4, 1, gf) != 1 || fread(&gemd, 4, 1, gf) != 1 || fread(&gexp, 4, 1, gf) != 1) {
-            fprintf(stderr, "[conveyor] bad gates header\n");
-            fclose(gf); fclose(f);
-            return false;
-        }
-        if (gnl != CONV_NL || gemd != CONV_NE || gexp != CONV_NEXP) {
-            fprintf(stderr, "[conveyor] gates dim mismatch\n");
-            fclose(gf); fclose(f);
-            return false;
-        }
-        std::vector<uint16_t> gw((size_t) CONV_NL * CONV_NEXP * CONV_NE);
-        if (fread(gw.data(), 2, gw.size(), gf) != gw.size()) {
-            fprintf(stderr, "[conveyor] gates truncated\n");
-            fclose(gf); fclose(f);
-            return false;
-        }
-        fclose(gf);
-        g_conveyor_gates.assign((size_t) CONV_NL * CONV_NEXP * CONV_NE, 0.0f);
-        for (size_t i = 0; i < gw.size(); i++) g_conveyor_gates[i] = conv_u16_to_f32(gw[i]);
-        fprintf(stderr, "[conveyor] gates loaded (%.1f MiB f32)\n", (double) g_conveyor_gates.size() * 4 / 1048576.0);
     }
-    uint32_t loaded = 0;
-    for (uint32_t i = 0; i < npairs; i++) {
-        int c = -1, l = -1, dl = 0;
-        if (fread(&c, 4, 1, f) != 1 || fread(&l, 4, 1, f) != 1 || fread(&dl, 4, 1, f) != 1) {
-            fprintf(stderr, "[conveyor] pair %u: header truncated\n", i);
-            fclose(f);
-            return false;
-        }
-        if (c < 0 || l < 0 || l >= CONV_NL || dl < 1 || dl > 4 || c != l - dl) {
-            fprintf(stderr, "[conveyor] pair %u: invalid layer indices\n", i);
-            fclose(f);
-            return false;
-        }
+    if (!moe_conveyor_device_init()) { fclose(f); return false; }
+    std::vector<float> values(count);
+    std::vector<ggml_fp16_t> halves(count);
+    bool loaded[48] = {};
+    int pairs = 0;
+    for (int pair = 0; pair < 182; pair++) {
+        int32_t indices[3];
+        if (fread(indices, sizeof(int32_t), 3, f) != 3) { fclose(f); return false; }
+        const int c = indices[0], target = indices[1], dl = indices[2];
+        if (c < 0 || target < 1 || target >= 48 || dl < 1 || dl > 4 || c != target - dl) { fclose(f); return false; }
         if (dl != 1) {
             if (fseek(f, (long) pair_bytes, SEEK_CUR) != 0) { fclose(f); return false; }
             continue;
         }
-        if (g_conveyor_map[(size_t) l * 4].c >= 0) { fclose(f); return false; }
-        ConveyorPair p;
-        p.c = c; p.l = l; p.dl = dl;
-        p.alphaU.resize(CONV_NE);
-        p.bvec.resize(CONV_NE);
-        p.Ap.resize((size_t) CONV_R * CONV_V);
-        p.Bp.resize((size_t) CONV_NE * CONV_R);
-        p.Mix.resize((size_t) CONV_NEXP * 5);
-        if (fread(p.alphaU.data(), 4, CONV_NE, f) != CONV_NE) { fprintf(stderr, "[conveyor] p%u alphaU truncated\n", i); fclose(f); return false; }
-        if (fread(p.bvec.data(),    4, CONV_NE, f) != CONV_NE) { fprintf(stderr, "[conveyor] p%u bvec truncated\n", i);    fclose(f); return false; }
-        if (fread(p.Ap.data(),      4, (size_t) CONV_R * CONV_V, f) != (size_t) CONV_R * CONV_V) { fprintf(stderr, "[conveyor] p%u Ap truncated\n", i);      fclose(f); return false; }
-        if (fread(p.Bp.data(),      4, (size_t) CONV_NE * CONV_R, f) != (size_t) CONV_NE * CONV_R) { fprintf(stderr, "[conveyor] p%u Bp truncated\n", i);      fclose(f); return false; }
-        if (fread(p.Mix.data(),     4, (size_t) CONV_NEXP * 5, f) != (size_t) CONV_NEXP * 5) { fprintf(stderr, "[conveyor] p%u Mix truncated\n", i);  fclose(f); return false; }
-        g_conveyor_map[(size_t) l * 4 + (size_t) (dl - 1)] = std::move(p);
-        loaded++;
+        if (loaded[target] || fread(values.data(), sizeof(float), count, f) != count) { fclose(f); return false; }
+        for (float value : values) {
+            if (!std::isfinite(value) || std::fabs(value) > 65504.0f) { fclose(f); return false; }
+        }
+        ggml_fp32_to_fp16_row(values.data(), halves.data(), count);
+        if (!moe_conveyor_pair_upload(target, (const uint16_t *) halves.data(), count,
+                (const float *) ctx->get_model().layers[target].ffn_gate_inp->data,
+                (const int32_t *) ctx->moe.slot_table[target]->data, moe_get_layer_slots(target, 48))) {
+            fclose(f);
+            return false;
+        }
+        loaded[target] = true;
+        pairs++;
     }
     fclose(f);
-    if (loaded != CONV_NL - 1) return false;
-    g_prev_u.resize((size_t) CONV_NL * CONV_NE, 0);
-    g_conveyor_ok = true;
-    fprintf(stderr, "[conveyor] loaded %u pairs from %s\n", loaded, path);
-    return true;
+    fprintf(stderr, "[conveyor] loaded %d Delta-l=1 pairs; reuse device F32 routers; host upload buffers released\n", pairs);
+    return pairs == 47;
 }
-
-static void conv_build_h(const ConveyorPair & p, const float * v, float * h_out) {
-    conv_matvec(p.Ap.data(), CONV_R, CONV_V, v, h_out);
-}
-
-// Evaluate the conveyor for layer target (dl=1 or 2 ahead of il). Writes:
-//  - dbs[il].pred_next[0..1], conveyor_score[0..3], pred_count, pred_state, pred_generation  (dl=1)
-//  - g_conveyor2_[il]                                                                       (dl=2)
-// VRAM-resident experts are masked to -1e9f before top-k.
-static void conveyor_predict(llama_context * ctx, int il, int dl) {
-    const int l = il + dl;
-    if (l < 0 || l >= CONV_NL) return;
-    const ConveyorPair & p = g_conveyor_map[(size_t) l * 4 + (size_t) (dl - 1)];
-    if (p.c < 0) return; // pair absent (training skipped this one)
-    MoeTraceStep * step = (MoeTraceStep *) moe_doorbell_trace_step_host();
-    if (!step) return;
-    const int n_exp = ctx->moe.n_expert;
-
-    const int64_t t0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
-
-    float v[CONV_V];
-    for (int k = 0; k < 4; k++) {
-        const int src = il - k;
-        float * dst = v + (size_t) k * CONV_NE;
-        if (src >= 0) {
-            const uint16_t * up = (const uint16_t *) step->u[src];
-            for (int i = 0; i < CONV_NE; i++) dst[i] = conv_u16_to_f32(up[i]);
-        } else {
-            memset(dst, 0, CONV_NE * sizeof(float));
-        }
-    }
-
-    float h[CONV_R];
-    conv_build_h(p, v, h);
-    float x_[CONV_NE];
-    {
-        const float * alf = p.alphaU.data();
-        const float * bb  = p.bvec.data();
-        const float * B   = p.Bp.data();
-        for (int i = 0; i < CONV_NE; i++) {
-            float acc = alf[i] * v[i] + bb[i];
-            const float * brow = B + (size_t) i * CONV_R;
-            for (int j = 0; j < CONV_R; j++) acc = fmaf(brow[j], h[j], acc);
-            x_[i] = acc;
-        }
-        float ss = 0.0f;
-        for (int i = 0; i < CONV_NE; i++) ss = fmaf(x_[i], x_[i], ss);
-        const float s = sqrtf(ss / (float) CONV_NE + 1e-5f);
-        for (int i = 0; i < CONV_NE; i++) x_[i] /= s;
-    }
-
-    const float * Wl = g_conveyor_gates.data() + (size_t) l * CONV_NEXP * CONV_NE;
-    float zh2[CONV_NEXP];
-    float qk[5][CONV_NEXP];
-    float uprev_f[CONV_NE];
-    {
-        const uint16_t * up = (const uint16_t *) g_prev_u.data() + (size_t) l * CONV_NE;
-        for (int i = 0; i < CONV_NE; i++) uprev_f[i] = conv_u16_to_f32(up[i]);
-    }
-    // v already holds the same four u rows the q^0..q^3 projections need
-    conv_matvec6(Wl, CONV_NEXP, CONV_NE, x_, v + 0 * CONV_NE, v + 1 * CONV_NE,
-                 v + 2 * CONV_NE, v + 3 * CONV_NE, uprev_f,
-                 zh2, qk[0], qk[1], qk[2], qk[3], qk[4]);
-
-    const float * mix = p.Mix.data();
-    float zhat[CONV_NEXP];
-    const int32_t * slot_of_l = ctx->moe.slot_of.data() + (size_t) l * n_exp;
-    for (int e = 0; e < CONV_NEXP; e++) {
-        float s = zh2[e];
-        #pragma unroll
-        for (int k = 0; k < 5; k++) s += mix[(size_t) e * 5 + k] * qk[k][e];
-        zhat[e] = (slot_of_l[e] >= 0) ? -1e9f : s;
-    }
-
-    float best1 = -1e30f, best2 = -1e30f;
-    int e1 = -1, e2 = -1;
-    for (int e = 0; e < CONV_NEXP; e++) {
-        const float z = zhat[e];
-        if (z <= -1e8f) continue; // VRAM-resident, masked
-        if (z > best1) { best2 = best1; e2 = e1; best1 = z; e1 = e; }
-        else if (z > best2) { best2 = z; e2 = e; }
-    }
-    if (moe_prof_enabled() && t0) g_moe_prof.conveyor_eval_us += (uint64_t) moe_prof_now() - (uint64_t) t0;
-    g_conveyor_eval_n++;
-
-    if (dl == 1) {
-        LayerDoorbell * dbs = moe_doorbell_get_host_ptr();
-        if (dbs) {
-            LayerDoorbell & db = dbs[il];
-            db.pred_next[0] = (e1 >= 0) ? e1 : -1;
-            db.pred_next[1] = (e2 >= 0) ? e2 : -1;
-            db.pred_count = 2;
-            db.pred_generation = ++g_conveyor_gen[il];
-            db.pred_layer = (uint32_t) il + 1u;
-            db.conveyor_score[0] = best1;
-            db.conveyor_score[1] = best2;
-            db.conveyor_score[2] = 0.0f;
-            db.conveyor_score[3] = 0.0f;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            db.pred_state = 1;
-        }
-    } else {
-        g_conveyor2_[il].expert[0] = e1;
-        g_conveyor2_[il].expert[1] = e2;
-        g_conveyor2_[il].score[0] = best1;
-        g_conveyor2_[il].score[1] = best2;
-        g_conveyor2_[il].generation = ++g_conveyor_gen[il];
-    }
-}
-
 
 static void start_doorbell_worker(llama_context * ctx) {
     if (g_doorbell_running.load()) return;
@@ -786,15 +479,15 @@ static void start_doorbell_worker(llama_context * ctx) {
         uint64_t dma_copies = 0, dma_bytes = 0;
         long demand_queued = 0, spec_completed = 0, spec_cancelled = 0, spec_short = 0;
         long cancel_requested = 0, ready_reused = 0, inflight_eligible = 0, inflight_joined = 0;
-        long join_retries = 0, duplicate_submissions = 0;
+        long join_retries = 0, duplicate_submissions = 0, spec_admitted = 0;
         double spec_elapsed_ms = 0.0, join_lead_ms = 0.0, spec_submit_ms = 0.0;
         auto spec_started = std::chrono::steady_clock::now();
         auto log_io = [&]() {
             if (!io_diag) return;
-            fprintf(stderr, "[moe_io] served=%ld logical_bytes=%llu demand_queued=%ld demand_bytes=%llu spec_submitted=%ld spec_bytes=%llu spec_completed=%ld spec_cancelled=%ld spec_short=%ld cancel_requested=%ld ready_reused=%ld inflight_eligible=%ld inflight_joined=%ld join_retries=%ld duplicate_submissions=%ld spec_ms=%.3f join_lead_ms=%.3f submit_ms=%.3f\n",
+            fprintf(stderr, "[moe_io] served=%ld logical_bytes=%llu demand_queued=%ld demand_bytes=%llu spec_submitted=%ld spec_bytes=%llu spec_completed=%ld spec_cancelled=%ld spec_short=%ld cancel_requested=%ld ready_reused=%ld inflight_eligible=%ld inflight_joined=%ld join_retries=%ld duplicate_submissions=%ld spec_reused=%ld cache_admit_from=%ld spec_ms=%.3f join_lead_ms=%.3f submit_ms=%.3f\n",
                     served, (unsigned long long) logical_bytes, demand_queued, (unsigned long long) demand_bytes,
                     spec_submitted, (unsigned long long) spec_bytes, spec_completed, spec_cancelled, spec_short,
-                    cancel_requested, ready_reused, inflight_eligible, inflight_joined, join_retries, duplicate_submissions,
+                    cancel_requested, ready_reused, inflight_eligible, inflight_joined, join_retries, duplicate_submissions, spec_reused, spec_admitted,
                     spec_completed ? spec_elapsed_ms / spec_completed : 0.0,
                     inflight_eligible ? join_lead_ms / inflight_eligible : 0.0,
                     spec_submitted ? spec_submit_ms / spec_submitted : 0.0);
@@ -842,9 +535,9 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 if (sl >= 0 && sl < n_layer && se >= 0 && se < n_exp &&
                                     ctx->moe.slot_of[(size_t) sl * n_exp + se] < 0) {
                                     const size_t row_bytes = ctx->moe.host_gate[sl] + ctx->moe.host_up[sl] + ctx->moe.host_down[sl];
-                                    ctx->pager.cache_admit_from(sl, se, spec_stage + (size_t) selected * stride,
+                                    if (ctx->pager.cache_admit_from(sl, se, spec_stage + (size_t) selected * stride,
                                                                 row_bytes, sl == dma_source_layer ? sel.data() : nullptr,
-                                                                sl == dma_source_layer ? sel.size() : 0);
+                                                                sl == dma_source_layer ? sel.size() : 0)) spec_admitted++;
                                 }
                             }
                             spec_pending[selected] = -1;
@@ -1061,40 +754,41 @@ static void start_doorbell_worker(llama_context * ctx) {
                 return true;
             };
 
-            if (conveyor_on && spec_ok && !spec_cancel_pending && spec_ring_inflight < 2) {
-                for (int layer = 0; layer < n_layer; ++layer) {
-                    if (dbs[layer].pred_state == 1) {
-                        uint32_t expected_pred = 1;
-                        if (__atomic_compare_exchange_n(&dbs[layer].pred_state, &expected_pred, 2, false,
-                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
-                            std::atomic_thread_fence(std::memory_order_seq_cst);
-                            const int target = (int) dbs[layer].pred_layer;
-                            if (target != layer + 1 || target >= n_layer) continue;
-                            const uint32_t npred = dbs[layer].pred_count > 0 ? 1u : 0u;
-                            for (uint32_t pi = 0; pi < npred && spec_ring_inflight < 2; pi++) {
-                                const int32_t e = (int32_t) dbs[layer].pred_next[pi];
-                                if (e < 0 || e >= n_exp) continue;
-                                if (ctx->moe.slot_of[(size_t) target * n_exp + e] >= 0) {
-                                    if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
-                                    continue;
+            auto claim_conveyor = [&]() {
+                if (conveyor_on && spec_ok && !spec_cancel_pending && spec_ring_inflight < 2) {
+                    for (int layer = 0; layer < n_layer; ++layer) {
+                        if (dbs[layer].pred_state == 1) {
+                            uint32_t expected_pred = 1;
+                            if (__atomic_compare_exchange_n(&dbs[layer].pred_state, &expected_pred, 2, false,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                                std::atomic_thread_fence(std::memory_order_seq_cst);
+                                const int target = (int) dbs[layer].pred_layer;
+                                if (target != layer + 1 || target >= n_layer) continue;
+                                const uint32_t npred = dbs[layer].pred_count > 0 ? 1u : 0u;
+                                for (uint32_t pi = 0; pi < npred && spec_ring_inflight < 2; pi++) {
+                                    const int32_t e = (int32_t) dbs[layer].pred_next[pi];
+                                    if (e < 0 || e >= n_exp) continue;
+                                    if (ctx->moe.slot_of[(size_t) target * n_exp + e] >= 0) {
+                                        if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
+                                        continue;
+                                    }
+                                    if (ctx->pager.cache_has(target, e)) {
+                                        if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
+                                        spec_cache_hits++;
+                                        continue;
+                                    }
+                                    submit_conveyor_read(target, e);
                                 }
-                                if (ctx->pager.cache_has(target, e)) {
-                                    if (moe_prof_enabled()) g_moe_prof.pk_skip_cache++;
-                                    spec_cache_hits++;
-                                    continue;
-                                }
-                                submit_conveyor_read(target, e);
                             }
                         }
                     }
                 }
-            }
+            };
+            claim_conveyor();
             bool handled = false;
             for (int il = 0; il < n_layer; ++il) {
                 if (dbs[il].state != 1) continue;
-                if (g_conveyor_ok && ctx->moe_enabled() && ctx->moe.last_ntok == 1) {
-                    conveyor_predict(ctx, il, 1);
-                }
+                claim_conveyor();
                 if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: taking layer %d\n", il);
                 const int64_t t_plan0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                 if (moe_prof_enabled() && g_moe_prof.doorbell_t0_us.load(std::memory_order_relaxed) == 0) {
@@ -3654,11 +3348,11 @@ llama_context::llama_context(
                                 if (moe_doorbell_init(moe.n_layer, moe.n_expert, moe.s_per_layer)) {
                                     LLAMA_LOG_INFO("%s: Zero-Split Stream-Ordered Doorbell armed (%d layers, n_splits = 1)\n",
                                                    __func__, moe.n_layer);
+                                    if (!moe_conveyor_init(this)) GGML_ABORT("conveyor initialization failed");
                                     start_doorbell_worker(this);
                                 }
                             }
                             moe_oracle_start(this);
-                            if (moe_ready) moe_conveyor_init();
                             io_run.store(true);
                             for (int i = 0; i < 16; i++) io_thr.emplace_back(moe_io_worker, this);
                             {
@@ -5235,11 +4929,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (!keep_static && !moe_doorbell_on(this)) moe_reseed_decode();
     }
     if (moe_ready) moe.last_ntok = ubatch.n_tokens;
-    // Mission 68: snapshot the previous step's u for the rolling conveyor prefetch
-    // (z_{t-1,l} = W_l * u_{t-1,l}); must happen before this ubatch overwrites it.
-    if (moe_ready && ubatch.n_tokens == 1 && g_conveyor_ok) {
-        conveyor_snapshot_prev_step();
-    }
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
