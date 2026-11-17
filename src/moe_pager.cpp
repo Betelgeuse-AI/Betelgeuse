@@ -842,6 +842,32 @@ char * moe_pager::cache_reserve(int il, int expert, const int32_t * selected, si
     return cache_ + cache_off_[(size_t) slot];
 }
 
+bool moe_pager::cache_admit_from(int il, int expert, const void * src, size_t bytes,
+                                 const int32_t * selected, size_t count) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!cache_ || il < 0 || il >= n_layer_ || expert < 0 || expert >= n_expert_) return false;
+    const size_t key = (size_t) il * n_expert_ + expert;
+    const int existing = cache_idx_[key];
+    if (existing >= 0) {
+        if (cache_state_[(size_t) existing] == 1) {
+            const cudaEvent_t ev = cache_ev_[(size_t) existing];
+            if (ev && cudaEventQuery(ev) == cudaSuccess) {
+                cache_state_[(size_t) existing] = 2;
+                if (n_cache_inflight_ > 0) n_cache_inflight_--;
+            }
+        }
+        cache_stamp_[(size_t) existing] = ++cache_tick_;
+        n_cache_already_resident_++;
+        return true;
+    }
+    const int slot = cache_reserve_slot_locked(il, expert, selected, count);
+    if (slot < 0) return false;
+    char * dst = cache_ + cache_off_[(size_t) slot];
+    memcpy(dst, src, bytes);
+    cache_state_[(size_t) slot] = 2; // host-to-host copy, ready immediately
+    return true;
+}
+
 void moe_pager::cache_quiesce(cudaStream_t d2h_stream) {
     std::lock_guard<std::mutex> lock(mtx_);
     if (d2h_stream) cudaStreamSynchronize(d2h_stream);

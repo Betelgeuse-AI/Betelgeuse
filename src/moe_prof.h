@@ -38,6 +38,7 @@ struct moe_prof_state {
     std::atomic<uint64_t> pk_state1_seen{0};
     std::atomic<uint64_t> nvme_drain_spec_us{0};
     std::atomic<uint64_t> nvme_publish_h2d_us{0};
+    std::atomic<uint64_t> conveyor_eval_us{0};
     std::atomic<uint64_t> nvme_cqe_wait_us{0};
     std::atomic<uint64_t> hits[48] = {};
     std::atomic<uint64_t> misses[48] = {};

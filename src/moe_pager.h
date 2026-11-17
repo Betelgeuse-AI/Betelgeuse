@@ -114,6 +114,10 @@ public:
     const char * cache_find(int il, int expert);
     bool cache_has(int il, int expert); // side-effect free probe (no LFU stamp, no hit count)
     char * cache_reserve(int il, int expert, const int32_t * selected, size_t count);
+    // Admit an already-resident host buffer (e.g. a completed pager read) into
+    // the Fate RAM victim cache. Returns true on success.
+    bool cache_admit_from(int il, int expert, const void * src, size_t bytes,
+                          const int32_t * selected = nullptr, size_t count = 0);
     void cache_remove(int il, int expert);
     // Exclusive DtoH admission (M35): copies the evicted expert's arena bytes
     // (src_gate/src_up/src_down, exact per-layer role lengths) into a RAM cache
