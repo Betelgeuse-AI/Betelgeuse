@@ -509,13 +509,7 @@ static bool moe_conveyor_init() {
 }
 
 static void conv_build_h(const ConveyorPair & p, const float * v, float * h_out) {
-    const float * A = p.Ap.data();
-    for (int ri = 0; ri < CONV_R; ri++) {
-        const float * arow = A + (size_t) ri * CONV_V;
-        float acc = 0.0f;
-        for (int i = 0; i < CONV_V; i++) acc = fmaf(arow[i], v[i], acc);
-        h_out[ri] = acc;
-    }
+    conv_matvec(p.Ap.data(), CONV_R, CONV_V, v, h_out);
 }
 
 // Evaluate the conveyor for layer target (dl=1 or 2 ahead of il). Writes:
