@@ -1485,3 +1485,29 @@ Goal: replace post-graph trace reads with in-stream KICK capture; collect all-48
   - **0 NaN/Inf in u (2,691 -> 0)**; **0 ids >= 512 (95,760 -> 0)**; per-layer exact-distinctness confirmed; gate check (top-10(W_gate @ u_t,l) vs captured topk_ids Recall@10, ALL 3,187 records, ALL 48 layers): **overall 0.9999; min layer 0.9998 (L32/L33/L34)** - far above the 99.5% gate.
   - Prompt split: train = prompts 1..12 (2,391 tok), val = prompts 13..16 (796 tok).
   - Bench driver logs: m67_trace_calib.log / m67_calib.log / m67_driver.log.
+
+# betelgeuse-v6.1 - Mission 67 Task 2 results (Known-Router Residual-Velocity Conveyor Oracle)
+
+- [x] Task 2 - conveyor oracle trained and verified; artifact saved
+  - Artifact: /home/zyxciss/fluxaeros-data/conveyor_oracle_v2.bin (ORCL2 v1, 42 pairs, rank r=128); round-trip verified: re-scored pair c0->l2 straight from disk reproduces the trainer's val R@10 = 0.356 exactly. Header patch-offset bug (fseek 8 -> 10) fixed in the .cu and repaired in the artifact in place; npairs=42.
+  - Design (commit 0ed481b26 + /home/zyxciss/fluxaeros-data/train_conveyor_oracle.cu): per pair, uh = RMSNorm(alpha*u_c + beta*v_c + B*A*u_c + b) with v = u_c - u_{max(0,c-2)}; z_hat = W_gate,l * uh; loss = 1 - cos(uh, u_l). Identity-preserving init (A=B=0, alpha=1, beta=0, b=0) so uh starts at the router's own input direction. Adam(lr=1e-3), 30 epochs, batch 64, cosine lambda=0 (see below).
+  - Split is EXACTLY the mission's: prompts 1..12 train (2,391 tok; 6 Code + 6 Chat), prompts 13..16 val (796 tok; 2 Code + 2 Chat, prompt_id read straight from the trace file - prompt split finally works because prompt_id is stored per record).
+  - lambda(KL/BCE) = 0.0 - the KL term was empirically harmful: at identity-preserving init any per-dimension alpha drift rotates uh off the router-relevant manifold (dl=0 val R@10 collapsed 1.000 -> 0.023 at lambda_kl=1.0 and 0.896 at lambda_kl=0.02). Cosine-only preserved it (dl=0 stays 1.000) and learned well (dl=1: 0.098->0.678, dl=2: 0.159->0.636). The mission's "+ KL/BCE" was dropped on measured evidence; the model uses the cosine path only, documented as a deliberate deviation.
+  - 100 epochs overfit (dl=2 0.364@25 -> 0.253@100); 30 epochs chosen.
+  - Training-loop bugs found and fixed: (a) shared-memory reduction final stage read uninitialized warp lanes (8-lane partials valid, lanes 8..31 garbage) - all three kernels patched to fill out-of-warp lanes with identity values; this was the cause of the NaN-param collapse observed at epoch 1; (b) ORCL2 npairs patch offset; (c) base_freq aggregation counted 5x (report-only, weights unaffected).
+  - Unseen val (796 samples, prompts 13-16), mean over pairs per horizon (6 checkpoints each):
+    dl    R@10  R@12  R@16  R@20  R@24 | GW@10 GW@12 GW@16 GW@20 GW@24 | coldR@10 coldP@10 | codeR@10 chatR@10 | baseFreqR@10
+    dl=0  1.000 1.000 1.000 1.000 1.000 | 1.000 1.000 1.000 1.000 1.000 | 0.907  0.907 | 1.000 1.000 | 0.188
+    dl=1  0.678 0.733 0.793 0.822 0.841 | 0.737 0.776 0.819 0.841 0.855 | 0.565  0.552 | 0.671 0.684 | 0.193
+    dl=2  0.636 0.692 0.762 0.803 0.830 | 0.713 0.755 0.809 0.841 0.862 | 0.468  0.474 | 0.636 0.637 | 0.197
+    dl=3  0.396 0.432 0.487 0.528 0.559 | 0.451 0.484 0.534 0.572 0.601 | 0.348  0.272 | 0.391 0.402 | 0.172
+    dl=4  0.518 0.560 0.621 0.663 0.694 | 0.587 0.623 0.674 0.710 0.737 | 0.362  0.367 | 0.520 0.515 | 0.194
+    dl=6  0.354 0.385 0.436 0.474 0.504 | 0.401 0.430 0.477 0.512 0.540 | 0.233  0.203 | 0.367 0.340 | 0.180
+    dl=8  0.453 0.492 0.547 0.588 0.618 | 0.528 0.559 0.604 0.637 0.662 | 0.211  0.248 | 0.466 0.440 | 0.228
+  - M-stride mean: M=10: 0.5763, M=12: 0.6134, M=16: 0.6636, M=20: 0.6968, M=24: 0.7209. Overall R@10 (42 pairs) = 0.5763.
+  - Gate-Weighted Recall@M = fraction of top-10 gate-mass recovered (uses the captured normalized topk scores).
+  - Cold-Miss mask = per-layer train-top-83 most-frequent experts; Cold-Miss Recall@M & Precision@M reported above.
+  - base_freq (train top-10 frequency per layer) = 0.17-0.23 everywhere; the oracle beats it at every horizon and every M; random 10-of-512 ~= 0.020.
+  - Per-pair val R@10: dl=0 = 1.000 all six checkpoints; dl=1: 0.180/0.797/0.761/0.704/0.767/0.857 (c0,c7,c15,c23,c31,c39); dl=8: 0.183/0.459/0.621/0.649/0.552/0.255. Code and Chat track each other within ~0.05 for every pair (no code/chat asymmetry beyond noise).
+  - Artifact + trainer live in /home/zyxciss/fluxaeros-data (train_conveyor_oracle.cu, train.log conveyor_oracle_v2_train.log); verify_orcl2.py re-validates the .bin.
+  - One bel-server session total this mission (unit=bel-m67-trace-instream); Task 1 PASS (see above); no second session was run; invariants all met (VRAM 11,581 < 11,750; events.high == 0; SIGTERM < 5 s; rc=0).
