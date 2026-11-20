@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <climits>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include <map>
 #include <mutex>
 #include <string>
@@ -395,6 +396,94 @@ static void start_doorbell_worker(llama_context * ctx) {
         const int n_layer = ctx->moe.n_layer;
         const int n_exp   = ctx->moe.n_expert;
         const int n_used  = ctx->moe.n_used;
+// Worker-owned timing events. A completed layer can be harvested without waiting.
+struct moe_dma_trace {
+    struct sample {
+        cudaEvent_t h0 = nullptr, h1 = nullptr, h2 = nullptr, d0 = nullptr, d1 = nullptr;
+        bool upload = false, download = false, waited = false;
+    };
+    sample slots[10];
+    bool enabled = false;
+    bool timed = false;
+    using phase_fn = void (*)(bool);
+    phase_fn activity_phase = nullptr;
+    struct activity_scope {
+        phase_fn fn;
+        explicit activity_scope(phase_fn f) : fn(f) { if (fn) fn(true); }
+        ~activity_scope() { if (fn) fn(false); }
+    };
+    uint64_t plans = 0, waits = 0, not_ready = 0, query_errors = 0;
+    uint64_t h_count = 0, d_count = 0, wait_count = 0, incomplete = 0, event_errors = 0;
+    uint64_t adjacent = 0, adjacent_us = 0, qd_split = 0;
+    int previous_layer = -2;
+    uint64_t published_us = 0;
+    double h_us = 0, d_us = 0, wait_us = 0;
+    struct qd_bucket { uint64_t submits = 0, reads = 0, cqe_us = 0, submit_to_reap_us = 0; };
+    qd_bucket depths[11];
+
+    moe_dma_trace() {
+        const char * env = getenv("MOE_DMA_TRACE");
+        enabled = env && atoi(env) != 0;
+        if (!enabled) return;
+        timed = true;
+        activity_phase = reinterpret_cast<phase_fn>(dlsym(RTLD_DEFAULT, "moe_dma_activity_phase"));
+        for (auto & s : slots) {
+            for (auto * ev : {&s.h0, &s.h1, &s.h2, &s.d0, &s.d1}) {
+                if (cudaEventCreate(ev) != cudaSuccess) timed = false;
+            }
+        }
+    }
+
+    void collect() {
+        auto duration = [&](cudaEvent_t a, cudaEvent_t b, uint64_t & n, double & us) {
+            const auto status = cudaEventQuery(b);
+            float ms = 0;
+            if (status == cudaSuccess && cudaEventElapsedTime(&ms, a, b) == cudaSuccess) {
+                ++n;
+                us += 1000.0 * ms;
+            } else {
+                ++incomplete;
+            }
+        };
+        for (auto & s : slots) {
+            if (s.upload) {
+                duration(s.h1, s.h2, h_count, h_us);
+                if (s.waited) duration(s.h0, s.h1, wait_count, wait_us);
+            }
+            if (s.download) duration(s.d0, s.d1, d_count, d_us);
+            s.upload = s.download = s.waited = false;
+        }
+    }
+
+    bool record(cudaEvent_t event, cudaStream_t stream) {
+        if (cudaEventRecord(event, stream) == cudaSuccess) return true;
+        ++event_errors;
+        return false;
+    }
+
+    ~moe_dma_trace() {
+        if (!enabled) return;
+        collect();
+        for (auto & s : slots) {
+            for (auto ev : {s.h0, s.h1, s.h2, s.d0, s.d1}) if (ev) cudaEventDestroy(ev);
+        }
+        fprintf(stderr, "[moe_dma_trace] plans=%" PRIu64 " sample_stride=16 waits=%" PRIu64
+                " ev_of_v_not_ready_count=%" PRIu64 " query_errors=%" PRIu64
+                " wait_samples=%" PRIu64 " h2d_blocked_on_d2h_sample_us=%.3f"
+                " h2d_samples=%" PRIu64 " h2d_copy_bracket_us=%.3f d2h_samples=%" PRIu64 " d2h_copy_bracket_us=%.3f"
+                " incomplete=%" PRIu64 " event_errors=%" PRIu64 " adjacent_pairs=%" PRIu64
+                " host_publish_to_adjacent_kick_us=%" PRIu64 " qd_split=%" PRIu64 "\n",
+                plans, waits, not_ready, query_errors, wait_count, wait_us, h_count, h_us, d_count, d_us,
+                incomplete, event_errors, adjacent, adjacent_us, qd_split);
+        for (size_t i = 1; i < 11; ++i) {
+            const auto & d = depths[i];
+            fprintf(stderr, "[moe_dma_qd] qd=%zu submits=%" PRIu64 " reads=%" PRIu64
+                    " cqe_wait_us=%" PRIu64 " submit_to_reap_us=%" PRIu64 "\n",
+                    i, d.submits, d.reads, d.cqe_us, d.submit_to_reap_us);
+        }
+    }
+};
+
         char * stage_host = (char *) moe_doorbell_stage_host();
         const size_t stride = moe_doorbell_stage_stride();
         const int stage_cap = moe_doorbell_stage_cap();
@@ -404,6 +493,7 @@ static void start_doorbell_worker(llama_context * ctx) {
             return;
         }
         int fd_gguf = -1;
+        moe_dma_trace dma_trace;
         if (!ctx->pager.pack_mode()) {
             fd_gguf = open(ctx->pager.path(), O_RDONLY);
         }
@@ -833,6 +923,21 @@ static void start_doorbell_worker(llama_context * ctx) {
                 misses.clear();
                 misses.reserve((size_t) n);
                 for (int j = 0; j < n; ++j) {
+                const bool trace_decode = dma_trace.enabled && n == n_used && moe_phase_tg(ctx);
+                moe_dma_trace::activity_scope activity(trace_decode ? dma_trace.activity_phase : nullptr);
+                bool trace_sample = false;
+                if (dma_trace.enabled) {
+                    const uint64_t observed = moe_prof_now();
+                    if (trace_decode && dma_trace.previous_layer + 1 == il && dma_trace.published_us) {
+                        ++dma_trace.adjacent;
+                        dma_trace.adjacent_us += observed - dma_trace.published_us;
+                    }
+                    dma_trace.previous_layer = trace_decode ? il : -2;
+                    dma_trace.published_us = 0;
+                    dma_trace.collect();
+                    trace_sample = trace_decode && ((dma_trace.plans++ & 15) == 0) && dma_trace.timed;
+                }
+
                     const int32_t e = pl->sel[j];
                     sel[(size_t) j] = e;
                     if (e < 0 || e >= n_exp) continue;
@@ -952,9 +1057,13 @@ static void start_doorbell_worker(llama_context * ctx) {
                     }
                     is_cold.push_back((char) cold);
                     if (ctx->pager.pack_mode()) {
+                                auto * slot_trace = trace_sample && ncopy < 10 ? &dma_trace.slots[ncopy] : nullptr;
+                                auto d2h = static_cast<cudaStream_t>(ctx->moe.d2h_stream);
+                                const bool started = slot_trace && dma_trace.record(slot_trace->d0, d2h);
                         const moe_pager::moe_pack_loc loc = ctx->pager.pack_loc(il, e);
                         locs.push_back(loc);
                         pl->copy_pre[ncopy] = loc.pre;
+                                if (started && admev) slot_trace->download = dma_trace.record(slot_trace->d1, d2h);
                         static int demand_buf = -1, demand_direct = -1;
                     if (demand_buf < 0) { const char * e = getenv("MOE_DEMAND_BUF"); demand_buf = (e && atoi(e) != 0) ? 1 : 0; }
                     if (demand_direct < 0) { const char * e = getenv("MOE_DEMAND_DIRECT"); demand_direct = (e && atoi(e) != 0) ? 1 : 0; }
@@ -1057,9 +1166,19 @@ static void start_doorbell_worker(llama_context * ctx) {
                         // guard #1: never overwrite the VRAM slot while the
                         // victim-cache DtoH is still reading it
                         const size_t gv = (size_t) base + (size_t) pl->copy_slot[ci];
-                        if (gv < ctx->moe.d2h_ev_of_v.size() && ctx->moe.d2h_ev_of_v[gv]) {
-                            void * h2d_stream = moe_doorbell_dma_h2d_stream();
-                            if (h2d_stream) cudaStreamWaitEvent((cudaStream_t) h2d_stream, (cudaEvent_t) ctx->moe.d2h_ev_of_v[gv], 0);
+                        const auto stream = static_cast<cudaStream_t>(moe_doorbell_dma_h2d_stream());
+                        const auto victim_event = gv < ctx->moe.d2h_ev_of_v.size() ?
+                            static_cast<cudaEvent_t>(ctx->moe.d2h_ev_of_v[gv]) : nullptr;
+                        auto * slot_trace = trace_sample && ci < 10 && stream ? &dma_trace.slots[ci] : nullptr;
+                        if (slot_trace && victim_event) slot_trace->waited = dma_trace.record(slot_trace->h0, stream);
+                        if (victim_event) {
+                            if (trace_decode && stream) {
+                                ++dma_trace.waits;
+                                const auto state = cudaEventQuery(victim_event);
+                                if (state == cudaErrorNotReady) ++dma_trace.not_ready;
+                                else if (state != cudaSuccess) ++dma_trace.query_errors;
+                            }
+                            if (stream) cudaStreamWaitEvent(stream, victim_event, 0);
                             ctx->moe.d2h_ev_of_v[gv] = nullptr;
                         }
                         const bool submitted = cached ? moe_doorbell_dma_submit_from(il, ci, cached)
@@ -1070,6 +1189,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                             dma_bytes += gb + ub + db;
                         }
                     }
+                if (trace_decode) dma_trace.published_us = moe_prof_now();
                     pl->copy_ready[ci] = 1;
 #if defined(__x86_64__) || defined(_M_X64)
                     _mm_sfence(); // push the store out for the UVA/PCIe readers (KICK kernel polls copy_ready)
@@ -1089,8 +1209,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                             posix_fadvise(l.fd, (off_t) l.off, (off_t) l.len, POSIX_FADV_DONTNEED);
                         }
                     }
+                        const bool started = slot_trace && dma_trace.record(slot_trace->h1, stream);
                 };
                 auto fail_ci = [&](int ci) {
+                        if (started && submitted) slot_trace->upload = dma_trace.record(slot_trace->h2, stream);
                     if (done[(size_t) ci]) return;
                     failed++;
                     GGML_ABORT("demand expert read failed: layer=%d expert=%d; refusing incomplete weights", il, misses[(size_t) ci]);
@@ -1390,6 +1512,10 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 const int32_t e = (int32_t) dbs[il].pred_next[pi];
                                 if (e < 0 || e >= n_exp) continue;
                                 if (ctx->moe.slot_of[(size_t) tgt * n_exp + e] >= 0) {
+                    const bool trace_direct = trace_decode && !works.empty() &&
+                        std::all_of(works.begin(), works.end(), [&](const SqeWork & work) { return work.fd == ctx->pager.pack_fd(); });
+                    int traced_qd = 0;
+                    uint64_t traced_submit_us = 0;
                                     if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
                                     continue;
                                 }
@@ -1401,10 +1527,17 @@ static void start_doorbell_worker(llama_context * ctx) {
                                 for (int z = 0; z < 8; z++) {
                                     spec_ready[z] = false;
                                     spec_lengths[z] = 0;
+                            if (trace_direct && r <= 10) {
+                                ++dma_trace.depths[r].submits;
+                                traced_qd = submitted == 0 && r == n_sqe ? r : 0;
+                                traced_submit_us = (uint64_t) t_submit0;
+                                if (!traced_submit_us) traced_submit_us = moe_prof_now();
+                            }
                                     spec_got_bytes[z] = 0;
                                     spec_got_roles[z] = 0;
                                     spec_got_cancel[z] = 0;
                                 }
+                    if (trace_direct && !traced_qd) ++dma_trace.qd_split;
                                 spec_experts[selected] = e;
                                 const auto submit_started = std::chrono::steady_clock::now();
                                 int n_sqe = 0;
@@ -1632,6 +1765,13 @@ static void start_doorbell_worker(llama_context * ctx) {
                                     memcpy(it.dst, sp.bounce + (it.foff - sp.fbeg), it.len);
                                 } else {
                                     // failed/short span read: retry this item synchronously
+                        if (traced_qd && ready == 0) {
+                            auto & bucket = dma_trace.depths[traced_qd];
+                            const uint64_t done_us = moe_prof_now();
+                            ++bucket.reads;
+                            if (t_cq0) bucket.cqe_us += done_us - (uint64_t) t_cq0;
+                            bucket.submit_to_reap_us += done_us - traced_submit_us;
+                        }
                                     const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) it.ci]);
                                     const int kfd = s[it.r].fd >= 0 ? s[it.r].fd : fd_gguf;
                                     const size_t want = exp_len[(size_t) it.ci * 3 + (size_t) it.r];
