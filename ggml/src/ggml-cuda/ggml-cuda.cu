@@ -5384,6 +5384,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     bool                         should_launch_concurrent_events = false;
     bool                         generic_concurrency = false;
     int                          gdn_forks = 0;
+    int                          gdn_regions = 0;
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
@@ -5423,6 +5424,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
                     should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
                     generic_concurrency |= !event.gdn_projection;
+                    if (event.gdn_projection) ++gdn_regions;
                 }
             }
 
@@ -5627,9 +5629,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
             ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
-            if (gdn_forks) {
-                GGML_LOG_INFO("[moe_gdn_overlap] captured %d projection fork/join pairs in %zu CUDA graph chunks\n",
-                        gdn_forks, n_chunks);
+            if (gdn_regions) {
+                static const bool verbose = [] {
+                    const char * env = getenv("MOE_IO_DIAG");
+                    return env && atoi(env) != 0;
+                }();
+                if (verbose) {
+                    fprintf(stderr, "[moe_gdn_overlap] captured %d/%d projection fork/join pairs in %zu CUDA graph chunks\n",
+                            gdn_forks, gdn_regions, n_chunks);
+                } else {
+                    GGML_LOG_INFO("[moe_gdn_overlap] captured %d/%d projection fork/join pairs in %zu CUDA graph chunks\n",
+                            gdn_forks, gdn_regions, n_chunks);
+                }
             }
 
             // drop the chunks left over from a longer graph
