@@ -2717,6 +2717,153 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+static ggml_cuda_moe_expert_pp_fetch_t ggml_cuda_moe_expert_pp_fetch = nullptr;
+
+void ggml_cuda_moe_expert_pp_register(ggml_cuda_moe_expert_pp_fetch_t fetch) {
+    ggml_cuda_moe_expert_pp_fetch = fetch;
+}
+
+static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+static void ggml_cuda_moe_expert_pp(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    constexpr int slots = 32;
+    constexpr int expert_count = 512;
+    constexpr size_t stage_bytes = (slots + 1) * 2176000;
+    const auto stream = ctx.stream();
+    auto * input = dst->src[0];
+    auto * routes = dst->src[1];
+    auto * weights = dst->src[2];
+    ggml_tensor * hot[3] = {dst->src[3], dst->src[4], dst->src[5]};
+    const auto * table = dst->src[6];
+    const int sentinel = (int) hot[0]->ne[2] - 1;
+    const int nk = (int) routes->ne[0];
+    const int nt = (int) routes->ne[1];
+    const int total = nk * nt;
+    const int64_t embd = input->ne[0];
+    const int64_t ff = hot[0]->ne[1];
+    const float limit = ggml_get_op_params_f32(dst, 1);
+    GGML_ASSERT(ggml_cuda_moe_expert_pp_fetch && table->ne[0] * table->ne[1] == expert_count);
+    GGML_ASSERT(nk == 10 && nt >= 2 && nt <= 64 && sentinel > 0);
+
+    std::vector<int32_t> route_ids(total);
+    std::array<int32_t, expert_count> resident;
+    CUDA_CHECK(cudaMemcpyAsync(route_ids.data(), routes->data, ggml_nbytes(routes), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(resident.data(), table->data, sizeof(resident), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::array<bool, expert_count> needed{};
+    for (int e : route_ids) {
+        GGML_ASSERT(e >= 0 && e < expert_count && resident[e] >= 0 && resident[e] <= sentinel);
+        if (resident[e] == sentinel) needed[e] = true;
+    }
+    std::vector<int32_t> cold;
+    std::array<int, expert_count> cold_pos{};
+    for (int e = 0; e < expert_count; ++e) {
+        if (!needed[e]) continue;
+        cold_pos[e] = (int) cold.size();
+        cold.push_back(e);
+    }
+
+    ggml_cuda_pool_alloc<char> stage(ctx.pool(), stage_bytes);
+    ggml_cuda_pool_alloc<float> output(ctx.pool(), total * embd);
+    ggml_cuda_pool_alloc<float> x(ctx.pool(), total * embd);
+    ggml_cuda_pool_alloc<float> g(ctx.pool(), total * ff);
+    ggml_cuda_pool_alloc<float> u(ctx.pool(), total * ff);
+    ggml_cuda_pool_alloc<float> act(ctx.pool(), total * ff);
+    ggml_cuda_pool_alloc<float> y(ctx.pool(), total * embd);
+    ggml_cuda_pool_alloc<int32_t> ids(ctx.pool(), total * 3);
+
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> scratch(
+        ggml_init({32 * ggml_tensor_overhead(), nullptr, true}), ggml_free);
+    auto * meta = scratch.get();
+    GGML_ASSERT(meta);
+    ggml_tensor * staged[3];
+    size_t offset = 0;
+    for (int role = 0; role < 3; ++role) {
+        const auto * source = hot[role];
+        auto * t = ggml_new_tensor_3d(meta, source->type, source->ne[0], source->ne[1], slots + 1);
+        GGML_ASSERT(t->nb[2] == source->nb[2] && offset + ggml_nbytes(t) <= stage_bytes);
+        t->buffer = source->buffer;
+        t->data = stage.get() + offset;
+        CUDA_CHECK(cudaMemsetAsync((char *) t->data + slots * t->nb[2], 0, t->nb[2], stream));
+        offset += ggml_nbytes(t);
+        staged[role] = t;
+    }
+    auto run = [&](ggml_tensor * op, void * data) {
+        op->data = data;
+        GGML_ASSERT(ggml_cuda_compute_forward(ctx, op));
+        return op;
+    };
+
+    auto evaluate = [&](ggml_tensor * const * matrices, int first, int count) {
+        std::array<int32_t, 640> token_ids, slot_ids, output_ids;
+        int rows = 0;
+        for (int route = 0; route < total; ++route) {
+            const int e = route_ids[route];
+            const bool hit = resident[e] != sentinel;
+            const int pos = cold_pos[e];
+            if (first < 0 ? !hit : (hit || pos < first || pos >= first + count)) continue;
+            token_ids[rows] = route / nk;
+            slot_ids[rows] = first < 0 ? resident[e] : pos - first;
+            GGML_ASSERT(slot_ids[rows] >= 0 && slot_ids[rows] < matrices[0]->ne[2] - 1);
+            output_ids[rows++] = route;
+        }
+        if (!rows) return;
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> batch(
+            ggml_init({24 * ggml_tensor_overhead(), nullptr, true}), ggml_free);
+        auto * m = batch.get();
+        auto * tokens = ggml_new_tensor_1d(m, GGML_TYPE_I32, rows);
+        auto * slots_ = ggml_new_tensor_2d(m, GGML_TYPE_I32, 1, rows);
+        auto * positions = ggml_new_tensor_1d(m, GGML_TYPE_I32, rows);
+        tokens->data = ids.get();
+        slots_->data = ids.get() + total;
+        positions->data = ids.get() + 2 * total;
+        CUDA_CHECK(cudaMemcpyAsync(tokens->data, token_ids.data(), ggml_nbytes(tokens), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(slots_->data, slot_ids.data(), ggml_nbytes(slots_), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(positions->data, output_ids.data(), ggml_nbytes(positions), cudaMemcpyHostToDevice, stream));
+        auto * gathered = run(ggml_get_rows(m, input, tokens), x.get());
+        gathered = ggml_reshape_3d(m, gathered, embd, 1, rows);
+        auto * gate = run(ggml_mul_mat_id(m, matrices[0], gathered, slots_), g.get());
+        auto * up = run(ggml_mul_mat_id(m, matrices[1], gathered, slots_), u.get());
+        ggml_tensor * activated;
+        if (limit > 1e-6f) {
+            up = run(ggml_clamp(m, up, -limit, limit), u.get());
+            auto * silu = run(ggml_silu(m, gate), act.get());
+            silu = run(ggml_clamp(m, silu, -INFINITY, limit), act.get());
+            activated = run(ggml_mul(m, silu, up), g.get());
+        } else {
+            activated = run(ggml_swiglu_split(m, gate, up), act.get());
+        }
+        auto * down = run(ggml_mul_mat_id(m, matrices[2], activated, slots_), y.get());
+        auto * full = ggml_new_tensor_2d(m, GGML_TYPE_F32, embd, total);
+        full->data = output.get();
+        run(ggml_set_rows(m, full, ggml_reshape_2d(m, down, embd, rows), positions), output.get());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    };
+
+    evaluate(hot, -1, 0);
+    const int il = ggml_get_op_params_i32(dst, 0);
+    for (int first = 0; first < (int) cold.size(); first += slots) {
+        const int count = std::min(slots, (int) cold.size() - first);
+        if (!ggml_cuda_moe_expert_pp_fetch(stream, il, cold.data() + first, count,
+                staged[0]->data, staged[0]->nb[2], staged[1]->data, staged[1]->nb[2],
+                staged[2]->data, staged[2]->nb[2])) {
+            GGML_ABORT("expert prefill read or transfer failed at layer %d", il);
+        }
+        evaluate(staged, first, count);
+    }
+
+    auto * full = ggml_new_tensor_3d(meta, GGML_TYPE_F32, embd, nk, nt);
+    full->data = output.get();
+    auto * weighted = run(ggml_mul(meta, full, weights), x.get());
+    ggml_tensor * sum = nullptr;
+    for (int rank = 0; rank < nk; ++rank) {
+        auto * row = ggml_view_2d(meta, weighted, embd, nt, weighted->nb[2], rank * weighted->nb[1]);
+        sum = sum ? run(ggml_add(meta, sum, row),
+                rank == nk - 1 ? dst->data : (rank % 2 ? y.get() : output.get())) : row;
+    }
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -3043,6 +3190,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_MOE_EXPERT_PP:
+            ggml_cuda_moe_expert_pp(ctx, dst);
+            break;
         case GGML_OP_MOE_SLOT_RESOLVE:
         case GGML_OP_MOE_SLOT_RESOLVE_KICK:
         case GGML_OP_MOE_SLOT_RESOLVE_WAIT:
@@ -3265,7 +3415,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
-        if (node->op == GGML_OP_MOE_SLOT_RESOLVE) {
+        if (node->op == GGML_OP_MOE_SLOT_RESOLVE || node->op == GGML_OP_MOE_EXPERT_PP) {
             use_cuda_graph = false;
         }
         if ((node->op == GGML_OP_MOE_SLOT_RESOLVE_KICK || node->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT ||
@@ -6776,6 +6926,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_MOE_EXPERT_PP:
+            return ggml_cuda_moe_expert_pp_fetch != nullptr;
         case GGML_OP_MOE_SLOT_RESOLVE:
             return op->src[0]->type == GGML_TYPE_I32 && op->src[1]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_I32;

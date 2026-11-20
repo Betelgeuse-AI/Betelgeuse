@@ -1864,9 +1864,40 @@ static void moe_slot_resolve_sync(
     int32_t op,
     int32_t count);
 
+static bool moe_expert_pp_fetch(void * stream, int il, const int32_t * experts, int count,
+        void * gate, size_t gb, void * up, size_t ub, void * down, size_t db) {
+    auto * ctx = g_moe_resolve_ctx;
+    if (!ctx || !ctx->pager.pack_mode() || count < 1 || count > 32) return false;
+    moe_batch_target targets[32];
+    for (int i = 0; i < count; ++i) {
+        targets[i] = {experts[i], (char *) gate + i * gb, gb, (char *) up + i * ub, ub,
+                      (char *) down + i * db, db};
+    }
+    uint64_t wait_us = 0;
+    const bool profile = moe_prof_enabled();
+    const int64_t start = profile ? moe_prof_now() : 0;
+    const long reads_before = ctx->pager.stats_io_ops();
+    const long bytes_before = ctx->pager.stats_io_bytes();
+    const long hits_before = ctx->pager.stats_cache_hit();
+    if (!ctx->pager.fetch_prefill(il, targets, count, stream, wait_us)) return false;
+    if (profile) {
+        const uint64_t elapsed = (uint64_t) (moe_prof_now() - start);
+        const long reads = ctx->pager.stats_io_ops() - reads_before;
+        const long bytes = ctx->pager.stats_io_bytes() - bytes_before;
+        g_moe_prof.pp_nvme_cqe_wait_us += wait_us;
+        g_moe_prof.nvme_cqe_wait_us += wait_us;
+        g_moe_prof.pp_nvme_us += elapsed;
+        g_moe_prof.nvme_us += elapsed;
+        fprintf(stderr, "[moe_expert_pp_fetch] layer=%d count=%d host_hits=%ld reads=%ld bytes=%ld nvme_cqe_wait_us=%llu\n",
+                il, count, ctx->pager.stats_cache_hit() - hits_before, reads, bytes, (unsigned long long) wait_us);
+    }
+    return true;
+}
+
 static void moe_slot_resolve_register_ctx(llama_context * ctx) {
     g_moe_resolve_ctx = ctx;
     ggml_cuda_moe_slot_resolve_register(moe_slot_resolve_sync);
+    ggml_cuda_moe_expert_pp_register(moe_expert_pp_fetch);
 }
 
 static void moe_slot_resolve_sync(
@@ -2721,6 +2752,10 @@ llama_context::llama_context(
 
     cparams.moe_direct_io = params.moe_direct_io;
     cparams.moe_slots     = params.moe_slots;
+    const char * expert_pp = getenv("MOE_EXPERT_PP");
+    cparams.moe_expert_pp = params.moe_direct_io && params.moe_pack_dir &&
+        model.arch == LLM_ARCH_QWEN4EXP && hparams.n_expert == 512 && hparams.n_expert_used() == 10 &&
+        model.n_gpu_layers() >= hparams.n_layer() && (!expert_pp || atoi(expert_pp) != 0);
     cparams.moe_pack_dir  = params.moe_pack_dir;
     cparams.moe_chunk_max = params.moe_chunk_max;
     cparams.moe_gguf_path = params.moe_gguf_path;
@@ -2922,7 +2957,7 @@ llama_context::llama_context(
             min_slots = std::min(min_slots, moe_get_layer_slots(il, n_layer));
         }
         const uint32_t safe = (uint32_t) std::max(1, min_slots / n_used);
-        if (cparams.n_ubatch > safe) {
+        if (!cparams.moe_expert_pp && cparams.n_ubatch > safe) {
             LLAMA_LOG_INFO("%s: moe slot pool caps n_ubatch at %u (requested %u, min slots %d, top-k %d)\n",
                     __func__, safe, cparams.n_ubatch, min_slots, n_used);
             cparams.n_ubatch = safe;
@@ -3104,6 +3139,7 @@ llama_context::llama_context(
                     std::string idx = dir + "/native_experts.txt";
                     std::string e2;
                     if (!pager.use_pack(bin.c_str(), idx.c_str(), e2)) {
+                        if (cparams.moe_expert_pp) throw std::runtime_error(e2);
                         LLAMA_LOG_WARN("%s: moe pack OFF: %s\n", __func__, e2.c_str());
                     } else {
                         LLAMA_LOG_INFO("%s: moe pack ON: one blob read per expert (%d layers x %d experts)\n",

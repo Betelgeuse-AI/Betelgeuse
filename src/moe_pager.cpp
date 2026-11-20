@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -31,6 +32,11 @@ static double now_s() {
 }
 
 moe_pager::~moe_pager() {
+    if (prefill_ring_) {
+        auto * ring = static_cast<io_uring *>(prefill_ring_);
+        io_uring_queue_exit(ring);
+        delete ring;
+    }
     if (ring_) { io_uring_queue_exit((struct io_uring *) ring_); ring_ = nullptr; }
     for (int k = 0; k < NSTAGE; k++) {
         if (stage_ev_[k]) {
@@ -1315,6 +1321,91 @@ bool moe_pager::fetch(int il, int e, void * dst_gate, size_t gate_bytes,
                                 void * dst_down,   size_t down_bytes) {
     std::lock_guard<std::mutex> lock(mtx_);
     return commit_locked(il, e, dst_gate, gate_bytes, dst_up, up_bytes, dst_down, down_bytes);
+}
+
+bool moe_pager::fetch_prefill(int il, const moe_batch_target * targets, int count, void * stream, uint64_t & wait_us) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!pack_mode_ || !stage_ || !stream || count < 1 || count > 32 ||
+            il < 0 || il >= n_layer_ || free_demand_.size() < (size_t) count) return false;
+    if (!prefill_ring_) {
+        auto * ring = new io_uring{};
+        if (io_uring_queue_init(32, ring, 0) < 0) {
+            delete ring;
+            return false;
+        }
+        prefill_ring_ = ring;
+    }
+    auto * ring = static_cast<io_uring *>(prefill_ring_);
+    auto ws = static_cast<cudaStream_t>(stream);
+    int stages[32];
+    int n_read = 0;
+    bool ok = true;
+    for (int i = 0; i < count; ++i) {
+        const auto & t = targets[i];
+        const auto * rb = &role_bytes_[(size_t) il * 3];
+        if (t.expert < 0 || t.expert >= n_expert_ ||
+                t.gate_bytes != rb[0] || t.up_bytes != rb[1] || t.down_bytes != rb[2]) return false;
+    }
+    auto copy = [&](int i, const char * src, const uint32_t * offsets) {
+        const auto & t = targets[i];
+        ok &= cudaMemcpyAsync(t.dst_gate, src + offsets[0], t.gate_bytes, cudaMemcpyHostToDevice, ws) == cudaSuccess;
+        ok &= cudaMemcpyAsync(t.dst_up, src + offsets[1], t.up_bytes, cudaMemcpyHostToDevice, ws) == cudaSuccess;
+        ok &= cudaMemcpyAsync(t.dst_down, src + offsets[2], t.down_bytes, cudaMemcpyHostToDevice, ws) == cudaSuccess;
+    };
+    for (int i = 0; i < count; ++i) {
+        stages[i] = -1;
+        const auto & t = targets[i];
+        const size_t key = (size_t) il * n_expert_ + t.expert;
+        const int slot = cache_ ? cache_idx_[key] : -1;
+        if (slot >= 0 && (cache_state_[slot] == 2 ||
+                (cache_state_[slot] == 1 && cache_ev_[slot] && cudaEventQuery(cache_ev_[slot]) == cudaSuccess))) {
+            const uint32_t offsets[] = {0, (uint32_t) t.gate_bytes, (uint32_t) (t.gate_bytes + t.up_bytes)};
+            copy(i, cache_ + cache_off_[slot], offsets);
+            ++n_cache_hit_;
+            continue;
+        }
+        const auto & slice = slices(il, t.expert)[0];
+        const int stage = free_demand_[free_demand_.size() - 1 - (size_t) n_read++];
+        stages[i] = stage;
+        sync_stage(stage);
+        auto * sqe = io_uring_get_sqe(ring);
+        GGML_ASSERT(sqe);
+        io_uring_prep_read(sqe, fd_pack_, stage_ + (size_t) stage * stage_bytes_, slice.len, slice.off);
+        io_uring_sqe_set_data64(sqe, (uint64_t) i);
+        ++io_ops_;
+        ++n_pack_reads_;
+        io_bytes_ += slice.len;
+    }
+    for (int submitted = 0; submitted < n_read;) {
+        const int n = io_uring_submit(ring);
+        if (n == -EINTR) continue;
+        if (n <= 0) return false;
+        submitted += n;
+    }
+    for (int done = 0; done < n_read; ++done) {
+        struct io_uring_cqe * cqe = nullptr;
+        const double started = now_s();
+        int rc;
+        do {
+            rc = io_uring_wait_cqe(ring, &cqe);
+        } while (rc == -EINTR);
+        wait_us += (uint64_t) ((now_s() - started) * 1e6);
+        if (rc < 0) return false;
+        const uint64_t i = io_uring_cqe_get_data64(cqe);
+        const int bytes = cqe->res;
+        io_uring_cqe_seen(ring, cqe);
+        if (i >= (uint64_t) count || stages[i] < 0 ||
+                bytes != (int) slices(il, targets[i].expert)[0].len) {
+            ok = false;
+            continue;
+        }
+        const size_t key = (size_t) il * n_expert_ + targets[i].expert;
+        copy((int) i, stage_ + (size_t) stages[i] * stage_bytes_, &bsrc_[key * 3]);
+    }
+    // Keep the host cache and staging sources pinned until all copies finish.
+    ok &= cudaStreamSynchronize(ws) == cudaSuccess;
+    if (!ok) ++n_io_fail_;
+    return ok;
 }
 
 bool moe_pager::fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream, bool sync_gpu) {

@@ -72,6 +72,12 @@ typedef void (*ggml_cuda_moe_slot_resolve_fn_t)(
 
 GGML_BACKEND_API void ggml_cuda_moe_slot_resolve_register(ggml_cuda_moe_slot_resolve_fn_t fn);
 
+typedef bool (*ggml_cuda_moe_expert_pp_fetch_t)(
+    void * stream, int layer, const int32_t * experts, int count,
+    void * gate, size_t gate_stride, void * up, size_t up_stride, void * down, size_t down_stride);
+
+GGML_BACKEND_API void ggml_cuda_moe_expert_pp_register(ggml_cuda_moe_expert_pp_fetch_t fetch);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

@@ -2460,6 +2460,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
     }
+    const bool expert_pp = cparams.moe_expert_pp && moe_use_pool && n_tokens > 1;
+    if (expert_pp) {
+        GGML_ASSERT(!weight_before_ffn && type_op == LLM_FFN_SILU && loras->empty());
+        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm);
+    }
     if (moe_use_pool) {
         gate_up_exps = nullptr;
         gate_exps = (ggml_tensor *) moe_gate[il];
@@ -2472,6 +2477,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         if (slot_ids_in) {
             GGML_ASSERT(n_tokens == 1 && ggml_are_same_shape(slot_ids_in, selected_experts));
+        } else if (expert_pp) {
+            // The expert-centric op resolves the entire batch.
         } else if (doorbell == 1 && n_tokens >= 1) {
             const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
             ggml_tensor * sel_c = ggml_cont(ctx0, selected_experts);
@@ -2530,6 +2537,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (!weights_in && w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
+    }
+
+    if (expert_pp) {
+        auto * out = ggml_moe_expert_pp(ctx0, ggml_cont(ctx0, cur), ggml_cont(ctx0, selected_experts),
+                ggml_cont(ctx0, weights), gate_exps, up_exps, down_exps, (ggml_tensor *) moe_table[il],
+                il, hparams.swiglu_clamp_exp[il]);
+        cb(out, "ffn_moe_out", il);
+        return out;
     }
 
     //call early so that topk-moe can be used

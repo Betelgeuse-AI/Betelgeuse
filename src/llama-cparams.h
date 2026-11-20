@@ -71,6 +71,7 @@ struct llama_cparams {
 
     bool         moe_direct_io = false;
     int32_t      moe_slots     = 4096;
+    bool         moe_expert_pp = false;
     const char * moe_pack_dir  = nullptr; // expert pack dir (experts.bin + native_experts.txt)
     const char * moe_gguf_path = nullptr;
     const char * moe_profile_path = nullptr; // optional hot profile (null = built-in)

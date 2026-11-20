@@ -79,6 +79,7 @@ public:
     // DMAs each expert as its CQE arrives; slots are recycled via the stage_ev_
     // event FIFO, so the host never blocks on ws mid-batch. sync_gpu defaults
     // off; pass true to keep the old mid-batch stream synchronize.
+    bool fetch_prefill(int il, const moe_batch_target * targets, int count, void * stream, uint64_t & wait_us);
     bool fetch_batch(int il, const moe_batch_target * targets, int n_targets, void * stream = nullptr, bool sync_gpu = false);
 
     bool fetch_direct_io(int il, int e, void * dst_gate, size_t gate_bytes,
@@ -242,6 +243,7 @@ private:
     std::vector<uint16_t> exp_freq_;
     std::vector<unsigned> cache_freq_tokens_;
     void * ring_ = nullptr;
+    void * prefill_ring_ = nullptr;
     long io_ops_ = 0, io_bytes_ = 0, n_io_fail_ = 0;
     long n_pf_issued_ = 0, n_pf_hit_ = 0;
 

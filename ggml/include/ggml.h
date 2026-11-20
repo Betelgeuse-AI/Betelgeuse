@@ -433,6 +433,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_EXPERT_PP,
+
         GGML_OP_COUNT,
     };
 
@@ -2521,6 +2523,12 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+    GGML_API struct ggml_tensor * ggml_moe_expert_pp(
+            struct ggml_context * ctx, struct ggml_tensor * input,
+            struct ggml_tensor * routes, struct ggml_tensor * weights,
+            struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down,
+            struct ggml_tensor * table, int32_t layer, float clamp);
+
     GGML_API struct ggml_tensor * ggml_moe_slot_resolve(
             struct ggml_context * ctx,
             struct ggml_tensor  * topk,

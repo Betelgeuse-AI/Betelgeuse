@@ -1116,9 +1116,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "MOE_EXPERT_PP",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1233,9 +1234,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "moe_expert_pp(x, routes, weights)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6592,6 +6594,29 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[3] = blocks;
     result->src[4] = extra;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_expert_pp(
+        struct ggml_context * ctx, struct ggml_tensor * input,
+        struct ggml_tensor * routes, struct ggml_tensor * weights,
+        struct ggml_tensor * gate, struct ggml_tensor * up, struct ggml_tensor * down,
+        struct ggml_tensor * table, int32_t layer, float clamp) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && ggml_is_contiguous(input));
+    GGML_ASSERT(routes->type == GGML_TYPE_I32 && ggml_is_contiguous(routes));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(routes->ne[1] == input->ne[1] && routes->ne[1] <= 64);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input->ne[0], input->ne[1]);
+    result->op = GGML_OP_MOE_EXPERT_PP;
+    result->src[0] = input;
+    result->src[1] = routes;
+    result->src[2] = weights;
+    result->src[3] = gate;
+    result->src[4] = up;
+    result->src[5] = down;
+    result->src[6] = table;
+    ggml_set_op_params_i32(result, 0, layer);
+    ggml_set_op_params_f32(result, 1, clamp);
     return result;
 }
 
