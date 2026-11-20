@@ -2460,7 +2460,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
     }
-    const bool expert_pp = cparams.moe_expert_pp && moe_use_pool && n_tokens > 1;
+    const bool expert_pp = cparams.moe_expert_pp && moe_use_pool && ubatch.n_tokens > 1;
     if (expert_pp) {
         GGML_ASSERT(!weight_before_ffn && type_op == LLM_FFN_SILU && loras->empty());
         GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s && !post_exp_norm);

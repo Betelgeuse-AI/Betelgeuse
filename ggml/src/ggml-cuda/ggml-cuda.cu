@@ -2743,7 +2743,7 @@ static void ggml_cuda_moe_expert_pp(ggml_backend_cuda_context & ctx, ggml_tensor
     const int64_t ff = hot[0]->ne[1];
     const float limit = ggml_get_op_params_f32(dst, 1);
     GGML_ASSERT(ggml_cuda_moe_expert_pp_fetch && table->ne[0] * table->ne[1] == expert_count);
-    GGML_ASSERT(nk == 10 && nt >= 2 && nt <= 64 && sentinel > 0);
+    GGML_ASSERT(nk == 10 && nt >= 1 && nt <= 64 && sentinel > 0);
 
     std::vector<int32_t> route_ids(total);
     std::array<int32_t, expert_count> resident;
