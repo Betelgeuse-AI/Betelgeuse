@@ -2755,7 +2755,7 @@ llama_context::llama_context(
     const char * expert_pp = getenv("MOE_EXPERT_PP");
     cparams.moe_expert_pp = params.moe_direct_io && params.moe_pack_dir &&
         model.arch == LLM_ARCH_QWEN4EXP && hparams.n_expert == 512 && hparams.n_expert_used() == 10 &&
-        model.n_gpu_layers() >= hparams.n_layer() && (!expert_pp || atoi(expert_pp) != 0);
+        model.n_gpu_layers() >= hparams.n_layer() && expert_pp && atoi(expert_pp) != 0;
     cparams.moe_pack_dir  = params.moe_pack_dir;
     cparams.moe_chunk_max = params.moe_chunk_max;
     cparams.moe_gguf_path = params.moe_gguf_path;
