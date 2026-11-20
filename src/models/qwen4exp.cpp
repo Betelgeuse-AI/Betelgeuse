@@ -705,7 +705,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     if (model.layers[il].wqkv_z) {
         // qkv and z read the same input: one matmul, then the qkv rows and the z rows
         ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
-        cb(qkvz, "linear_attn_qkvz", il);
+        cb(qkvz, "gdn_qkvz_proj", il);
 
         const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
         const int64_t n_qkv = qkvz->ne[0] - n_z;
@@ -720,6 +720,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     }
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    cb(qkv_mixed, "gdn_qkv_proj", il);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
@@ -1139,7 +1140,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     if (model.layers[il].ssm_beta_alpha_cat) {
         // beta and alpha read the same input: one matmul, then the beta rows and the alpha rows
         ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
-        cb(ba, "beta_alpha", il);
+        cb(ba, "gdn_beta_alpha_proj", il);
 
         beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
                 ggml_element_size(ba), ba->nb[1], ba->nb[1] * n_seq_tokens, 0);
@@ -1147,13 +1148,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
                 ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
     } else {
         beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+        cb(beta, "gdn_beta_proj", il);
         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
 
         alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        cb(alpha, "gdn_alpha_proj", il);
         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     }
     cb(beta, "beta", il);
     cb(alpha, "alpha", il);
+
+    static const bool gdn_overlap = [] {
+        const char * env = getenv("MOE_GDN_OVERLAP");
+        return !env || atoi(env) != 0;
+    }();
+    if (gdn_overlap && cparams.moe_direct_io && ubatch.n_tokens == 1) {
+        // Keep the independent projections together for CUDA stream scheduling.
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, alpha);
+    }
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);

@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <climits>
 #include <fcntl.h>
+#include <fstream>
 #include <dlfcn.h>
 #include <map>
 #include <mutex>
@@ -50,6 +51,30 @@ static thread_local double moe_diag_publish_ms = 0.0;
 #include <vector>
 #include <csignal>
 #include <execinfo.h>
+
+static void moe_startup_memory(const char * stage) {
+    const char * env = getenv("MOE_IO_DIAG");
+    if (!env || atoi(env) == 0) return;
+    std::ifstream membership("/proc/self/cgroup");
+    for (std::string line; std::getline(membership, line);) {
+        if (line.compare(0, 3, "0::") != 0) continue;
+        const std::string root = "/sys/fs/cgroup" + line.substr(3);
+        uint64_t current = 0, peak = 0, file = 0, anon = 0;
+        if (!(std::ifstream(root + "/memory.current") >> current)) return;
+        std::ifstream(root + "/memory.peak") >> peak;
+        std::ifstream stat(root + "/memory.stat");
+        for (std::string name; stat >> name;) {
+            uint64_t value;
+            if (!(stat >> value)) break;
+            if (name == "anon") anon = value;
+            if (name == "file") file = value;
+        }
+        fprintf(stderr, "[moe_startup_ram] %s current=%llu peak=%llu anon=%llu file=%llu\n", stage,
+                (unsigned long long) current, (unsigned long long) peak,
+                (unsigned long long) anon, (unsigned long long) file);
+        return;
+    }
+}
 
 // MOE_CRASH_TRACE=1 installs SIGSEGV/SIGABRT handlers that write raw frame
 // addresses to stderr with no heap allocation; gdb/addr2line resolve them.
@@ -3436,12 +3461,26 @@ llama_context::llama_context(
                         const char * stage_env = getenv("MOE_PAGER_STAGES");
                         const int pager_stages = stage_env && atoi(stage_env) > 0 ? std::max(64, std::min(384, atoi(stage_env))) : (demand_only ? 64 : 384);
                         LLAMA_LOG_INFO("%s: moe pager staging %d slots (64 demand)\n", __func__, pager_stages);
+                        moe_startup_memory("before_model_page_release");
+                        model.audit_residency();
+                        model.advise_mmap_random();
+                        const char * drop_env = getenv("MOE_DROP_MMAP");
+                        const char * direct_env = getenv("MOE_DEMAND_DIRECT");
+                        const bool drop_mmap = drop_env ? atoi(drop_env) != 0 :
+                            demand_only && direct_env && atoi(direct_env) != 0;
+                        const size_t dropped = drop_mmap ? model.drop_mmap_cache() :
+                            model.drop_mmap_cache_tensor(model.per_layer_tok_embd);
+                        const bool dropped_backing = drop_mmap && pager.pack_mode() && pager.drop_gguf_pages();
+                        fprintf(stderr, "[moe_cache] %s mmap advice issued (%.2f MiB mapped), backing cache drop=%d\n",
+                                drop_mmap ? "GGUF" : "PLE", (double) dropped / 1048576.0, dropped_backing ? 1 : 0);
+                        moe_startup_memory("after_model_page_release");
                         if (!pager.reserve_staging_split(pager_stages, 64)) {
                             LLAMA_LOG_ERROR("%s: staging reserve failed -> moe_direct_io OFF\n", __func__);
                         } else if (cache_bytes && !pager.init_cache(cache_bytes)) {
                             LLAMA_LOG_WARN("%s: Tier 1 host cache unavailable (%zu MiB asked)\n",
                                            __func__, cache_bytes / 1048576);
                         } else {
+                            moe_startup_memory("after_fate_registration");
                             for (int il = 0; il < n_layer; il++) {
                                 const int s_pl_il = moe_get_layer_slots(il, n_layer);
                                 std::vector<int32_t> tab((size_t) n_exp, s_pl_il);
@@ -3557,29 +3596,6 @@ llama_context::llama_context(
                             moe_oracle_start(this);
                             io_run.store(true);
                             for (int i = 0; i < 16; i++) io_thr.emplace_back(moe_io_worker, this);
-                            {
-                                static int drop = -1;
-                                if (drop < 0) {
-                                    const char * e = getenv("MOE_DROP_MMAP");
-                                    drop = (e && atoi(e) != 0) ? 1 : 0;
-                                }
-                                model.audit_residency();
-                                model.advise_mmap_random();
-                                // bound the PLE mmap: read lazily, never hot-reused; drop its pages so they don't bloat the cgroup
-                                if (model.per_layer_tok_embd) {
-                                    const size_t ple_dropped = model.drop_mmap_cache_tensor(model.per_layer_tok_embd);
-                                    if (ple_dropped) {
-                                        fprintf(stderr, "[moe_cache] PLE mmap residency released (%.2f MiB)\n",
-                                                (double) ple_dropped / 1048576.0);
-                                    }
-                                }
-                                if (drop) {
-                                    const size_t dropped = model.drop_mmap_cache();
-                                    const bool dropped_backing = dropped > 0 && pager.pack_mode() && pager.drop_gguf_pages();
-                                    fprintf(stderr, "[moe_cache] GGUF mmap residency released (%.2f MiB mapped), backing cache drop=%d\n",
-                                            (double) dropped / 1048576.0, dropped_backing ? 1 : 0);
-                                }
-                            }
                         } // staging reserved
                     } // buf ok
                 } else {

@@ -918,13 +918,11 @@ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragme
 
 void llama_mmap::drop_cache() const {
 #ifdef _POSIX_MAPPED_FILES
-    void * base = pimpl->addr;
-    size_t len = pimpl->size;
-    if (!base || !len) return;
-    const size_t ps = (size_t) sysconf(_SC_PAGESIZE);
-    uintptr_t p0 = ((uintptr_t) base + ps - 1) & ~(ps - 1);
-    uintptr_t p1 = ((uintptr_t) base + len) & ~(ps - 1);
-    if (p1 > p0) madvise((void *) p0, p1 - p0, MADV_DONTNEED);
+    for (const auto & fragment : pimpl->mapped_fragments) {
+        if (madvise((char *) pimpl->addr + fragment.first, fragment.second - fragment.first, MADV_DONTNEED) != 0) {
+            LLAMA_LOG_DEBUG("%s: MADV_DONTNEED failed: %s\n", __func__, strerror(errno));
+        }
+    }
 #else
     (void) 0;
 #endif

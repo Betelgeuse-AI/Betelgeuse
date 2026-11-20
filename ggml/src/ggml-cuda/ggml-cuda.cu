@@ -4538,7 +4538,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, bool generic_concurrency) {
 
     if (ggml_cuda_fusion_disabled()) {
         return 0;
@@ -4546,7 +4546,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+    if (node->op == GGML_OP_MUL_MAT_ID && !generic_concurrency &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
         const int outputs[] = { i + 2, i + 5 };
@@ -5382,6 +5382,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
+    bool                         generic_concurrency = false;
+    int                          gdn_forks = 0;
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
@@ -5395,6 +5397,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             concurrent_event = &stream_ctx.concurrent_events[node];
 
             is_concurrent_event_active = true;
+            if (concurrent_event->gdn_projection) ++gdn_forks;
 
             GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
 
@@ -5419,6 +5422,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
                     should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
+                    generic_concurrency |= !event.gdn_projection;
                 }
             }
 
@@ -5475,6 +5479,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             } else {
                 stream_ctx.concurrent_events.clear();
+                generic_concurrency = false;
             }
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -5528,7 +5533,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                const int nodes_to_skip = concurrent_event && concurrent_event->gdn_projection ? 0 :
+                    ggml_cuda_try_fuse(cuda_ctx, cgraph, i, generic_concurrency);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5621,6 +5627,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
             ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
+            if (gdn_forks) {
+                GGML_LOG_INFO("[moe_gdn_overlap] captured %d projection fork/join pairs in %zu CUDA graph chunks\n",
+                        gdn_forks, n_chunks);
+            }
 
             // drop the chunks left over from a longer graph
             for (size_t i = n_chunks; i < graph->instances.size(); ++i) {
@@ -5944,7 +5954,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return env != nullptr && atoi(env) == 1;
     }();
 
-    if (!enable_graph_optimization) {
+    static const bool enable_gdn_overlap = [] {
+        const char * env = getenv("MOE_GDN_OVERLAP");
+        return !env || atoi(env) != 0;
+    }();
+    if (!enable_graph_optimization && !enable_gdn_overlap) {
         return;
     }
 
@@ -5966,6 +5980,59 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
                node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
     };
+
+    std::vector<std::pair<int, int>> concurrent_node_ranges;
+    if (enable_gdn_overlap) {
+        for (int i = 1; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * qkv = cgraph->nodes[i];
+            if (qkv->op != GGML_OP_MUL_MAT || ggml_nrows(qkv) != 1 ||
+                    (strncmp(qkv->name, "gdn_qkvz_proj-", 14) != 0 &&
+                     strncmp(qkv->name, "gdn_qkv_proj-", 13) != 0)) {
+                continue;
+            }
+            int fork = i - 1;
+            while (fork >= 0 && is_noop(cgraph->nodes[fork])) --fork;
+            if (fork < 0) continue;
+            int join = i + 1;
+            int gates = 0;
+            for (; join < cgraph->n_nodes; ++join) {
+                const ggml_tensor * node = cgraph->nodes[join];
+                if (is_noop(node)) continue;
+                if (node->op != GGML_OP_MUL_MAT || node->src[1] != qkv->src[1]) break;
+                if (strncmp(node->name, "gdn_beta_alpha_proj-", 20) == 0 ||
+                    strncmp(node->name, "gdn_beta_proj-", 14) == 0 ||
+                    strncmp(node->name, "gdn_alpha_proj-", 15) == 0) {
+                    ++gates;
+                } else if (strncmp(node->name, "z-", 2) != 0) {
+                    break;
+                }
+            }
+            if (gates == 0 || join == cgraph->n_nodes) continue;
+
+            ggml_cuda_concurrent_event event(1);
+            event.gdn_projection = true;
+            event.join_node = cgraph->nodes[join];
+            for (int j = fork + 1; j < join; ++j) {
+                const ggml_tensor * node = cgraph->nodes[j];
+                int stream = 0;
+                if (node->view_src) {
+                    const auto base = event.stream_mapping.find(node->view_src);
+                    if (base != event.stream_mapping.end()) stream = base->second;
+                } else if (strncmp(node->name, "gdn_beta_alpha_proj-", 20) == 0 ||
+                           strncmp(node->name, "gdn_beta_proj-", 14) == 0 ||
+                           strncmp(node->name, "gdn_alpha_proj-", 15) == 0) {
+                    stream = 1;
+                }
+                event.original_order.push_back(node);
+                event.stream_mapping.emplace(node, stream);
+            }
+            add_alloc_deps(fork + 1, join);
+            stream_context.concurrent_events.emplace(cgraph->nodes[fork], std::move(event));
+            concurrent_node_ranges.emplace_back(fork, join);
+            i = join - 1;
+        }
+    }
+    if (!enable_graph_optimization) return;
 
     const auto & depends_on = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {
         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
@@ -6009,9 +6076,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     const int min_fan_out = 3;
     const int max_fan_out = 3;
-
-    // store {fork_idx, join_idx}
-    std::vector<std::pair<int, int>> concurrent_node_ranges;
 
     for (const auto & [root_node, count] : fan_out) {
         if (count >= min_fan_out && count <= max_fan_out) {

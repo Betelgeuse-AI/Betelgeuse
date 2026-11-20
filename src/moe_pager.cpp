@@ -137,16 +137,11 @@ void moe_lru::prefill_miss(size_t s) {
 }
 
 bool moe_pager::drop_gguf_pages() {
-    const char * paths[2] = { path_.c_str(), pack_path_.c_str() };
-    bool ok = false;
-    for (int i = 0; i < 2; i++) {
-        if (!paths[i] || !paths[i][0]) continue;
-        int fd = open(paths[i], O_RDONLY);
-        if (fd < 0) continue;
-        off_t sz = lseek(fd, 0, SEEK_END);
-        if (sz > 0) ok |= (posix_fadvise(fd, 0, sz, POSIX_FADV_DONTNEED) == 0);
-        close(fd);
+    bool ok = !fds_.empty();
+    for (int fd : fds_) {
+        ok &= posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
     }
+    if (fd_pack_ >= 0) ok &= posix_fadvise(fd_pack_, 0, 0, POSIX_FADV_DONTNEED) == 0;
     return ok;
 }
 
