@@ -713,7 +713,7 @@ bool moe_pager::init_cache(size_t bytes) {
             (double) bytes / (1024.0*1024.0*1024.0), cache_slots_, max_layer);
     cache_idx_.assign((size_t) n_layer_ * n_expert_, -1);
     const char * tinylfu_env = getenv("MOE_CACHE_TINYLFU");
-    if (!tinylfu_env || atoi(tinylfu_env) != 0) {
+    if (tinylfu_env && atoi(tinylfu_env) != 0) {
         exp_freq_.assign(cache_idx_.size(), 0);
         cache_freq_tokens_.assign((size_t) n_layer_, 0);
     }
