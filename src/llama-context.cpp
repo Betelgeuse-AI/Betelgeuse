@@ -592,6 +592,7 @@ struct moe_dma_trace {
         const char * spec_async_env = getenv("MOE_PREKICK_ASYNC");
         const bool spec_async = !spec_async_env || atoi(spec_async_env) != 0;
         uint64_t logical_bytes = 0, demand_bytes = 0, spec_bytes = 0;
+        uint64_t tg_demand_reads = 0, tg_demand_bytes = 0;
         uint64_t dma_copies = 0, dma_bytes = 0;
         long demand_queued = 0, spec_completed = 0, spec_cancelled = 0, spec_short = 0;
         long cancel_requested = 0, ready_reused = 0, inflight_eligible = 0, inflight_joined = 0;
@@ -600,6 +601,10 @@ struct moe_dma_trace {
         auto spec_started = std::chrono::steady_clock::now();
         auto log_io = [&]() {
             if (!io_diag) return;
+            fprintf(stderr, "[moe_physical_io] tg_reads=%llu tg_bytes=%llu pp_reads=%llu pp_bytes=%llu\n",
+                    (unsigned long long) tg_demand_reads, (unsigned long long) tg_demand_bytes,
+                    (unsigned long long) ((uint64_t) demand_queued - tg_demand_reads),
+                    (unsigned long long) (demand_bytes - tg_demand_bytes));
             fprintf(stderr, "[moe_io] served=%ld logical_bytes=%llu demand_queued=%ld demand_bytes=%llu spec_submitted=%ld spec_bytes=%llu spec_completed=%ld spec_cancelled=%ld spec_short=%ld cancel_requested=%ld ready_reused=%ld inflight_eligible=%ld inflight_joined=%ld join_retries=%ld duplicate_submissions=%ld spec_reused=%ld cache_admit_from=%ld spec_ms=%.3f join_lead_ms=%.3f submit_ms=%.3f\n",
                     served, (unsigned long long) logical_bytes, demand_queued, (unsigned long long) demand_bytes,
                     spec_submitted, (unsigned long long) spec_bytes, spec_completed, spec_cancelled, spec_short,
@@ -1401,6 +1406,8 @@ struct moe_dma_trace {
                     works.clear();
                     works.reserve((size_t) ncopy * 3 + 8);
                     if (io_diag) {
+                        const long reads_before = demand_queued;
+                        const uint64_t bytes_before = demand_bytes;
                         if (ctx->pager.pack_mode()) {
                             for (int ci = 0; ci < ncopy; ++ci) {
                                 if (left[(size_t) ci] == 0) continue;
@@ -1417,6 +1424,10 @@ struct moe_dma_trace {
                                 demand_queued += 3;
                                 demand_bytes += gb + ub + db;
                             }
+                        }
+                        if (moe_phase_tg(ctx)) {
+                            tg_demand_reads += demand_queued - reads_before;
+                            tg_demand_bytes += demand_bytes - bytes_before;
                         }
                     }
                     if (ctx->pager.pack_mode()) {

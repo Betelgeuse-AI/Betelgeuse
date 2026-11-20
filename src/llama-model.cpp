@@ -2538,7 +2538,7 @@ size_t llama_model::drop_mmap_cache() const {
     for (auto & m : pimpl->mappings) {
         if (!m) continue;
         total += m->size();
-        m->drop_cache();
+        m->drop_cache(tok_embd ? tok_embd->data : nullptr, tok_embd ? ggml_nbytes(tok_embd) : 0);
     }
     return total;
 }
@@ -2553,7 +2553,7 @@ size_t llama_model::drop_mmap_cache_tensor(const ggml_tensor * t) const {
         const char * base = (const char *) t->data;
         if (base && base >= a && base < a + sz) {
             total += sz;
-            m->drop_cache();
+            m->drop_cache(tok_embd ? tok_embd->data : nullptr, tok_embd ? ggml_nbytes(tok_embd) : 0);
         }
     }
     return total;

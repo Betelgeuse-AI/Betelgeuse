@@ -5967,7 +5967,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     static const bool enable_gdn_overlap = [] {
         const char * env = getenv("MOE_GDN_OVERLAP");
-        return !env || atoi(env) != 0;
+        return env && atoi(env) != 0;
     }();
     if (!enable_graph_optimization && !enable_gdn_overlap) {
         return;

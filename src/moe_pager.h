@@ -186,6 +186,8 @@ private:
     int n_layer_ = 0, n_expert_ = 0, n_used_ = 0;
     int fd_ = -1;
     std::vector<int> fds_;                 // open file descriptors for multi-shard GGUFs
+    int embedding_fd_ = -1;
+    size_t embedding_begin_ = 0, embedding_end_ = 0;
     std::vector<moe_expert_slice> idx_;   // n_layer * n_expert * 3
     size_t bytes_per_expert_ = 0;
     // per-(layer,role) byte length taken from the GGUF index; the pack blob is

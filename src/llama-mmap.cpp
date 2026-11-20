@@ -916,15 +916,30 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
-void llama_mmap::drop_cache() const {
+void llama_mmap::drop_cache(const void * keep, size_t keep_bytes) const {
 #ifdef _POSIX_MAPPED_FILES
-    for (const auto & fragment : pimpl->mapped_fragments) {
-        if (madvise((char *) pimpl->addr + fragment.first, fragment.second - fragment.first, MADV_DONTNEED) != 0) {
+    const auto addr = reinterpret_cast<uintptr_t>(pimpl->addr);
+    const auto active = reinterpret_cast<uintptr_t>(keep);
+    size_t keep_first = 0, keep_last = 0;
+    if (keep_bytes && active >= addr && active - addr < pimpl->size) {
+        const size_t page = sysconf(_SC_PAGESIZE);
+        const size_t offset = active - addr;
+        const size_t end = offset + std::min(keep_bytes, pimpl->size - offset);
+        keep_first = offset / page * page;
+        keep_last = std::min(pimpl->size, (end + page - 1) / page * page);
+    }
+    const auto drop = [&](size_t first, size_t last) {
+        if (first < last && madvise((char *) pimpl->addr + first, last - first, MADV_DONTNEED) != 0) {
             LLAMA_LOG_DEBUG("%s: MADV_DONTNEED failed: %s\n", __func__, strerror(errno));
         }
+    };
+    for (const auto & fragment : pimpl->mapped_fragments) {
+        drop(fragment.first, std::min(fragment.second, keep_first));
+        drop(std::max(fragment.first, keep_last), fragment.second);
     }
 #else
-    (void) 0;
+    (void) keep;
+    (void) keep_bytes;
 #endif
 }
 

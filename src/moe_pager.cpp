@@ -139,7 +139,14 @@ void moe_lru::prefill_miss(size_t s) {
 bool moe_pager::drop_gguf_pages() {
     bool ok = !fds_.empty();
     for (int fd : fds_) {
-        ok &= posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
+        if (fd == embedding_fd_) {
+            if (embedding_begin_) {
+                ok &= posix_fadvise(fd, 0, embedding_begin_, POSIX_FADV_DONTNEED) == 0;
+            }
+            ok &= posix_fadvise(fd, embedding_end_, 0, POSIX_FADV_DONTNEED) == 0;
+        } else {
+            ok &= posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0;
+        }
     }
     if (fd_pack_ >= 0) ok &= posix_fadvise(fd_pack_, 0, 0, POSIX_FADV_DONTNEED) == 0;
     return ok;
@@ -216,6 +223,19 @@ bool moe_pager::init(const char * gguf_path, int n_layer, int n_expert, int n_us
             if (sfd >= 0) fds_.push_back(sfd);
             shards.push_back({spath, sctx, (int64_t) gguf_get_data_offset(sctx), sfd, true});
         }
+    }
+
+    embedding_fd_ = -1;
+    for (const auto & shard : shards) {
+        const int64_t id = gguf_find_tensor(shard.ctx, "token_embd.weight");
+        if (id < 0 || shard.fd < 0) continue;
+        const size_t page = sysconf(_SC_PAGESIZE);
+        const size_t begin = shard.data_off + gguf_get_tensor_offset(shard.ctx, id);
+        const size_t end = begin + gguf_get_tensor_size(shard.ctx, id);
+        embedding_fd_ = shard.fd;
+        embedding_begin_ = begin / page * page;
+        embedding_end_ = (end + page - 1) / page * page;
+        break;
     }
 
     // role 0 = gate, role 1 = up, role 2 = down. qwen4exp on this box ships

@@ -1160,7 +1160,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     static const bool gdn_overlap = [] {
         const char * env = getenv("MOE_GDN_OVERLAP");
-        return !env || atoi(env) != 0;
+        return env && atoi(env) != 0;
     }();
     if (gdn_overlap && cparams.moe_direct_io && ubatch.n_tokens == 1) {
         // Keep the independent projections together for CUDA stream scheduling.
