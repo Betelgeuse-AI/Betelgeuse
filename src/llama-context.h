@@ -335,6 +335,7 @@ public:
         std::vector<ggml_tensor *> step_weights;
         // last ubatch width seen; used to detect the prefill->decode edge
         uint32_t last_ntok = 0;
+        std::atomic<bool> draft_verify{false};
         // Direction 1: one extra all-zero slot per layer absorbing cold misses
         bool     sentinel_slot = false;
         // adaptive swap tier (MOE_ADAPT>=1): decayed routing demand per

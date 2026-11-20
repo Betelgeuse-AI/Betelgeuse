@@ -317,7 +317,7 @@ static bool destructor_trace() {
 
 
 static inline bool moe_phase_tg(const llama_context * ctx) {
-    return ctx && ctx->moe.last_ntok == 1;
+    return ctx && (ctx->moe.last_ntok == 1 || ctx->moe.draft_verify.load(std::memory_order_relaxed));
 }
 
 static bool moe_conveyor_init(llama_context * ctx) {
@@ -563,6 +563,7 @@ struct moe_dma_trace {
         const char * predictor_env = getenv("MOE_PRED");
         const bool victim_cache = (!victim_env || atoi(victim_env) != 0) && ctx->pager.cache_bytes() > 0 && (!predictor_env || atoi(predictor_env) == 0);
         uint64_t victim_saved = 0, victim_hits = 0, victim_bytes = 0;
+        uint64_t draft_anchor_saved = 0, draft_saved_skipped = 0, draft_sync_saved = 0;
         const char * spec_async_env = getenv("MOE_PREKICK_ASYNC");
         const bool spec_async = !spec_async_env || atoi(spec_async_env) != 0;
         uint64_t logical_bytes = 0, demand_bytes = 0, spec_bytes = 0;
@@ -584,6 +585,11 @@ struct moe_dma_trace {
             if (moe_doorbell_dma_enabled()) fprintf(stderr, "[moe_dma_io] copies=%llu h2d_bytes=%llu\n",
                 (unsigned long long) dma_copies, (unsigned long long) dma_bytes);
             if (victim_cache) fprintf(stderr, "[moe_victim_cache] saved=%llu hits=%llu bytes=%llu cache_evict=%ld already_resident=%ld tinylfu_rejected=%ld\n", (unsigned long long) victim_saved, (unsigned long long) victim_hits, (unsigned long long) victim_bytes, ctx->pager.stats_cache_evict(), ctx->pager.stats_cache_already_resident(), ctx->pager.stats_cache_tinylfu_rejected());
+            if (draft_anchor_saved || draft_saved_skipped) {
+                fprintf(stderr, "[moe_draft_victim] anchor_saved=%llu draft_only_skipped=%llu sync_saved=%llu\n",
+                        (unsigned long long) draft_anchor_saved, (unsigned long long) draft_saved_skipped,
+                        (unsigned long long) draft_sync_saved);
+            }
         };
         auto drain_spec = [&]() {
             if (!spec_ok) return;
@@ -923,6 +929,8 @@ struct moe_dma_trace {
                 misses.clear();
                 misses.reserve((size_t) n);
                 for (int j = 0; j < n; ++j) {
+                const bool draft_verify = n_used > 0 && n > n_used && n <= 4 * n_used &&
+                    n % n_used == 0 && ctx->moe.draft_verify.load(std::memory_order_relaxed);
                 const bool trace_decode = dma_trace.enabled && n == n_used && moe_phase_tg(ctx);
                 moe_dma_trace::activity_scope activity(trace_decode ? dma_trace.activity_phase : nullptr);
                 bool trace_sample = false;
@@ -1029,15 +1037,27 @@ struct moe_dma_trace {
                             const void * sg = (const void *) ((uintptr_t) ctx->moe.pool_gate[il]->data + slot_off * gb);
                             const void * su = (const void *) ((uintptr_t) ctx->moe.pool_up[il]->data   + slot_off * ub);
                             const void * sd = (const void *) ((uintptr_t) ctx->moe.pool_down[il]->data + slot_off * db);
-                            if (ctx->moe.d2h_stream) {
+                            const bool anchor_needed = !draft_verify ||
+                                std::find(sel.begin(), sel.begin() + n_used, e) != sel.begin() + n_used;
+                            if (!anchor_needed) {
+                                ++draft_saved_skipped;
+                            } else if (ctx->moe.d2h_stream) {
                                 cudaEvent_t admev = ctx->pager.cache_admit_d2h(il, old_e, sel.data(), (size_t) n,
                                         sg, su, sd, gb, ub, db,
                                         (cudaStream_t) ctx->moe.d2h_stream);
                                 if (admev) {
-                                    if ((size_t) v < ctx->moe.d2h_ev_of_v.size()) {
+                                    if (draft_verify && !pl->pad0) {
+                                        // The device-copy path does not wait on the H2D stream's event.
+                                        if (cudaEventSynchronize(admev) != cudaSuccess) {
+                                            GGML_ABORT("anchor victim DtoH failed: layer=%d expert=%d", il, old_e);
+                                        }
+                                        ++draft_sync_saved;
+                                        ++victim_saved;
+                                    } else if ((size_t) v < ctx->moe.d2h_ev_of_v.size()) {
                                         ctx->moe.d2h_ev_of_v[(size_t) v] = (void *) admev;
                                         victim_saved++;
                                     }
+                                    if (draft_verify) ++draft_anchor_saved;
                                 }
                             }
                         }
@@ -1111,6 +1131,9 @@ struct moe_dma_trace {
                         cur = ctx->moe.slot_of[(size_t) key];
                     }
                     const int local = (cur >= base && cur < base + s_pl) ? cur - base : s_pl;
+                    if (draft_verify && (local == s_pl || ctx->moe.slot_key[(size_t) cur] != key)) {
+                        GGML_ABORT("draft verification expert is unresolved: layer=%d expert=%d", il, e);
+                    }
                     pl->assigned[j] = local;
                     const int old = (local >= 0 && local < s_pl) ? old_keys[(size_t) local] : -1;
                     pl->evicted[j] = (old >= 0 && old != key) ? old - il * n_exp : -1;
@@ -8629,6 +8652,14 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
         case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
     }
     return -1;
+}
+
+int32_t llama_process_moe_draft_verify(llama_context * ctx, llama_batch_ext * batch) {
+    ctx->moe.draft_verify.store(true, std::memory_order_relaxed);
+    const int32_t ret = ctx->decode(*batch);
+    ctx->synchronize();
+    ctx->moe.draft_verify.store(false, std::memory_order_relaxed);
+    return ret;
 }
 
 //

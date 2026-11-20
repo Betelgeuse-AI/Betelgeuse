@@ -16,6 +16,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -4710,10 +4711,27 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        static const bool draft_no_evict = [] {
+            const char * value = getenv("MOE_DRAFT_NO_EVICT");
+            return value && atoi(value) != 0;
+        }();
+        const int32_t n_view = batch.view.size();
+        const auto & spec_types = params_base.speculative.types;
+        const bool draft_verify = draft_no_evict && params_base.moe_direct_io && n_view >= 2 && n_view <= 4 &&
+            std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != spec_types.end() &&
+            std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
+                const auto & rows = slot.spec_i_batch;
+                return rows.size() == (size_t) n_view && rows.front() == off && rows.back() == off + n_view - 1;
+            });
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            if (draft_verify) {
+                ret = llama_process_moe_draft_verify(ctx_tgt, batch.view.get());
+                return;
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);

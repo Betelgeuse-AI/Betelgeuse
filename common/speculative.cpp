@@ -1399,6 +1399,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 std::vector<float>   probs;
                 std::vector<int32_t> sorted_idx;
+                static const bool log_confidence = [] {
+                    const char * value = getenv("MOE_DRAFT_NO_EVICT");
+                    return value && atoi(value) != 0;
+                }();
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
@@ -1416,7 +1420,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             probs[k] = std::exp((scores[k] - scores[predecessor]) / temp);
                             sum += probs[k];
                         }
-                        if (1.0f / sum < params.p_min) {
+                        const float confidence = 1.0f / sum;
+                        if (confidence < params.p_min) {
+                            if (is_dflash2 && log_confidence) {
+                                LOG_INF("[dflash_confidence] seq=%d pos=%d kept=%d p=%.6f threshold=%.2f\n",
+                                        seq_id, (int) dp.pos0, i - 1, confidence, params.p_min);
+                            }
                             break;
                         }
                         for (int32_t k = 0; k < top_k; ++k) {

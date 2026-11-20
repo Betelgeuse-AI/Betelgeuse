@@ -12,6 +12,9 @@
 #include <string>
 #include <vector>
 
+// Process one complete target verification batch and wait for its graph.
+LLAMA_API int32_t llama_process_moe_draft_verify(struct llama_context * ctx, struct llama_batch_ext * batch);
+
 //
 // llama architecture queries
 //
