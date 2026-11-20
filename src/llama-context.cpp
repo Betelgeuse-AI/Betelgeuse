@@ -932,6 +932,23 @@ struct moe_dma_trace {
                 if (n < 0) n = 0;
                 if (n > MOE_DOORBELL_PLAN_MAX) n = MOE_DOORBELL_PLAN_MAX;
 
+                const bool draft_verify = n_used > 0 && n > n_used && n <= 4 * n_used &&
+                    n % n_used == 0 && ctx->moe.draft_verify.load(std::memory_order_relaxed);
+                const bool trace_decode = dma_trace.enabled && n == n_used && moe_phase_tg(ctx);
+                moe_dma_trace::activity_scope activity(trace_decode ? dma_trace.activity_phase : nullptr);
+                bool trace_sample = false;
+                if (dma_trace.enabled) {
+                    const uint64_t observed = moe_prof_now();
+                    if (trace_decode && dma_trace.previous_layer + 1 == il && dma_trace.published_us) {
+                        ++dma_trace.adjacent;
+                        dma_trace.adjacent_us += observed - dma_trace.published_us;
+                    }
+                    dma_trace.previous_layer = trace_decode ? il : -2;
+                    dma_trace.published_us = 0;
+                    dma_trace.collect();
+                    trace_sample = trace_decode && ((dma_trace.plans++ & 15) == 0) && dma_trace.timed;
+                }
+
                 // real LRU: the tick was frozen in doorbell mode before
                 if (++ctx->moe.lru.tick == 0) {
                     ctx->moe.lru.init(ctx->moe.lru.last.size(), 1);
@@ -959,23 +976,6 @@ struct moe_dma_trace {
                 misses.clear();
                 misses.reserve((size_t) n);
                 for (int j = 0; j < n; ++j) {
-                const bool draft_verify = n_used > 0 && n > n_used && n <= 4 * n_used &&
-                    n % n_used == 0 && ctx->moe.draft_verify.load(std::memory_order_relaxed);
-                const bool trace_decode = dma_trace.enabled && n == n_used && moe_phase_tg(ctx);
-                moe_dma_trace::activity_scope activity(trace_decode ? dma_trace.activity_phase : nullptr);
-                bool trace_sample = false;
-                if (dma_trace.enabled) {
-                    const uint64_t observed = moe_prof_now();
-                    if (trace_decode && dma_trace.previous_layer + 1 == il && dma_trace.published_us) {
-                        ++dma_trace.adjacent;
-                        dma_trace.adjacent_us += observed - dma_trace.published_us;
-                    }
-                    dma_trace.previous_layer = trace_decode ? il : -2;
-                    dma_trace.published_us = 0;
-                    dma_trace.collect();
-                    trace_sample = trace_decode && ((dma_trace.plans++ & 15) == 0) && dma_trace.timed;
-                }
-
                     const int32_t e = pl->sel[j];
                     sel[(size_t) j] = e;
                     if (e < 0 || e >= n_exp) continue;
@@ -1072,9 +1072,13 @@ struct moe_dma_trace {
                             if (!anchor_needed) {
                                 ++draft_saved_skipped;
                             } else if (ctx->moe.d2h_stream) {
+                                auto * slot_trace = trace_sample && ncopy < 10 ? &dma_trace.slots[ncopy] : nullptr;
+                                auto d2h = static_cast<cudaStream_t>(ctx->moe.d2h_stream);
+                                const bool started = slot_trace && dma_trace.record(slot_trace->d0, d2h);
                                 cudaEvent_t admev = ctx->pager.cache_admit_d2h(il, old_e, sel.data(), (size_t) n,
                                         sg, su, sd, gb, ub, db,
                                         (cudaStream_t) ctx->moe.d2h_stream);
+                                if (started && admev) slot_trace->download = dma_trace.record(slot_trace->d1, d2h);
                                 if (admev) {
                                     if (draft_verify && !pl->pad0) {
                                         // The device-copy path does not wait on the H2D stream's event.
@@ -1107,13 +1111,9 @@ struct moe_dma_trace {
                     }
                     is_cold.push_back((char) cold);
                     if (ctx->pager.pack_mode()) {
-                                auto * slot_trace = trace_sample && ncopy < 10 ? &dma_trace.slots[ncopy] : nullptr;
-                                auto d2h = static_cast<cudaStream_t>(ctx->moe.d2h_stream);
-                                const bool started = slot_trace && dma_trace.record(slot_trace->d0, d2h);
                         const moe_pager::moe_pack_loc loc = ctx->pager.pack_loc(il, e);
                         locs.push_back(loc);
                         pl->copy_pre[ncopy] = loc.pre;
-                                if (started && admev) slot_trace->download = dma_trace.record(slot_trace->d1, d2h);
                         static int demand_buf = -1, demand_direct = -1;
                     if (demand_buf < 0) { const char * e = getenv("MOE_DEMAND_BUF"); demand_buf = (e && atoi(e) != 0) ? 1 : 0; }
                     if (demand_direct < 0) { const char * e = getenv("MOE_DEMAND_DIRECT"); demand_direct = (e && atoi(e) != 0) ? 1 : 0; }
@@ -1205,6 +1205,7 @@ struct moe_dma_trace {
                 // publish the plan and ring the doorbell
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 moe_doorbell_signal_unblock(il, nullptr);
+                if (trace_decode) dma_trace.published_us = moe_prof_now();
                 if (destructor_trace()) fprintf(stderr, "[~llama_context] doorbell_worker: layer %d plan published, ncopy=%d\n", il, ncopy);
 
                 left.assign((size_t) ncopy, 0);
@@ -1234,15 +1235,16 @@ struct moe_dma_trace {
                             if (stream) cudaStreamWaitEvent(stream, victim_event, 0);
                             ctx->moe.d2h_ev_of_v[gv] = nullptr;
                         }
+                        const bool started = slot_trace && dma_trace.record(slot_trace->h1, stream);
                         const bool submitted = cached ? moe_doorbell_dma_submit_from(il, ci, cached)
                                                       : moe_doorbell_dma_submit(il, ci);
+                        if (started && submitted) slot_trace->upload = dma_trace.record(slot_trace->h2, stream);
                         if (!submitted) GGML_ABORT("demand DMA submission failed");
                         if (io_diag) {
                             dma_copies++;
                             dma_bytes += gb + ub + db;
                         }
                     }
-                if (trace_decode) dma_trace.published_us = moe_prof_now();
                     pl->copy_ready[ci] = 1;
 #if defined(__x86_64__) || defined(_M_X64)
                     _mm_sfence(); // push the store out for the UVA/PCIe readers (KICK kernel polls copy_ready)
@@ -1262,10 +1264,8 @@ struct moe_dma_trace {
                             posix_fadvise(l.fd, (off_t) l.off, (off_t) l.len, POSIX_FADV_DONTNEED);
                         }
                     }
-                        const bool started = slot_trace && dma_trace.record(slot_trace->h1, stream);
                 };
                 auto fail_ci = [&](int ci) {
-                        if (started && submitted) slot_trace->upload = dma_trace.record(slot_trace->h2, stream);
                     if (done[(size_t) ci]) return;
                     failed++;
                     GGML_ABORT("demand expert read failed: layer=%d expert=%d; refusing incomplete weights", il, misses[(size_t) ci]);
@@ -1535,6 +1535,10 @@ struct moe_dma_trace {
                         io_uring_sqe_set_data(sqe, (void *) (uintptr_t) w.tag);
                         n_sqe++;
                     }
+                    const bool trace_direct = trace_decode && !works.empty() &&
+                        std::all_of(works.begin(), works.end(), [&](const SqeWork & work) { return work.fd == ctx->pager.pack_fd(); });
+                    int traced_qd = 0;
+                    uint64_t traced_submit_us = 0;
                     const int64_t t_submit0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                     bool submit_fail = !submit_ok;
                     if (moe_prof_enabled()) {
@@ -1546,10 +1550,17 @@ struct moe_dma_trace {
                         while (submitted < n_sqe) {
                             const int r = io_uring_submit(&ring);
                             if (r <= 0) { submit_fail = true; break; }
+                            if (trace_direct && r <= 10) {
+                                ++dma_trace.depths[r].submits;
+                                traced_qd = submitted == 0 && r == n_sqe ? r : 0;
+                                traced_submit_us = (uint64_t) t_submit0;
+                                if (!traced_submit_us) traced_submit_us = moe_prof_now();
+                            }
                             submitted += r;
                         }
                         if (submitted < n_sqe) submit_fail = true;
                     }
+                    if (trace_direct && !traced_qd) ++dma_trace.qd_split;
                     if (moe_prof_enabled()) g_moe_prof.nvme_submit_syscall_us += (uint64_t) moe_prof_now() - (uint64_t) t_submit0;
                     if (moe_prof_enabled()) g_moe_prof.nvme_prep_submit_us += (uint64_t) moe_prof_now() - (uint64_t) t_prep0;
                     if (submit_fail) {
@@ -1571,10 +1582,6 @@ struct moe_dma_trace {
                                 const int32_t e = (int32_t) dbs[il].pred_next[pi];
                                 if (e < 0 || e >= n_exp) continue;
                                 if (ctx->moe.slot_of[(size_t) tgt * n_exp + e] >= 0) {
-                    const bool trace_direct = trace_decode && !works.empty() &&
-                        std::all_of(works.begin(), works.end(), [&](const SqeWork & work) { return work.fd == ctx->pager.pack_fd(); });
-                    int traced_qd = 0;
-                    uint64_t traced_submit_us = 0;
                                     if (moe_prof_enabled()) g_moe_prof.pk_skip_vram++;
                                     continue;
                                 }
@@ -1586,17 +1593,10 @@ struct moe_dma_trace {
                                 for (int z = 0; z < 8; z++) {
                                     spec_ready[z] = false;
                                     spec_lengths[z] = 0;
-                            if (trace_direct && r <= 10) {
-                                ++dma_trace.depths[r].submits;
-                                traced_qd = submitted == 0 && r == n_sqe ? r : 0;
-                                traced_submit_us = (uint64_t) t_submit0;
-                                if (!traced_submit_us) traced_submit_us = moe_prof_now();
-                            }
                                     spec_got_bytes[z] = 0;
                                     spec_got_roles[z] = 0;
                                     spec_got_cancel[z] = 0;
                                 }
-                    if (trace_direct && !traced_qd) ++dma_trace.qd_split;
                                 spec_experts[selected] = e;
                                 const auto submit_started = std::chrono::steady_clock::now();
                                 int n_sqe = 0;
@@ -1789,6 +1789,13 @@ struct moe_dma_trace {
                         struct io_uring_cqe * cqe = nullptr;
                         const int64_t t_cq0 = moe_prof_enabled() ? (int64_t) moe_prof_now() : 0;
                         const int ready = io_uring_wait_cqe(&ring, &cqe);
+                        if (traced_qd && ready == 0) {
+                            auto & bucket = dma_trace.depths[traced_qd];
+                            const uint64_t done_us = moe_prof_now();
+                            ++bucket.reads;
+                            if (t_cq0) bucket.cqe_us += done_us - (uint64_t) t_cq0;
+                            bucket.submit_to_reap_us += done_us - traced_submit_us;
+                        }
                         if (moe_prof_enabled()) {
                             const uint64_t v = (uint64_t) moe_prof_now() - (uint64_t) t_cq0;
                             g_moe_prof.nvme_cqe_wait_us += v;
@@ -1824,13 +1831,6 @@ struct moe_dma_trace {
                                     memcpy(it.dst, sp.bounce + (it.foff - sp.fbeg), it.len);
                                 } else {
                                     // failed/short span read: retry this item synchronously
-                        if (traced_qd && ready == 0) {
-                            auto & bucket = dma_trace.depths[traced_qd];
-                            const uint64_t done_us = moe_prof_now();
-                            ++bucket.reads;
-                            if (t_cq0) bucket.cqe_us += done_us - (uint64_t) t_cq0;
-                            bucket.submit_to_reap_us += done_us - traced_submit_us;
-                        }
                                     const moe_expert_slice * s = ctx->pager.slices(il, misses[(size_t) it.ci]);
                                     const int kfd = s[it.r].fd >= 0 ? s[it.r].fd : fd_gguf;
                                     const size_t want = exp_len[(size_t) it.ci * 3 + (size_t) it.r];
@@ -6731,10 +6731,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
         if (moe_ready && strcmp(name, "ffn_moe_topk") == 0 && il >= 0 && il < moe.n_layer) {
-            ggml_set_output(cur);
+            if (oracle_trace_enabled()) ggml_set_output(cur);
             const_cast<llama_context*>(this)->moe.step_topk[(size_t) il] = cur;
         }
-        if (moe_ready && strcmp(name, "ffn_moe_weights_norm") == 0 && il >= 0 && il < moe.n_layer) {
+        if (oracle_trace_enabled() && moe_ready && strcmp(name, "ffn_moe_weights_norm") == 0 && il >= 0 && il < moe.n_layer) {
             ggml_set_output(cur);
             const_cast<llama_context*>(this)->moe.step_weights[(size_t) il] = cur;
         }
@@ -9520,7 +9520,7 @@ static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud) {
 
     // oracle trace: keep the CURRENT normalized router weights fresh on
     // decode for the post-refresh path (M67 capture is in-stream at KICK)
-    if (strncmp(nm, "ffn_moe_weights_norm-", 21) == 0) {
+    if (oracle_trace_enabled() && strncmp(nm, "ffn_moe_weights_norm-", 21) == 0) {
         const int ilw = atoi(nm + 21);
         if (ilw >= 0 && ilw < ctx->moe.n_layer && t->ne[1] == 1) {
             ggml_set_output(t);
@@ -9564,7 +9564,7 @@ static bool llama_moe_page_cb(struct ggml_tensor * t, bool ask, void * ud) {
             // capture the CURRENT routing tensor for the oracle trace and the
             // post-refresh path; the old code returned before the assignment
             // below and left step_topk pointing at a freed prefill arena
-            ggml_set_output(t);
+            if (oracle_trace_enabled()) ggml_set_output(t);
             ctx->moe.step_topk[(size_t) il] = t;
             return true; // Decode: page experts on host during graph build so GPU kernel finds them resident → fast path → no doorbell → no deadlock
         }

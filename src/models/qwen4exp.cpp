@@ -1347,8 +1347,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         }
         ggml_build_forward_expand(gf, router_weights);
         const int32_t sentinel = (int32_t) (((ggml_tensor *) moe_up[il])->ne[2] - 1);
+        const char * trace_env = getenv("MOE_ORACLE_TRACE");
+        const char * conveyor_env = getenv("MOE_CONVEYOR_ORACLE");
+        const bool capture = (trace_env && trace_env[0]) || (conveyor_env && conveyor_env[0]);
         ggml_tensor * kick = ggml_moe_slot_resolve_kick(ctx0, ggml_cont(ctx0, selected),
-                (ggml_tensor *) moe_table[il], il, sentinel, router_weights, cur);
+                (ggml_tensor *) moe_table[il], il, sentinel, capture ? router_weights : nullptr, capture ? cur : nullptr);
         cb(kick, "ffn_moe_kick", il);
         ggml_build_forward_expand(gf, kick);
         ffn_shexp = build_shared();
