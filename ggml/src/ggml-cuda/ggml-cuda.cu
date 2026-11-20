@@ -2850,6 +2850,14 @@ static void ggml_cuda_moe_expert_pp(ggml_backend_cuda_context & ctx, ggml_tensor
                 staged[2]->data, staged[2]->nb[2])) {
             GGML_ABORT("expert prefill read or transfer failed at layer %d", il);
         }
+        // Quantized matmul can read the padded tail of the last active expert.
+        for (const auto * tensor : staged) {
+            const int64_t pad = GGML_PAD(tensor->ne[0], MATRIX_ROW_PADDING) - tensor->ne[0];
+            if (pad != 0) {
+                CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + count * tensor->nb[2], 0,
+                        ggml_row_size(tensor->type, pad), stream));
+            }
+        }
         evaluate(staged, first, count);
     }
 
