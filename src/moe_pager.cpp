@@ -712,6 +712,11 @@ bool moe_pager::init_cache(size_t bytes) {
     fprintf(stderr, "moe_pager: Tier 1 host cache %.2f GiB, %d slots (per-layer stride, largest %zu B)\n",
             (double) bytes / (1024.0*1024.0*1024.0), cache_slots_, max_layer);
     cache_idx_.assign((size_t) n_layer_ * n_expert_, -1);
+    const char * tinylfu_env = getenv("MOE_CACHE_TINYLFU");
+    if (!tinylfu_env || atoi(tinylfu_env) != 0) {
+        exp_freq_.assign(cache_idx_.size(), 0);
+        cache_freq_tokens_.assign((size_t) n_layer_, 0);
+    }
     cache_used_.assign((size_t) cache_slots_, 0);
     cache_stamp_.assign((size_t) cache_slots_, 0);
     cache_state_.assign((size_t) cache_slots_, 0);
@@ -725,6 +730,22 @@ bool moe_pager::init_cache(size_t bytes) {
         }
     }
     return true;
+}
+
+void moe_pager::cache_observe(int il, const int32_t * selected, size_t count, unsigned tokens) {
+    if (exp_freq_.empty()) return;
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto * freq = exp_freq_.data() + (size_t) il * n_expert_;
+    auto & elapsed = cache_freq_tokens_[(size_t) il];
+    elapsed += tokens;
+    while (elapsed >= 256) {
+        for (int e = 0; e < n_expert_; ++e) freq[e] >>= 1;
+        elapsed -= 256;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const int e = selected[i];
+        if (e >= 0 && e < n_expert_ && freq[e] != UINT16_MAX) ++freq[e];
+    }
 }
 
 const char * moe_pager::cache_find(int il, int expert) {
@@ -775,7 +796,7 @@ bool moe_pager::cache_has(int il, int expert) {
     return true;
 }
 
-int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * selected, size_t count) {
+int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * selected, size_t count, bool frequency_gate) {
     const size_t key = (size_t) il * n_expert_ + expert;
     int slot = cache_idx_[key];
     if (slot < 0) {
@@ -793,6 +814,9 @@ int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * sel
                 pinned[(size_t) cached - (size_t) base_slot] = 1;
             }
         }
+        const bool tinylfu = frequency_gate && !exp_freq_.empty();
+        const int window = tinylfu ? std::min(n_slots, std::max(4, n_slots / 10)) : 0;
+        const bool probation = tinylfu && exp_freq_[key] <= 1;
         long oldest = std::numeric_limits<long>::max();
         int chosen = -1;
         for (int current = 0; current < n_slots; ++current) {
@@ -811,6 +835,7 @@ int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * sel
                 chosen = gs;
                 break;
             }
+            if (window < n_slots && tinylfu && (current < window) != probation) continue;
             if (cache_stamp_[(size_t) gs] < oldest) {
                 oldest = cache_stamp_[(size_t) gs];
                 chosen = gs;
@@ -820,6 +845,11 @@ int moe_pager::cache_reserve_slot_locked(int il, int expert, const int32_t * sel
         slot = chosen;
         if (cache_used_[(size_t) slot]) {
             const int old_key = cache_slot_key_[(size_t) slot];
+            if (tinylfu && slot - base_slot >= window && old_key >= 0 &&
+                    exp_freq_[key] < exp_freq_[(size_t) old_key]) {
+                ++n_cache_tinylfu_rejected_;
+                return -1;
+            }
             if (old_key >= 0) cache_idx_[(size_t) old_key] = -1;
             // Event object is pre-created at init_cache and reusable; do not destroy here (worker thread path).
             cache_state_[(size_t) slot] = 0;
@@ -912,7 +942,7 @@ cudaEvent_t moe_pager::cache_admit_d2h(int il, int evicted_expert, const int32_t
             return nullptr;
         }
     }
-    const int slot = cache_reserve_slot_locked(il, evicted_expert, selected, count);
+    const int slot = cache_reserve_slot_locked(il, evicted_expert, selected, count, true);
     {
         const char * e = getenv("MOE_DESTRUCTOR_TRACE");
         if (e && atoi(e) != 0) fprintf(stderr, "[d2h_admit] il=%d e=%d slot=%d\n", il, evicted_expert, slot);

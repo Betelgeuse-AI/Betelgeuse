@@ -493,7 +493,7 @@ static void start_doorbell_worker(llama_context * ctx) {
                     spec_submitted ? spec_submit_ms / spec_submitted : 0.0);
             if (moe_doorbell_dma_enabled()) fprintf(stderr, "[moe_dma_io] copies=%llu h2d_bytes=%llu\n",
                 (unsigned long long) dma_copies, (unsigned long long) dma_bytes);
-            if (victim_cache) fprintf(stderr, "[moe_victim_cache] saved=%llu hits=%llu bytes=%llu cache_evict=%ld already_resident=%ld\n", (unsigned long long) victim_saved, (unsigned long long) victim_hits, (unsigned long long) victim_bytes, ctx->pager.stats_cache_evict(), ctx->pager.stats_cache_already_resident());
+            if (victim_cache) fprintf(stderr, "[moe_victim_cache] saved=%llu hits=%llu bytes=%llu cache_evict=%ld already_resident=%ld tinylfu_rejected=%ld\n", (unsigned long long) victim_saved, (unsigned long long) victim_hits, (unsigned long long) victim_bytes, ctx->pager.stats_cache_evict(), ctx->pager.stats_cache_already_resident(), ctx->pager.stats_cache_tinylfu_rejected());
         };
         auto drain_spec = [&]() {
             if (!spec_ok) return;
@@ -845,6 +845,9 @@ static void start_doorbell_worker(llama_context * ctx) {
                     } else {
                         misses.push_back(e);
                     }
+                }
+                if (victim_cache) {
+                    ctx->pager.cache_observe(il, sel.data(), sel.size(), ctx->moe.last_ntok);
                 }
                 std::sort(misses.begin(), misses.end());
                 misses.erase(std::unique(misses.begin(), misses.end()), misses.end());

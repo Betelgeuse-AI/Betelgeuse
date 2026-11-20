@@ -111,6 +111,7 @@ public:
     // A cold expert read once is kept in host memory and served from there over
     // PCIe (~20 GB/s) instead of the NVMe (~2.8 GB/s). Sized by `bytes`; 0 off.
     bool init_cache(size_t bytes);
+    void cache_observe(int il, const int32_t * selected, size_t count, unsigned tokens);
     const char * cache_find(int il, int expert);
     bool cache_has(int il, int expert); // side-effect free probe (no LFU stamp, no hit count)
     char * cache_reserve(int il, int expert, const int32_t * selected, size_t count);
@@ -137,6 +138,7 @@ public:
     long stats_cache_miss()  const { return n_cache_miss_; }
     long stats_cache_fill()  const { return n_cache_fill_; }
     long stats_cache_evict() const { return n_cache_evict_; }
+    long stats_cache_tinylfu_rejected() const { return n_cache_tinylfu_rejected_; }
     long stats_cache_already_resident() const { return n_cache_already_resident_; }
 
     // public for verification: exact file range this pager reads for an expert
@@ -225,7 +227,7 @@ private:
     std::vector<uint64_t> cache_off_;    // per-slot offset into cache_
     std::vector<int> layer_slot_base_;   // first arena slot of layer il
     std::vector<int> layer_slot_count_;  // arena slots per layer
-    int cache_reserve_slot_locked(int il, int expert, const int32_t * selected, size_t count); // mtx held
+    int cache_reserve_slot_locked(int il, int expert, const int32_t * selected, size_t count, bool frequency_gate = false); // mtx held
     std::vector<int> cache_slot_key_;    // slot -> il*n_expert+e, -1 = empty
     std::vector<int>  cache_idx_;        // il*n_expert+e -> slot, -1 = absent
     std::vector<char> cache_used_;       // slot occupied
@@ -236,6 +238,9 @@ private:
     long n_cache_hit_ = 0, n_cache_miss_ = 0, n_cache_fill_ = 0, n_cache_evict_ = 0;
     long n_cache_inflight_ = 0;
     long n_cache_already_resident_ = 0;
+    long n_cache_tinylfu_rejected_ = 0;
+    std::vector<uint16_t> exp_freq_;
+    std::vector<unsigned> cache_freq_tokens_;
     void * ring_ = nullptr;
     long io_ops_ = 0, io_bytes_ = 0, n_io_fail_ = 0;
     long n_pf_issued_ = 0, n_pf_hit_ = 0;
