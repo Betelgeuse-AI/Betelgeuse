@@ -441,7 +441,11 @@ bool moe_pager::wait_ok_(int r) {
     }
     if (had_wait) disk_wait_us_ += (int64_t) ((now_s() - t0) * 1e6);
     for (int k = 0; k < need; k++) {
-        if (reqs_[r].got[k] != (long) s[k].len) return false;
+        // s[k].len includes O_DIRECT tail padding; a short read at EOF only
+        // loses padding, so require the real payload like is_request_complete
+        const size_t needed = (size_t) s[k].pre + role_bytes_[(size_t) reqs_[r].il * 3 + (pack_mode_ ? 0 : k)]
+                            + (pack_mode_ ? role_bytes_[(size_t) reqs_[r].il * 3 + 1] + role_bytes_[(size_t) reqs_[r].il * 3 + 2] : 0);
+        if (reqs_[r].got[k] < 0 || (size_t) reqs_[r].got[k] < needed) return false;
     }
     return true;
 }
