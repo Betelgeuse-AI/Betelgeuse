@@ -1,0 +1,48 @@
+Restored direct-engine measurements, 2026-11-23. Each row is one /v1/completions request,
+greedy, 512 generated tokens. "run 1" is cold (first request after server load), "run 2" is
+warm (second request on the same engine). Prompt token counts are from /tokenize.
+
+server ctx 1536, prompt 1024, 256k route profile
+run 1 prompt_n 1024 predicted_n 512 pp 296.2 tg 36.82 prompt_ms 3457.0 decode_ms 13879.0 finish length
+run 2 prompt_n 1024 predicted_n 512 pp 338.3 tg 36.78 prompt_ms 3027.0 decode_ms 13892.0 finish length
+
+server ctx 2560, prompt 2048, 256k route profile
+run 1 prompt_n 2048 predicted_n 512 pp 435.7 tg 38.26 prompt_ms 4701.0 decode_ms 13357.0 finish length
+run 2 prompt_n 2048 predicted_n 512 pp 510.7 tg 39.57 prompt_ms 4010.0 decode_ms 12915.0 finish length
+
+server ctx 4608, prompt 4096, 256k route profile
+run 1 prompt_n 4096 predicted_n 512 pp 542.3 tg 40.85 prompt_ms 7553.0 decode_ms 12509.0 finish length
+run 2 prompt_n 4096 predicted_n 512 pp 695.5 tg 40.87 prompt_ms 5889.0 decode_ms 12504.0 finish length
+
+server ctx 8704, prompt 8192, 256k route profile
+run 1 prompt_n 8192 predicted_n 512 pp 657.2 tg 40.36 prompt_ms 12465.0 decode_ms 12661.0 finish length
+run 2 prompt_n 8192 predicted_n 512 pp 903.8 tg 40.45 prompt_ms 9064.0 decode_ms 12632.0 finish length
+
+server ctx 16896, prompt 16384, 256k route profile
+run 1 prompt_n 16384 predicted_n 512 pp 733.3 tg 36.13 prompt_ms 22342.0 decode_ms 14145.0 finish length
+run 2 prompt_n 16384 predicted_n 512 pp 887.5 tg 38.93 prompt_ms 18461.0 decode_ms 13127.0 finish length
+
+server ctx 16896, prompt 16384, best512 route profile (selected automatically by server)
+run 1 prompt_n 16384 predicted_n 512 pp 764.6 tg 37.86 prompt_ms 21427.0 decode_ms 13497.0 finish length
+run 2 prompt_n 16384 predicted_n 512 pp 890.1 tg 40.29 prompt_ms 18407.0 decode_ms 12684.0 finish length
+
+server ctx 32768, prompt 32256, 256k route profile
+run 1 prompt_n 32256 predicted_n 512 pp 781.0 tg 36.42 prompt_ms 41300.0 decode_ms 14029.0 finish length
+run 2 prompt_n 32256 predicted_n 512 pp 851.7 tg 36.45 prompt_ms 37874.0 decode_ms 14021.0 finish length
+
+Standalone bel-inkling2, one-shot, 512 generated tokens (see standalone logs):
+16K total (15872 prompt), 256k route: prompt 15872 tokens 19302 ms (822.3 tok/s), decode 512 tokens 13076 ms (39.2 tok/s)
+16K prompt (16384), best512 route: prompt 16384 tokens 21346 ms (767.6 tok/s), decode 512 tokens 12916 ms (39.6 tok/s)
+16K prompt (16384), 256k route: prompt 16384 tokens 20960 ms (781.7 tok/s), decode 512 tokens 13326 ms (38.4 tok/s); repeat 780.9/38.6
+32K total (32256 prompt), 256k route: prompt 32256 tokens 40345 ms (799.5 tok/s), decode 512 tokens 14030 ms (36.5 tok/s)
+8K prompt (8192), 256k route: prompt 8192 tokens 11122 ms (736.5 tok/s), decode 512 tokens 12683 ms (40.4 tok/s)
+4K prompt (4096), 256k route: prompt 4096 tokens 6229 ms (657.6 tok/s), decode 512 tokens 12345 ms (41.5 tok/s)
+2K prompt (2048), 256k route: prompt 2048 tokens 5604 ms (365.4 tok/s), decode 512 tokens 12911 ms (39.7 tok/s)
+1K prompt (1024), 256k route: prompt 1024 tokens 4572 ms (224.0 tok/s), decode 512 tokens 13573 ms (37.7 tok/s)
+
+bel-cli local server smoke test: -m checkpoint -c 1536 -t 5 -p "Hello, my name is" -n 8 --no-display-prompt -st
+load 15.4 s, 11.32 GiB VRAM, 1919 NVFP4 + 90 MXFP8 slots, 30.2 tok/s short generation.
+
+Reproducer run.sh pass (later run, single pass each):
+server ctx 1536, prompt 1024, 256k route: run 1 pp/s 246.8 tok/s 37.7 total 17.70; run 2 pp/s 454.7 tok/s 37.66 total 15.82
+server ctx 2560, prompt 2048, 256k route: run 1 pp/s 336.5 tok/s 39.66 total 18.97; run 2 pp/s 654.7 tok/s 39.62 total 16.02

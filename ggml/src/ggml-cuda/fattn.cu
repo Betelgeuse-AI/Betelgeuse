@@ -4,6 +4,8 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include <cstdlib>
+#include <cstring>
 
 #if !defined(GGML_USE_MUSA)
 
@@ -224,7 +226,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = mask && !dst->src[6] && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -459,10 +461,19 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+#if !GGML_CUDA_FA_GGML_TYPE_F8_E4M3_GGML_TYPE_Q4_0
+// Inkling needs this mixed layout for the bounded-scratch path.
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0);
+#endif
+
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
-static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K_in, const ggml_type type_V_in) {
+static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K_in,
+        const ggml_type type_V_in, bool relative = false) {
     const ggml_type type_K = type_K_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K_in;
     const ggml_type type_V = type_V_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_V_in;
+    if (relative && head_size == 128 && type_K == GGML_TYPE_F8_E4M3 && type_V == GGML_TYPE_Q4_0) {
+        return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_F8_E4M3, GGML_TYPE_Q4_0>;
+    }
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q4_1, F16)
@@ -543,7 +554,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    fattn_vec_case_t vec_case = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type);
+    fattn_vec_case_t vec_case = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type, dst->src[6] != nullptr);
     if (vec_case == nullptr) {
         static bool warned = false;
         if (!warned) {
@@ -680,6 +691,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    if (dst->src[6] || dst->src[7]) {
+        const auto * table = dst->src[6];
+        const auto * distances = dst->src[7];
+        if (!table || !distances || kv_rows || max_bias != 0.0f ||
+                !GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) ||
+                Q->ne[0] != 128 || table->type != GGML_TYPE_F32 || distances->type != GGML_TYPE_I32 ||
+                !ggml_is_contiguous(table) || !ggml_is_contiguous(distances) ||
+                table->ne[1] != Q->ne[2] || table->ne[2] != Q->ne[1]*Q->ne[3] ||
+                (mask ? distances->ne[0] != n_kv || distances->ne[1] != table->ne[2] :
+                    Q->ne[3] != 1 || distances->ne[0] != 1 + n_kv + table->ne[2] || distances->ne[1] != 1)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        const char * bounded_scratch = std::getenv("LLAMA_INKLING_REL_FATTN_BOUNDED_SCRATCH");
+        const bool direct_kv = bounded_scratch && std::strcmp(bounded_scratch, "1") == 0 &&
+            n_kv >= 32768 && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) &&
+            ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type, dst->src[6] != nullptr);
+        // For long compressed caches, read quantized K/V directly to avoid a full F16 expansion.
+        return (Q->ne[1] == 1 || direct_kv) && n_kv % FATTN_KQ_STRIDE == 0 ?
+            BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_MMA_F16;
+    }
+
     // only the MMA kernel reads K/V through kv_rows
     if (kv_rows) {
         return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
@@ -802,7 +834,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = true;
             break;
         case BEST_FATTN_KERNEL_VEC: {
-            const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
+            const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type, dst->src[6] != nullptr) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;

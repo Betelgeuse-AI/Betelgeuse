@@ -18,6 +18,46 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+struct fattn_rel_bias {
+    const float * table;
+    const int32_t * distances;
+    int n_distances;
+    int n_heads;
+    int n_keys;
+    bool compact;
+
+    __device__ __forceinline__ fattn_rel_bias slice(int sequence, int head, int n_queries) const {
+        auto result = *this;
+        if (table) {
+            result.table += (int64_t(sequence) * n_queries * n_heads + head) * n_distances;
+            if (!compact) {
+                result.distances += int64_t(sequence) * n_queries * n_keys;
+            }
+        }
+        return result;
+    }
+
+    __device__ __forceinline__ float get(int query, int key) const {
+        if (!table || key >= n_keys) {
+            return 0.0f;
+        }
+        int bucket;
+        if (compact) {
+            const int key_pos = distances[1 + key];
+            const int query_pos = distances[1 + n_keys + query];
+            const int64_t distance = int64_t(query_pos) - key_pos;
+            const int window = distances[0];
+            if (key_pos < 0 || distance < 0 || (window && distance >= window)) {
+                return -INFINITY;
+            }
+            bucket = distance < n_distances - 1 ? int(distance) : n_distances - 1;
+        } else {
+            bucket = distances[int64_t(query) * n_keys + key];
+        }
+        return table[int64_t(query) * n_heads * n_distances + bucket];
+    }
+};
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -40,7 +80,7 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33, const fattn_rel_bias rel_bias);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1324,7 +1364,10 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        fattn_rel_bias{dst->src[6] ? static_cast<const float *>(dst->src[6]->data) : nullptr,
+                       dst->src[7] ? static_cast<const int32_t *>(dst->src[7]->data) : nullptr,
+                       dst->src[6] ? int(dst->src[6]->ne[0]) : 0, int(Q->ne[2]), int(n_kv_cols), dst->src[7] && !mask}
     );
     CUDA_CHECK(cudaGetLastError());
 

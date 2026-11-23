@@ -263,6 +263,22 @@ struct llama_layer_switch_lora {
 };
 
 struct llama_layer {
+    struct ggml_tensor * attn_rel         = nullptr;
+    struct ggml_tensor * attn_rel_bias    = nullptr;
+    struct ggml_tensor * attn_q_clip      = nullptr;
+    struct ggml_tensor * attn_rel_clip    = nullptr;
+    struct ggml_tensor * attn_sink_proj   = nullptr;
+    struct ggml_tensor * attn_q_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_inp_norm  = nullptr;
+    struct ggml_tensor * attn_v_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_conv      = nullptr;
+    struct ggml_tensor * attn_v_conv      = nullptr;
+    struct ggml_tensor * attn_k_conv_proj = nullptr;
+    struct ggml_tensor * attn_v_conv_proj = nullptr;
+    struct ggml_tensor * attn_post_conv   = nullptr;
+    struct ggml_tensor * attn_res_query   = nullptr;
+    struct ggml_tensor * ffn_post_conv    = nullptr;
+    struct ggml_tensor * ffn_res_query    = nullptr;
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
     struct ggml_tensor * attn_norm_b     = nullptr;
@@ -789,6 +805,7 @@ struct llama_model {
     // deepseek41 Engram: token id -> id of its normalized form, hashed into the n-grams
     std::vector<int32_t> engram_token_map;
 
+    struct ggml_tensor * output_res_query = nullptr;
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
     struct ggml_tensor * pos_embd   = nullptr;
@@ -1013,6 +1030,7 @@ struct llama_model {
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+    virtual void post_arch_tensors(llama_model_loader &) {}
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:

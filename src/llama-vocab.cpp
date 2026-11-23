@@ -2668,6 +2668,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_DOMYN_SMALL;
                 escape_whitespaces = true;
             } else if (
+                tokenizer_pre == "inkling2") {
+                pre_type = LLAMA_VOCAB_PRE_TYPE_GPT4O;
+                special_bos_id = LLAMA_TOKEN_NULL;
+                clean_spaces = false;
+            } else if (
                 tokenizer_pre == "megrez") {
                 pre_type = LLAMA_VOCAB_PRE_TYPE_QWEN2;
             } else if (
@@ -4364,6 +4369,74 @@ llama_vocab::~llama_vocab() = default;
 
 void llama_vocab::load(llama_model_loader & ml, const LLM_KV & kv) {
     pimpl->load(ml, kv);
+}
+
+void llama_vocab::load_hf_bpe(const std::vector<std::string> & tokens,
+                              const std::vector<std::pair<std::string, std::string>> & merges,
+                              const std::vector<bool> & special_tokens,
+                              llama_token bos_id,
+                              llama_token eos_id,
+                              llama_token eot_id) {
+    if (tokens.empty() || tokens.size() != special_tokens.size() || bos_id < 0 || eos_id < 0 ||
+        (size_t) bos_id >= tokens.size() || (size_t) eos_id >= tokens.size() ||
+        (eot_id != LLAMA_TOKEN_NULL && (size_t) eot_id >= tokens.size())) {
+        throw std::runtime_error("invalid Hugging Face BPE vocabulary");
+    }
+
+    auto & v = *pimpl;
+    v.tokenizer_model = "gpt2";
+    v.tokenizer_pre = "inkling2";
+    v.type = LLAMA_VOCAB_TYPE_BPE;
+    v.pre_type = LLAMA_VOCAB_PRE_TYPE_GPT4O;
+    v.escape_whitespaces = false;
+    v.clean_spaces = false;
+    v.special_bos_id = bos_id;
+    v.special_eos_id = eos_id;
+    v.special_eot_id = eot_id;
+    v.special_unk_id = LLAMA_TOKEN_NULL;
+    v.special_sep_id = LLAMA_TOKEN_NULL;
+    v.special_pad_id = LLAMA_TOKEN_NULL;
+    v.special_mask_id = LLAMA_TOKEN_NULL;
+    v.add_bos = false;
+    v.add_eos = false;
+    v.id_to_token.resize(tokens.size());
+    v.token_to_id.reserve(tokens.size());
+
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].empty() || !v.token_to_id.emplace(tokens[i], (llama_token) i).second) {
+            throw std::runtime_error("invalid or duplicate Hugging Face BPE token");
+        }
+        auto & token = v.id_to_token[i];
+        token.text = tokens[i];
+        token.attr = special_tokens[i] ? LLAMA_TOKEN_ATTR_CONTROL : LLAMA_TOKEN_ATTR_NORMAL;
+        v.max_token_len = std::max(v.max_token_len, (int) token.text.size());
+        if (special_tokens[i]) {
+            v.cache_special_tokens.push_back((llama_token) i);
+        }
+    }
+
+    v.bpe_ranks.reserve(merges.size());
+    for (size_t i = 0; i < merges.size(); ++i) {
+        if (!v.bpe_ranks.emplace(merges[i], (int) i).second) {
+            throw std::runtime_error("duplicate Hugging Face BPE merge");
+        }
+    }
+
+    v.special_eog_ids.insert(eos_id);
+    std::sort(v.cache_special_tokens.begin(), v.cache_special_tokens.end(), [&](llama_token a, llama_token b) {
+        return v.id_to_token[a].text.size() > v.id_to_token[b].text.size();
+    });
+    v.init_tokenizer(v.type);
+    const auto newline = v.tokenize("\n", false);
+    if (newline.empty()) {
+        throw std::runtime_error("Hugging Face BPE vocabulary has no newline token");
+    }
+    v.linefeed_id = newline.front();
+    std::vector<std::string> token_to_piece_cache(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        token_to_piece_cache[i] = v.token_to_piece_for_cache((llama_token) i, true);
+    }
+    v.cache_token_to_piece.swap(token_to_piece_cache);
 }
 
 std::string llama_vocab::get_tokenizer_model() const {

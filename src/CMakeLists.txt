@@ -80,6 +80,17 @@ if (GGML_CUDA)
     # moe_pager.cpp issues O_DIRECT reads through io_uring
     target_link_libraries(llama PRIVATE uring)
 endif()
+option(LLAMA_INKLING_MARLIN "Build the experimental Inkling SM86 Marlin bridge" OFF)
+if (LLAMA_INKLING_MARLIN)
+    if (NOT GGML_CUDA OR NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "LLAMA_INKLING_MARLIN requires CUDA on Linux")
+    endif()
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(llama PRIVATE llama-inkling-marlin.cpp llama-inkling-marlin-cuda.cu)
+    set_source_files_properties(llama-inkling-marlin.cpp llama-inkling-marlin-cuda.cu PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    target_compile_definitions(llama PRIVATE LLAMA_INKLING_MARLIN)
+    target_link_libraries(llama PRIVATE CUDA::cuda_driver)
+endif()
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 find_package(Threads REQUIRED)

@@ -1919,6 +1919,35 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
     }
 }
 
+void llama_kv_cache::set_input_relative_metadata(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && dst->ne[0] == 1 + int64_t(n_kv) + ubatch->n_tokens);
+    GGML_ASSERT(ubatch->n_seqs_unq == 1);
+    GGML_ASSERT(swa_type == LLAMA_SWA_TYPE_NONE || swa_type == LLAMA_SWA_TYPE_STANDARD);
+    const llama_seq_id seq = ubatch->seq_id_unq[0];
+    const auto & cells = v_cells.at(seq_to_stream.at(seq));
+    std::vector<int32_t> data(dst->ne[0]);
+    data[0] = swa_type == LLAMA_SWA_TYPE_NONE ? 0 : n_swa;
+    for (uint32_t i = 0; i < n_kv; ++i) {
+        data[1 + i] = !cells.is_empty(i) && cells.seq_has(i, seq) ? cells.pos_get(i) : -1;
+    }
+    std::copy_n(ubatch->pos, ubatch->n_tokens, data.data() + 1 + n_kv);
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    const int64_t n_kv = dst->ne[0];
+    std::vector<int32_t> data(n_kv * ubatch->n_tokens);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const int64_t distance = cells.is_empty(j) ? -1 : int64_t(ubatch->pos[i]) - cells.pos_get(j);
+            data[i*n_kv + j] = distance >= 0 && distance < extent ? distance : extent;
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
+}
+
 void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
     // fill the cell rows of each slice
     if (attn_mask.rows && attn_mask.rows->buffer) {
@@ -3115,6 +3144,14 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_relative_metadata(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t n_kv) const {
+    kv->set_input_relative_metadata(dst, ubatch, n_kv);
+}
+
+void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_relative_pos(dst, ubatch, extent);
 }
 
 void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {

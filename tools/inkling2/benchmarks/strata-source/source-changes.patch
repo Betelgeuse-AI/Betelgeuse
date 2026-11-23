@@ -1,0 +1,669 @@
+diff --git a/engine/src/inkling2/ink2_cpu.cpp b/engine/src/inkling2/ink2_cpu.cpp
+index cf547fd3b..f206a40c3 100644
+--- a/engine/src/inkling2/ink2_cpu.cpp
++++ b/engine/src/inkling2/ink2_cpu.cpp
+@@ -168,8 +168,7 @@ int g_opt = 31;
+     }
+
+ // y[r] = factor * W[r] . x for r in [r0, r1)
+-T2 void nv_rows_avx2(const uint8_t* W, int N, int K, const float* x, float factor, float* y, int r0, int r1) {
+-    const uint8_t* S = W + (size_t) N * (K / 2);
++T2 void nv_rows_avx2(const uint8_t* W, const uint8_t* S, int, int K, const float* x, float factor, float* y, int r0, int r1) {
+     const size_t pf = g_opt & 2 ? (size_t) R * (K / 2) : 0;
+     const __m128i lut = _mm_load_si128((const __m128i*) E2M1X2);
+     for (int r = r0; r < r1; r += R) {
+@@ -198,8 +197,7 @@ T2 void nv_rows_avx2(const uint8_t* W, int N, int K, const float* x, float facto
+         for (int i = 0; i < nr; ++i) y[r + i] = factor * hsum256(acc[i]);
+     }
+ }
+-T5 void nv_rows_512(const uint8_t* W, int N, int K, const float* x, float factor, float* y, int r0, int r1) {
+-    const uint8_t* S = W + (size_t) N * (K / 2);
++T5 void nv_rows_512(const uint8_t* W, const uint8_t* S, int, int K, const float* x, float factor, float* y, int r0, int r1) {
+     const size_t pf = g_opt & 2 ? (size_t) R * (K / 2) : 0;
+     const __m128i lut = _mm_load_si128((const __m128i*) E2M1X2);
+     for (int r = r0; r < r1; r += R) {
+@@ -227,8 +225,7 @@ T5 void nv_rows_512(const uint8_t* W, int N, int K, const float* x, float factor
+ // the high nibble in those of the odd one, and vpermps reads only those 4 bits of an index.  Cascade Lake, one core,
+ // L2-resident (k1.cpp): 690 uops per KB on ports 0 + 5 against 862, and the core stays in the AVX-512 "light" licence
+ // (2.39 GHz all-core bin against 1.99): 6.05 GB/s against 4.03.
+-T5 void nv_rows_perm(const uint8_t* W, int N, int K, const float* x, float factor, float* y, int r0, int r1) {
+-    const uint8_t* S = W + (size_t) N * (K / 2);
++T5 void nv_rows_perm(const uint8_t* W, const uint8_t* S, int, int K, const float* x, float factor, float* y, int r0, int r1) {
+     const size_t pf = g_opt & 2 ? (size_t) R * (K / 2) : 0;
+     const __m512 tab = _mm512_load_ps(E2M1X2F);
+     for (int r = r0; r < r1; r += R) {
+@@ -252,8 +249,7 @@ T5 void nv_rows_perm(const uint8_t* W, int N, int K, const float* x, float facto
+         for (int i = 0; i < nr; ++i) y[r + i] = factor * _mm512_reduce_add_ps(acc[i]);
+     }
+ }
+-T2 void mx_rows_avx2(const uint8_t* W, int N, int K, const float* x, float* y, int r0, int r1) {
+-    const uint8_t* S = W + (size_t) N * K;
++T2 void mx_rows_avx2(const uint8_t* W, const uint8_t* S, int, int K, const float* x, float* y, int r0, int r1) {
+     for (int r = r0; r < r1; r += R) {
+         const int nr = r1 - r < R ? r1 - r : R;
+         __m256 acc[R];
+@@ -275,8 +271,7 @@ T2 void mx_rows_avx2(const uint8_t* W, int N, int K, const float* x, float* y, i
+         for (int i = 0; i < nr; ++i) y[r + i] = hsum256(acc[i]);
+     }
+ }
+-T5 void mx_rows_512(const uint8_t* W, int N, int K, const float* x, float* y, int r0, int r1) {
+-    const uint8_t* S = W + (size_t) N * K;
++T5 void mx_rows_512(const uint8_t* W, const uint8_t* S, int, int K, const float* x, float* y, int r0, int r1) {
+     const size_t pf = g_opt & 2 ? (size_t) R * K : 0;
+     for (int r = r0; r < r1; r += R) {
+         const int nr = r1 - r < R ? r1 - r : R;
+@@ -337,8 +332,7 @@ T2 void q8_lanes(const int8_t* q, const float* d, int K, int C, int32_t* init, f
+ }
+
+ // CBA: the e4m3 block scales' sign bit is dropped (NVFP4 block scales are amax / 6 / global: non-negative)
+-T2 void q8_rows_avx2(const uint8_t* W, int N, int K, QAct X, float factor, float* y, int r0, int r1) {
+-    const uint8_t* S = W + (size_t) N * (K / 2);
++T2 void q8_rows_avx2(const uint8_t* W, const uint8_t* S, int, int K, QAct X, float factor, float* y, int r0, int r1) {
+     const __m256i lut = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*) E2M1X2U));
+     const __m128i m4 = _mm_set1_epi8(0x0F), sm = _mm_set1_epi16(0x7F00);
+     const __m256i ones = _mm256_set1_epi16(1);
+@@ -368,8 +362,7 @@ T2 void q8_rows_avx2(const uint8_t* W, int N, int K, QAct X, float factor, float
+         for (int i = 0; i < nr; ++i) y[r + i] = factor * hsum256(acc[i]);
+     }
+ }
+-T5V void q8_rows_vnni(const uint8_t* W, int N, int K, QAct X, float factor, float* y, int r0, int r1) {
+-    const uint8_t* S = W + (size_t) N * (K / 2);
++T5V void q8_rows_vnni(const uint8_t* W, const uint8_t* S, int, int K, QAct X, float factor, float* y, int r0, int r1) {
+     const __m512i lut = _mm512_broadcast_i32x4(_mm_load_si128((const __m128i*) E2M1X2U));
+     const size_t pf = g_opt & 2 ? (size_t) R * (K / 2) : 0;
+     const __m256i m4 = _mm256_set1_epi8(0x0F), sm = _mm256_set1_epi16(0x7F00);
+@@ -407,17 +400,27 @@ int g_isa = 0;          // fp32 kernels: 2 avx2, 5 avx512
+ bool g_vnni = false;    // q8 kernels: AVX-512 VNNI (chunks of 64), else AVX2 (chunks of 32)
+ bool g_q8 = false;      // NVFP4 layers with int8 activations (INK2_CPU_ACT=int8)
+ int g_C = 32;
+-void rows(bool nv, const uint8_t* W, int N, int K, const float* x, float factor, float* y, int r0, int r1) {
++void rows(bool nv, const uint8_t* W, const uint8_t* S, int N, int K, const float* x, float factor, float* y, int r0, int r1) {
+     if (r0 >= r1) return;
+-    if (nv) (g_isa == 5 ? (g_opt & 1 ? nv_rows_perm : nv_rows_512) : nv_rows_avx2)(W, N, K, x, factor, y, r0, r1);
+-    else (g_isa == 5 ? mx_rows_512 : mx_rows_avx2)(W, N, K, x, y, r0, r1);
++    if (nv) (g_isa == 5 ? (g_opt & 1 ? nv_rows_perm : nv_rows_512) : nv_rows_avx2)(W, S, N, K, x, factor, y, r0, r1);
++    else (g_isa == 5 ? mx_rows_512 : mx_rows_avx2)(W, S, N, K, x, y, r0, r1);
+ }
+-void q8_rows(const uint8_t* W, int N, int K, QAct X, float factor, float* y, int r0, int r1) {
+-    if (r0 < r1) (g_vnni ? q8_rows_vnni : q8_rows_avx2)(W, N, K, X, factor, y, r0, r1);
++void q8_rows(const uint8_t* W, const uint8_t* S, int N, int K, QAct X, float factor, float* y, int r0, int r1) {
++    if (r0 < r1) (g_vnni ? q8_rows_vnni : q8_rows_avx2)(W, S, N, K, X, factor, y, r0, r1);
+ }
+
+ // ------------------------------------------------------------------------------------------------ pools
+ Setup S;
++ExpertParts expert_view(int key, bool nv) {
++    if (S.ex_parts) return S.ex_parts[key];
++    const size_t w13 = (size_t) 2 * S.ff * S.h * (nv ? 1 : 2) / 2;
++    const size_t s13 = (size_t) 2 * S.ff * S.h / (nv ? 16 : 32);
++    const size_t w2 = (size_t) S.h * S.ff * (nv ? 1 : 2);
++    const size_t s2 = (size_t) S.h * S.ff / (nv ? 16 : 32);
++    const uint8_t* p = S.ex[key];
++    const size_t partA = w13 + s13;
++    return {p, p + w13, p + partA, p + partA + w2, w13, s13, w2, s2};
++}
+ inline float swiglu1(float g, float u) {   // as the GPU's
+     return (std::tanh(g / S.gate_cap) * S.gate_cap) * (1.0f / (1.0f + std::exp(-g))) * (std::tanh(u / S.up_cap) * S.up_cap);
+ }
+@@ -502,7 +505,6 @@ inline void mark(Node& N, int t, int i) { if (!t && g_trace) N.ph[i] = now_ms();
+ void node_work(Node& N, Priv& P, int t, int& sense) {
+     const int T = (int) N.cpus.size(), l = N.layer, H = S.h, FF = S.ff, nj = N.nj, C = g_C;
+     const bool nv = l < S.mx_first, q8 = nv && g_q8, fuse = (g_opt & 4) && !q8;
+-    const size_t partA = nv ? S.nv_partA : S.mx_partA;
+     int a, b;
+     // private copies of the input: threads reading a buffer others write near hit an 8x slowdown (cpunv.cpp)
+     if (q8) {
+@@ -515,9 +517,10 @@ void node_work(Node& N, Priv& P, int t, int& sense) {
+     share(2 * FF, t, T, R, a, b);
+     for (int j = 0; j < nj; ++j) {
+         const int key = l * S.ne + N.ex[j];
++        const ExpertParts ex = expert_view(key, nv);
+         float* gu = N.gu + (size_t) j * 2 * FF;
+-        if (q8) q8_rows(S.ex[key], 2 * FF, H, {P.qx, P.ix, P.sx}, S.f13[key], gu, a, b);
+-        else rows(nv, S.ex[key], 2 * FF, H, P.x, nv ? S.f13[key] : 1.0f, gu, a, b);
++        if (q8) q8_rows(ex.w13, ex.s13, 2 * FF, H, {P.qx, P.ix, P.sx}, S.f13[key], gu, a, b);
++        else rows(nv, ex.w13, ex.s13, 2 * FF, H, P.x, nv ? S.f13[key] : 1.0f, gu, a, b);
+         if (fuse) {
+             // SwiGLU of the thread's own outputs right away (rows 2i and 2i + 1 are both in its share: R is even), one
+             // barrier less.  h by non-temporal stores: every thread of the node reads all of it next, and lines left
+@@ -560,10 +563,11 @@ void node_work(Node& N, Priv& P, int t, int& sense) {
+     share(H, t, T, R, a, b);
+     for (int j = 0; j < nj; ++j) {
+         const int key = l * S.ne + N.ex[j];
++        const ExpertParts ex = expert_view(key, nv);
+         float* y = S.bell[N.id]->y[N.bj[j]];
+-        if (q8) q8_rows(S.ex[key] + partA, H, FF, {P.qh + (size_t) j * FF, P.ih + (size_t) j * FF / 4, P.sh + (size_t) j * FF / 4},
++        if (q8) q8_rows(ex.w2, ex.s2, H, FF, {P.qh + (size_t) j * FF, P.ih + (size_t) j * FF / 4, P.sh + (size_t) j * FF / 4},
+                         S.f2[key], y, a, b);
+-        else rows(nv, S.ex[key] + partA, H, FF, P.h + (size_t) j * FF, nv ? S.f2[key] : 1.0f, y, a, b);
++        else rows(nv, ex.w2, ex.s2, H, FF, P.h + (size_t) j * FF, nv ? S.f2[key] : 1.0f, y, a, b);
+     }
+     mark(N, t, 5);
+     N.bar.wait(sense);
+diff --git a/engine/src/inkling2/ink2_cpu.hpp b/engine/src/inkling2/ink2_cpu.hpp
+index 8c7a5741e..62a8344c6 100644
+--- a/engine/src/inkling2/ink2_cpu.hpp
++++ b/engine/src/inkling2/ink2_cpu.hpp
+@@ -32,9 +32,21 @@ struct InkBell {   // one per node in its memory, registered mapped; GPU writes
+                                        // of its expert's node
+ };
+
++struct ExpertParts {
++    const uint8_t* w13 = nullptr;
++    const uint8_t* s13 = nullptr;
++    const uint8_t* w2 = nullptr;
++    const uint8_t* s2 = nullptr;
++    size_t w13_bytes = 0;
++    size_t s13_bytes = 0;
++    size_t w2_bytes = 0;
++    size_t s2_bytes = 0;
++};
++
+ struct Setup {
+     int nl = 0, ne = 0, mx_first = 0, h = 0, ff = 0;
+     const uint8_t* const* ex = nullptr;    // [nl * ne] host address of expert (l, e)'s slot
++    const ExpertParts* ex_parts = nullptr; // split tensors in the read-only checkpoint mapping
+     const uint8_t* home = nullptr;          // [nl * ne] its node
+     const float* f13 = nullptr;             // [nl * ne] NVFP4 per-expert factors (layers < mx_first)
+     const float* f2 = nullptr;
+diff --git a/engine/src/inkling2/ink2_engine.cu b/engine/src/inkling2/ink2_engine.cu
+index 7a4e15b6d..d0f286172 100644
+--- a/engine/src/inkling2/ink2_engine.cu
++++ b/engine/src/inkling2/ink2_engine.cu
+@@ -2231,11 +2231,34 @@ __global__ void kb_add(const float* a, const float* b, float* y, size_t n) {
+ struct Ckpt {
+     std::string path;
+     StFile st;
++    const uint8_t* mapped = nullptr;
++    size_t mapped_size = 0;
++    ~Ckpt() { if (mapped) munmap((void*) mapped, mapped_size); }
++    std::string map_file() {
++        const int fd = ::open(path.c_str(), O_RDONLY);
++        if (fd < 0) return "cannot open " + path;
++        struct stat info{};
++        if (fstat(fd, &info) != 0 || info.st_size <= 0) { ::close(fd); return "cannot stat " + path; }
++        mapped_size = (size_t) info.st_size;
++        void* p = mmap(nullptr, mapped_size, PROT_READ, MAP_PRIVATE, fd, 0);
++        ::close(fd);
++        if (p == MAP_FAILED) { mapped_size = 0; return "cannot map " + path; }
++        mapped = (const uint8_t*) p;
++        return "";
++    }
+     const StTensor& t(const std::string& name) const {
+         auto it = st.tensors.find(name);
+         if (it == st.tensors.end()) { std::fprintf(stderr, "missing tensor %s\n", name.c_str()); std::exit(1); }
+         return it->second;
+     }
++    const uint8_t* data(const std::string& name) const {
++        const StTensor& d = t(name);
++        if (!mapped || d.end < d.begin || st.data_start + d.end > mapped_size) {
++            std::fprintf(stderr, "%s: tensor mapping is unavailable or out of range\n", name.c_str());
++            std::exit(1);
++        }
++        return mapped + st.data_start + d.begin;
++    }
+     std::vector<unsigned char> bytes(const std::string& name) const {
+         std::vector<unsigned char> b;
+         const std::string e = strata::image::st_read_tensor(path, st, t(name), b);
+@@ -2472,7 +2495,10 @@ struct Engine {
+     // in mapped host memory (xh), the pools hold nslot_nv / nslot_mx of them, LRU (k_cache_plan)
+     int reserve_mib = -1;   // < 0: everything resident
+     bool offload = false;
++    bool lazy_experts = false;          // safetensors experts stay file-backed; CPU reads only routed misses
+     std::vector<uint8_t*> xh;            // [NL * NE] host address of expert (l, e) (regions placed per NUMA node)
++    std::vector<ink2cpu::ExpertParts> expert_parts; // [NL * NE] source tensor views for lazy offload
++    std::vector<uint32_t> expert_freq;   // optional route counts for initial expert placement
+     std::vector<uint8_t> home;           // [NL * NE] its node
+     const uint8_t** xsrc_d = nullptr;    // device [NL * NE]: its device view (mapped)
+     std::vector<std::pair<void*, size_t>> regions;
+@@ -2579,6 +2605,20 @@ void expert_memory() {
+         // whole on one node, alternating (a node's threads read local memory only); else all on the GPU's node.
+         E.offload = true;
+         E.cpu_nodes = E.cpu ? ink2cpu::nodes() : 1;
++        if (E.cpu && !g_is_gguf) {
++            E.lazy_experts = true;
++            E.home.resize((size_t) NL * NE);
++            E.expert_parts.resize((size_t) NL * NE);
++            for (int k = 0; k < NL * NE; ++k) E.home[k] = E.cpu_nodes > 1 ? (uint8_t) (k % E.cpu_nodes) : 0;
++            std::fprintf(stderr, "expert source: file-backed safetensors, CPU misses read on demand\n");
++            E.hf13.assign((size_t) NL * NE, 1.0f);
++            E.hf2.assign((size_t) NL * NE, 1.0f);
++            E.tabA = (const uint8_t**) dalloc((size_t) NL * NE * sizeof(void*));
++            E.tabB = (const uint8_t**) dalloc((size_t) NL * NE * sizeof(void*));
++            E.htabA.assign((size_t) NL * NE, nullptr);
++            E.htabB.assign((size_t) NL * NE, nullptr);
++            return;
++        }
+         const int gnode = gpu_node();
+         E.xh.assign((size_t) NL * NE, nullptr);
+         E.home.assign((size_t) NL * NE, 0);
+@@ -2687,24 +2727,35 @@ void load() {
+         Experts& X = Y.ex;
+         X.nvfp4 = l < MXFP8_FIRST;
+         {   // the four expert tensors interleaved into one slot per expert, then the layer into its pool range
+-            const auto w13 = ck.bytes(q + "mlp.experts.w13_weight"), s13 = ck.bytes(q + "mlp.experts.w13_weight_scale");
+-            const auto w2 = ck.bytes(q + "mlp.experts.w2_weight"), s2 = ck.bytes(q + "mlp.experts.w2_weight_scale");
+-            const size_t a = w13.size() / NE, b = s13.size() / NE, c = w2.size() / NE, d = s2.size() / NE, eb = ex_bytes(l);
++            const std::string n13 = q + "mlp.experts.w13_weight", ns13 = q + "mlp.experts.w13_weight_scale";
++            const std::string n2 = q + "mlp.experts.w2_weight", ns2 = q + "mlp.experts.w2_weight_scale";
++            const size_t a = (size_t) (ck.t(n13).end - ck.t(n13).begin) / NE;
++            const size_t b = (size_t) (ck.t(ns13).end - ck.t(ns13).begin) / NE;
++            const size_t c = (size_t) (ck.t(n2).end - ck.t(n2).begin) / NE;
++            const size_t d = (size_t) (ck.t(ns2).end - ck.t(ns2).begin) / NE, eb = ex_bytes(l);
+             if (a + b + c + d != eb || a + b != ex_partA(l)) { std::fprintf(stderr, "layer %d: expert bytes %zu\n", l, a + b + c + d); std::exit(1); }
+-            std::vector<uint8_t> lay(E.offload ? 0 : (size_t) NE * eb);
+-            for (int e = 0; e < NE; ++e) {
+-                uint8_t* o = E.offload ? E.xh[(size_t) l * NE + e] : lay.data() + (size_t) e * eb;
+-                std::memcpy(o, w13.data() + e * a, a);
+-                std::memcpy(o + a, s13.data() + e * b, b);
+-                std::memcpy(o + a + b, w2.data() + e * c, c);
+-                std::memcpy(o + a + b + c, s2.data() + e * d, d);
+-            }
+-            if (!E.offload) {   // resident: the layer's range of its pool (offload: setup_offload fills the pools)
+-                uint8_t* dst = (X.nvfp4 ? E.pool_nv : E.pool_mx) + ex_layer_off(l) - (X.nvfp4 ? 0 : ex_layer_off(MXFP8_FIRST));
+-                CK(cudaMemcpy(dst, lay.data(), lay.size(), cudaMemcpyHostToDevice));
++            if (E.lazy_experts) {
++                const uint8_t* w13 = ck.data(n13), *s13 = ck.data(ns13), *w2 = ck.data(n2), *s2 = ck.data(ns2);
++                for (int e = 0; e < NE; ++e)
++                    E.expert_parts[(size_t) l * NE + e] = {w13 + (size_t) e * a, s13 + (size_t) e * b,
++                                                           w2 + (size_t) e * c, s2 + (size_t) e * d, a, b, c, d};
++            } else {
++                const auto w13 = ck.bytes(n13), s13 = ck.bytes(ns13), w2 = ck.bytes(n2), s2 = ck.bytes(ns2);
++                std::vector<uint8_t> lay(E.offload ? 0 : (size_t) NE * eb);
+                 for (int e = 0; e < NE; ++e) {
+-                    E.htabA[l * NE + e] = dst + (size_t) e * eb;
+-                    E.htabB[l * NE + e] = dst + (size_t) e * eb + ex_partA(l);
++                    uint8_t* o = E.offload ? E.xh[(size_t) l * NE + e] : lay.data() + (size_t) e * eb;
++                    std::memcpy(o, w13.data() + (size_t) e * a, a);
++                    std::memcpy(o + a, s13.data() + (size_t) e * b, b);
++                    std::memcpy(o + a + b, w2.data() + (size_t) e * c, c);
++                    std::memcpy(o + a + b + c, s2.data() + (size_t) e * d, d);
++                }
++                if (!E.offload) {
++                    uint8_t* dst = (X.nvfp4 ? E.pool_nv : E.pool_mx) + ex_layer_off(l) - (X.nvfp4 ? 0 : ex_layer_off(MXFP8_FIRST));
++                    CK(cudaMemcpy(dst, lay.data(), lay.size(), cudaMemcpyHostToDevice));
++                    for (int e = 0; e < NE; ++e) {
++                        E.htabA[l * NE + e] = dst + (size_t) e * eb;
++                        E.htabB[l * NE + e] = dst + (size_t) e * eb + ex_partA(l);
++                    }
+                 }
+             }
+             X.tA = E.tabA + (size_t) l * NE;
+@@ -3060,6 +3111,23 @@ void load_gguf() {
+ // CPU-expert staging).  Measured on the 3090 at 8 GiB (reserve 15946, nvidia-smi peak): 17-31 MiB used after the pools
+ // with --tc 0 / 1, --cpu-threads 22, --spec 1, a 6000-token prompt at chunk 1024; 128 leaves ~100 MiB to spare.
+ int g_off_margin_mib = 128;
++float g_off_mx_fraction = 0.20f;
++std::vector<int> expert_placement_order() {
++    std::vector<int> order;
++    order.reserve((size_t) NL * NE);
++    for (int l = LOOP_BEGIN; l < LOOP_END; ++l)
++        for (int e = 0; e < NE; ++e) order.push_back(l * NE + e);
++    std::vector<int> outside;
++    for (int l = 0; l < NL; ++l)
++        if (l < LOOP_BEGIN || l >= LOOP_END)
++            for (int e = 0; e < NE; ++e) outside.push_back(l * NE + e);
++    if (E.expert_freq.size() == (size_t) NL * NE)
++        std::stable_sort(outside.begin(), outside.end(), [](int a, int b) {
++            return E.expert_freq[a] != E.expert_freq[b] ? E.expert_freq[a] > E.expert_freq[b] : a < b;
++        });
++    order.insert(order.end(), outside.begin(), outside.end());
++    return order;
++}
+ void setup_offload() {
+     size_t fr = 0, tot = 0;
+     CK(cudaMemGetInfo(&fr, &tot));
+@@ -3069,7 +3137,7 @@ void setup_offload() {
+         E.nslot_mx = 0;
+         E.nslot_nv = (int) std::min<size_t>(budget / ex_bytes(0), (size_t) NL * NE);
+     } else {
+-        E.nslot_mx = (int) std::min<size_t>((size_t) (budget * 0.2) / MX_BYTES, (size_t) (NL - MXFP8_FIRST) * NE);
++        E.nslot_mx = (int) std::min<size_t>((size_t) (budget * g_off_mx_fraction) / MX_BYTES, (size_t) (NL - MXFP8_FIRST) * NE);
+         E.nslot_nv = (int) std::min<size_t>((budget - (size_t) E.nslot_mx * MX_BYTES) / NV_BYTES, (size_t) MXFP8_FIRST * NE);
+     }
+     if (E.nslot_nv < FETCH_MAX || (!g_is_gguf && E.nslot_mx < FETCH_MAX)) {
+@@ -3093,24 +3161,36 @@ void setup_offload() {
+     }
+     std::vector<int> slot_of((size_t) NL * NE, -1), own_nv(E.grow ? cap_nv : E.nslot_nv, -1),
+                      own_mx(E.grow ? cap_mx : E.nslot_mx, -1);
+-    std::vector<int> order;
+-    for (int l = LOOP_BEGIN; l < LOOP_END; ++l) order.push_back(l);
+-    for (int l = 0; l < NL; ++l) if (l < LOOP_BEGIN || l >= LOOP_END) order.push_back(l);
++    const std::vector<int> order = expert_placement_order();
+     int used_nv = 0, used_mx = 0;
+-    for (int l : order)
+-        for (int e = 0; e < NE; ++e) {
+-            const bool nv = ex_nv(l);
+-            int& used = nv ? used_nv : used_mx;
+-            if (used >= (nv ? E.nslot_nv : E.nslot_mx)) continue;
+-            const size_t eb = ex_bytes(l);
+-            uint8_t* d = (nv ? E.pool_nv : E.pool_mx) + (size_t) used * eb;
++    std::vector<uint8_t> packed(E.lazy_experts ? MX_BYTES : 0);
++    for (int key : order) {
++        const int l = key / NE, e = key % NE;
++        const bool nv = ex_nv(l);
++        int& used = nv ? used_nv : used_mx;
++        if (used >= (nv ? E.nslot_nv : E.nslot_mx)) continue;
++        const size_t eb = ex_bytes(l);
++        uint8_t* d = (nv ? E.pool_nv : E.pool_mx) + (size_t) used * eb;
++        if (E.lazy_experts) {
++            const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) l * NE + e];
++            if (p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes != eb) {
++                std::fprintf(stderr, "layer %d expert %d: source size mismatch\n", l, e);
++                std::exit(1);
++            }
++            std::memcpy(packed.data(), p.w13, p.w13_bytes);
++            std::memcpy(packed.data() + p.w13_bytes, p.s13, p.s13_bytes);
++            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
++            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
++            CK(cudaMemcpy(d, packed.data(), eb, cudaMemcpyHostToDevice));
++        } else {
+             CK(cudaMemcpy(d, E.xh[(size_t) l * NE + e], eb, cudaMemcpyHostToDevice));
+-            slot_of[l * NE + e] = used;
+-            (nv ? own_nv : own_mx)[used] = l * NE + e;
+-            E.htabA[l * NE + e] = d;
+-            E.htabB[l * NE + e] = d + ex_partA(l);
+-            ++used;
+         }
++        slot_of[l * NE + e] = used;
++        (nv ? own_nv : own_mx)[used] = l * NE + e;
++        E.htabA[l * NE + e] = d;
++        E.htabB[l * NE + e] = d + ex_partA(l);
++        ++used;
++    }
+     CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
+     CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
+     auto ints = [](const std::vector<int>& v) { return (int*) upload(v.data(), v.size() * 4); };
+@@ -3173,6 +3253,75 @@ void pool_resize(bool nv, int n) {
+     for (auto& x : g_vexec) if (x) { CK(cudaGraphExecDestroy(x)); x = nullptr; }
+ }
+ double pool_bytes(bool nv) { return (double) (nv ? E.nslot_nv : E.nslot_mx) * (nv ? ex_bytes(0) : MX_BYTES); }
++void refill_lazy_pool() {
++    if (!E.lazy_experts) return;
++    CK(cudaDeviceSynchronize());
++    std::vector<int> slot_of((size_t) NL * NE), owner_nv((size_t) E.nslot_nv), owner_mx((size_t) E.nslot_mx);
++    CK(cudaMemcpy(slot_of.data(), E.slot_of, slot_of.size() * sizeof(int), cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(owner_nv.data(), E.owner_nv, owner_nv.size() * sizeof(int), cudaMemcpyDeviceToHost));
++    CK(cudaMemcpy(owner_mx.data(), E.owner_mx, owner_mx.size() * sizeof(int), cudaMemcpyDeviceToHost));
++    const std::vector<int> order = expert_placement_order();
++    std::vector<uint8_t> packed(MX_BYTES);
++    size_t bytes = 0;
++    int filled_nv = 0, filled_mx = 0;
++    auto fill = [&](bool nv, std::vector<int>& owners, int& filled) {
++        size_t next = 0;
++        for (int s = 0; s < (int) owners.size(); ++s) {
++            if (owners[s] >= 0) continue;
++            int key = -1;
++            while (next < order.size()) {
++                const int candidate = order[next++], l = candidate / NE;
++                if (ex_nv(l) == nv && slot_of[candidate] < 0) { key = candidate; break; }
++            }
++            if (key < 0) break;
++            const int l = key / NE;
++            const ink2cpu::ExpertParts& p = E.expert_parts[key];
++            const size_t eb = ex_bytes(l);
++            if (p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes != eb) {
++                std::fprintf(stderr, "layer %d expert %d: source size mismatch during pool refill\n", l, key % NE);
++                std::exit(1);
++            }
++            std::memcpy(packed.data(), p.w13, p.w13_bytes);
++            std::memcpy(packed.data() + p.w13_bytes, p.s13, p.s13_bytes);
++            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
++            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
++            uint8_t* pool = nv ? E.pool_nv : E.pool_mx;
++            uint8_t* dst = pool + (size_t) s * eb;
++            CK(cudaMemcpy(dst, packed.data(), eb, cudaMemcpyHostToDevice));
++            slot_of[key] = s;
++            owners[s] = key;
++            bytes += eb;
++            ++filled;
++        }
++    };
++    fill(true, owner_nv, filled_nv);
++    fill(false, owner_mx, filled_mx);
++    if (!bytes) return;
++    std::fill(E.htabA.begin(), E.htabA.end(), nullptr);
++    std::fill(E.htabB.begin(), E.htabB.end(), nullptr);
++    for (int key = 0; key < NL * NE; ++key) {
++        const int slot = slot_of[key];
++        if (slot < 0) continue;
++        const int l = key / NE;
++        const bool nv = ex_nv(l);
++        const int count = nv ? E.nslot_nv : E.nslot_mx;
++        if (slot >= count) { std::fprintf(stderr, "layer %d expert %d: invalid slot after pool refill\n", l, key % NE); std::exit(1); }
++        uint8_t* pool = nv ? E.pool_nv : E.pool_mx;
++        E.htabA[key] = pool + (size_t) slot * ex_bytes(l);
++        E.htabB[key] = E.htabA[key] + ex_partA(l);
++    }
++    CK(cudaMemcpy(E.slot_of, slot_of.data(), slot_of.size() * sizeof(int), cudaMemcpyHostToDevice));
++    CK(cudaMemcpy(E.owner_nv, owner_nv.data(), owner_nv.size() * sizeof(int), cudaMemcpyHostToDevice));
++    CK(cudaMemcpy(E.owner_mx, owner_mx.data(), owner_mx.size() * sizeof(int), cudaMemcpyHostToDevice));
++    CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
++    CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
++    unsigned long long fetched = 0;
++    CK(cudaMemcpy(&fetched, E.fbytes, sizeof(fetched), cudaMemcpyDeviceToHost));
++    fetched += bytes;
++    CK(cudaMemcpy(E.fbytes, &fetched, sizeof(fetched), cudaMemcpyHostToDevice));
++    std::fprintf(stderr, "pool refill: restored %d NVFP4 + %d MXFP8 experts (%.2f GiB)\n", filled_nv, filled_mx,
++                 bytes / 1073741824.0);
++}
+ // the pools give up `bytes`, in proportion to their sizes
+ void pools_release(double bytes, const char* what) {
+     const double deficit = bytes + 4.0 * g_vmm.gran, used = pool_bytes(true) + pool_bytes(false);
+@@ -3185,16 +3334,18 @@ void pools_release(double bytes, const char* what) {
+     }
+ }
+ // the pools take what is free beyond the margin, in proportion to their sizes
+-void pools_fill() {
++void pools_fill(bool refill = true) {
+     if (!E.offload || !E.grow) return;
+     const size_t fr = vram_free(), keep = vram_keep() + 4 * g_vmm.gran;
+     if (fr <= keep) return;
++    const int old_nv = E.nslot_nv, old_mx = E.nslot_mx;
+     const double spare = (double) (fr - keep), used = pool_bytes(true) + pool_bytes(false);
+     for (bool nv : {true, false}) {
+         const int ns = nv ? E.nslot_nv : E.nslot_mx;
+         if (!ns) continue;
+         pool_resize(nv, ns + (int) (spare * pool_bytes(nv) / used / (nv ? ex_bytes(0) : MX_BYTES)));
+     }
++    if (refill && (E.nslot_nv > old_nv || E.nslot_mx > old_mx)) refill_lazy_pool();
+ }
+ // the full slots hold `need` cells (grown in --kv-grow-step steps, from the expert pools when VRAM is short)
+ void kv_fit(int need) {
+@@ -3679,6 +3830,10 @@ void setup_cpu() {
+     if (const char* p = std::getenv("INK2_PLACE")) g_place_freq = std::string(p) != "lru";
+     if (const char* p = std::getenv("INK2_DECAY")) g_decay = (float) std::atof(p);
+     if (const char* p = std::getenv("INK2_GAIN")) g_gain = (float) std::atof(p);
++    if (E.lazy_experts) {
++        g_promote_nv = 0;
++        g_promote_mx = 0;
++    }
+     E.cnt = (float*) dalloc((size_t) NL * NE * 4);
+     CK(cudaMemset(E.cnt, 0, (size_t) NL * NE * 4));
+     g_promote_nv = std::min(g_promote_nv, PMAX);
+@@ -3702,7 +3857,7 @@ void setup_cpu() {
+     a.xsrc = E.xsrc_d; a.tabA = E.tabA; a.tabB = E.tabB; a.fsrc = E.fsrc; a.fdst = E.fdst; a.nfetch = E.nfetch;
+     a.fbytes = E.fbytes; a.home = E.home_d;
+     a.keys = (int*) dalloc(SYNC_MAX * 4);
+-    if (!(std::getenv("INK2_PCIE") && std::string(std::getenv("INK2_PCIE")) == "0")) {
++    if (!E.lazy_experts && !(std::getenv("INK2_PCIE") && std::string(std::getenv("INK2_PCIE")) == "0")) {
+         a.stage = (uint8_t*) dalloc((size_t) SYNC_MAX * MX_BYTES);
+         const uint8_t* srcd = nullptr;   // layer 0's expert 0 (an NVFP4 one), its device view
+         CK(cudaMemcpy(&srcd, E.xsrc_d, sizeof srcd, cudaMemcpyDeviceToHost));
+@@ -3749,7 +3904,8 @@ void setup_cpu() {
+     CK(cudaEventCreateWithFlags(&E.ev_join, cudaEventDisableTiming));
+     ink2cpu::Setup s;
+     s.nl = NL; s.ne = NE; s.mx_first = MXFP8_FIRST; s.h = H; s.ff = FF;
+-    s.ex = E.xh.data();
++    s.ex = E.lazy_experts ? nullptr : E.xh.data();
++    s.ex_parts = E.lazy_experts ? E.expert_parts.data() : nullptr;
+     s.home = E.home.data();
+     s.f13 = E.hf13.data();
+     s.f2 = E.hf2.data();
+@@ -3967,7 +4123,8 @@ struct Prefill {
+     cudaStream_t cs = nullptr;
+     cudaEvent_t ev_free[2], ev_ready[2];
+     uint8_t* stg[2];
+-    size_t stg_half = 192ull << 20;
++    uint8_t* hstg[2] = {};
++    size_t stg_half = 64ull << 20;
+     unsigned stg_turn = 0;
+     const uint8_t** ptab[2];
+     const uint8_t** dtab[2];
+@@ -4057,6 +4214,7 @@ void alloc_prefill() {
+             CK(cudaEventCreateWithFlags(&PF.ev_free[h], cudaEventDisableTiming));
+             CK(cudaEventCreateWithFlags(&PF.ev_ready[h], cudaEventDisableTiming));
+             PF.stg[h] = (uint8_t*) pf_alloc(PF.stg_half, 2);
++            CK(cudaHostAlloc((void**) &PF.hstg[h], PF.stg_half, cudaHostAllocDefault));
+             CK(cudaHostAlloc((void**) &PF.ptab[h], NE * sizeof(void*), cudaHostAllocDefault));
+             PF.dtab[h] = (const uint8_t**) dalloc(NE * sizeof(void*));
+         }
+@@ -4093,7 +4251,7 @@ void alloc_prefill() {
+ // earlier group of the chunk fetched (its tiles would be skipped): T x TOPK, plus the promotions in flight with the
+ // CPU experts, within the smaller pool.  CBA: counts ids, not distinct experts (a device count would cost a sync).
+ bool pf_routed_ok(int T) {
+-    if (!E.offload || T > g_pf_routed_max) return false;
++    if (!E.offload || E.lazy_experts || T > g_pf_routed_max) return false;
+     const int need = T * TOPK + (E.cpu ? PMAX : 0);
+     return need <= E.nslot_nv && (!E.nslot_mx || need <= E.nslot_mx);
+ }
+@@ -4148,13 +4306,14 @@ int pf_fit(int T, int pos0) {
+     }
+ }
+ // after a prompt: the buffers' memory back to the pools
+-void pf_unmap() {
++void pf_unmap(bool refill) {
+     if (g_pfr.empty() || !g_pf_mapped_T) return;
+     CK(cudaDeviceSynchronize());
+     for (auto& r : g_pfr) r.unmap_to(0);
+     g_pf_mapped_T = 0;
+-    pools_fill();
++    pools_fill(refill);
+ }
++void pf_unmap() { pf_unmap(true); }
+
+ // tensor-core dense product: Y[t][0..n) = fp16(X[t]) . fp16(W rows [first, first + n))^T, fp32 accumulation.
+ // wcvt: convert W (whole matrix) into PF.wh first; xslot: which third of PF.xh holds X's fp16 copy
+@@ -4323,7 +4482,20 @@ template <class F> void expert_parts(int l, bool partB, F launch) {
+         for (int j = 0; j < n; ++j) {
+             const int e = nonres[b0 + j];
+             uint8_t* d = PF.stg[h] + (size_t) j * part;
+-            CK(cudaMemcpyAsync(d, E.xh[(size_t) l * NE + e] + off, part, cudaMemcpyHostToDevice, PF.cs));
++            if (E.lazy_experts) {
++                const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) l * NE + e];
++                uint8_t* src = PF.hstg[h] + (size_t) j * part;
++                const uint8_t* w = partB ? p.w2 : p.w13;
++                const uint8_t* s = partB ? p.s2 : p.s13;
++                const size_t nw = partB ? p.w2_bytes : p.w13_bytes;
++                const size_t ns = partB ? p.s2_bytes : p.s13_bytes;
++                if (nw + ns != part) { std::fprintf(stderr, "layer %d expert %d: prefill source size mismatch\n", l, e); std::exit(1); }
++                std::memcpy(src, w, nw);
++                std::memcpy(src + nw, s, ns);
++                CK(cudaMemcpyAsync(d, src, part, cudaMemcpyHostToDevice, PF.cs));
++            } else {
++                CK(cudaMemcpyAsync(d, E.xh[(size_t) l * NE + e] + off, part, cudaMemcpyHostToDevice, PF.cs));
++            }
+             tab[e] = d;
+         }
+         // the batch table rides on the copy stream too (pinned slot per half, reused once ev_free[h] has fired)
+@@ -4376,12 +4548,15 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
+     if (g_pf_routed && !(T <= SMALL_T && !X.gg13))
+         for (int t0 = 0; t0 < T; t0 += 8) expert_cache(l, PF.ids + (size_t) t0 * TOPK, std::min(8, T - t0) * TOPK);
+     if (T <= SMALL_T && !X.gg13) {   // offload: the verify's experts through the decode cache (T x TOPK ids), not the staging
+-        if (E.offload) expert_cache(l, PF.ids, T * TOPK);
++        if (E.offload && !E.lazy_experts) expert_cache(l, PF.ids, T * TOPK);
+         const int RR = g_grp_r;
+         auto g = RR == 2 ? (X.nvfp4 ? k_moe_gemv_grp<true, 2> : k_moe_gemv_grp<false, 2>)
+                          : RR == 1 ? (X.nvfp4 ? k_moe_gemv_grp<true, 1> : k_moe_gemv_grp<false, 1>)
+                                    : (X.nvfp4 ? k_moe_gemv_grp<true, 4> : k_moe_gemv_grp<false, 4>);
+-        auto parts = [&](bool partB, auto launch) { if (E.offload) launch(partB ? X.tB : X.tA); else expert_parts(l, partB, launch); };
++        auto parts = [&](bool partB, auto launch) {
++            if (E.offload && !E.lazy_experts) launch(partB ? X.tB : X.tA);
++            else expert_parts(l, partB, launch);
++        };
+         parts(false, [&](const uint8_t* const* t) {
+             g<<<dim3(2 * FF / (8 * RR), maxt), 256>>>(x, H, PF.rows, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                  PF.ecnt, PF.gu, 2 * FF, H);
+@@ -5212,13 +5387,14 @@ int main(int argc, char** argv) {
+     if (const char* r = std::getenv("INK2_GG_RPW")) g_gg_rpw = std::atoi(r);
+     if (const char* r = std::getenv("INK2_ROUTED_MAX")) g_pf_routed_max = std::atoi(r);
+     if (const char* r = std::getenv("INK2_DQ_MIN")) g_dq_min = std::atoi(r);
++    if (const char* r = std::getenv("INK2_MX_POOL_FRACTION")) g_off_mx_fraction = std::clamp((float) std::atof(r), 0.05f, 0.95f);
+     {
+         int major = 0;   // default on before Ampere only: Turing gains, 3090 decode 91.7 -> 90.5 tok/s with it
+         CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
+         const int w = std::getenv("INK2_Q8_WIDE") ? std::atoi(std::getenv("INK2_Q8_WIDE")) : (major < 8);
+         CK(cudaMemcpyToSymbol(c_q8w, &w, sizeof(int)));
+     }
+-    std::string dir, dump_logits, rec_path;
++    std::string dir, dump_logits, rec_path, freq_path;
+     std::vector<std::string> vis_paths;   // --image (one per placeholder of --tokens, in order)
+     std::string vis_pixels;               // --vis-pixels: the ViT alone on a processor pixel tensor
+     std::vector<int> ids;
+@@ -5267,16 +5443,36 @@ int main(int argc, char** argv) {
+         else if (a == "--kv-resident" || a == "--prefill" || a == "--conversation-cache-slots") std::fprintf(stderr, "[ink2] %s %s ignored\n", a.c_str(), v);
+         else if (a == "--record-routing") { rec_path = v; E.rec_mode = 1; }
+         else if (a == "--force-routing") { rec_path = v; E.rec_mode = 2; }
++        else if (a == "--expert-frequencies") freq_path = v;
+         else if (a == "--image") vis_paths.push_back(v);
+         else if (a == "--vis-pixels") vis_pixels = v;
+         else if (a == "--dump-image-emb") g_vis.dump = v;
+         else if (a == "--image-max-tokens") g_vis.max_tokens = std::atoi(v);
+         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+     }
++    if (!freq_path.empty()) {
++        FILE* f = std::fopen(freq_path.c_str(), "r");
++        if (!f) { std::fprintf(stderr, "cannot open %s\n", freq_path.c_str()); return 1; }
++        E.expert_freq.assign((size_t) NL * NE, 0);
++        int l, e, n, entries = 0;
++        for (;;) {
++            const int got = std::fscanf(f, "%d %d %d", &l, &e, &n);
++            if (got == EOF) break;
++            if (got != 3 || l < 0 || l >= NL || e < 0 || e >= NE || n < 0) {
++                std::fprintf(stderr, "invalid expert frequency file %s\n", freq_path.c_str());
++                std::fclose(f);
++                return 1;
++            }
++            E.expert_freq[(size_t) l * NE + e] += (uint32_t) n;
++            ++entries;
++        }
++        std::fclose(f);
++        std::fprintf(stderr, "expert placement: read %d route-count entries\n", entries);
++    }
+     if (E.grow) vmm_init();
+     if (dir.empty() || (ids.empty() && !serve && vis_pixels.empty())) {
+         std::fprintf(stderr, "usage: strata-ink2 --model DIR (--serve | --tokens IDS | --tokens-file F) [--n N] [--ctx N] "
+-                             "[--chunk N] [--tc 0|1] [--kv f16|fp16|f32|i8|int8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N [--cpu-threads N]] [--spec 0|1] [--dump-logits F] [--conversation-cache-mib N [--conversation-cache-min-tokens N]] [--image FILE ... [--image-max-tokens N] [--dump-image-emb F]] [--vis-pixels F]\n");
++                             "[--chunk N] [--tc 0|1] [--kv f16|fp16|f32|i8|int8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N [--cpu-threads N]] [--expert-frequencies FILE] [--spec 0|1] [--dump-logits F] [--conversation-cache-mib N [--conversation-cache-min-tokens N]] [--image FILE ... [--image-max-tokens N] [--dump-image-emb F]] [--vis-pixels F]\n");
+         return 2;
+     }
+     if (serve && PF.TP <= 0) { std::fprintf(stderr, "--serve needs --chunk > 0\n"); return 2; }
+@@ -5302,6 +5498,10 @@ int main(int argc, char** argv) {
+         ck.path = dir + "/model-00001-of-00001.safetensors";
+         const std::string e = strata::image::st_read_header(ck.path, ck.st);
+         if (!e.empty()) { std::fprintf(stderr, "%s\n", e.c_str()); return 1; }
++        if (E.cpu) {
++            const std::string m = ck.map_file();
++            if (!m.empty()) { std::fprintf(stderr, "%s\n", m.c_str()); return 1; }
++        }
+         E.ck = &ck;
+     }
+     if (!vis_pixels.empty()) return vis_cli_pixels(vis_pixels);
+@@ -5534,7 +5734,7 @@ int main(int argc, char** argv) {
+                     const int T = sess_chunk((int) p0, pf_fit((int) std::min((size_t) PF.TP, pr.size() - p0), (int) p0));
+                     if (g_pf_full) { context_full(hist, p0, pr.size()); break; }   // ink2_grow_guard.cuh
+                     Tz = (size_t) T;
+-                    if (T < g_pf_mapped_T) pf_unmap();
++                    if (T < g_pf_mapped_T) pf_unmap(false);
+                     pf_map(T);
+                     forward_prefill(&pr[p0], T, (int) p0, nullptr);
+                     if (spec) {
+@@ -5636,7 +5836,7 @@ int main(int argc, char** argv) {
+         std::vector<float> all(fg ? (size_t) PF.TP * VOCAB : 0);
+         for (size_t p0 = 0, T = 0; p0 < ids.size(); p0 += T) {
+             T = (size_t) pf_fit((int) std::min((size_t) PF.TP, ids.size() - p0), (int) p0);
+-            if ((int) T < g_pf_mapped_T) pf_unmap();
++            if ((int) T < g_pf_mapped_T) pf_unmap(false);
+             pf_map((int) T);
+             forward_prefill(&ids[p0], T, (int) p0, fg ? all.data() : nullptr);
+             if (fg) std::fwrite(all.data(), 4, (size_t) T * VOCAB, fg);

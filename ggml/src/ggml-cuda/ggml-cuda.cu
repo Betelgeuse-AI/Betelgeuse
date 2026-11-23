@@ -1,3 +1,4 @@
+#include "custom-dispatch.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -3198,6 +3199,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_CUSTOM:
+            {
+                const auto dispatch = ggml_cuda_custom_dispatch::get(dst);
+                if (!dispatch.compute) {
+                    return false;
+                }
+                dispatch.compute(dst, ctx.stream(), dispatch.data);
+            } break;
         case GGML_OP_MOE_EXPERT_PP:
             ggml_cuda_moe_expert_pp(ctx, dst);
             break;
@@ -3423,7 +3432,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
-        if (node->op == GGML_OP_MOE_SLOT_RESOLVE || node->op == GGML_OP_MOE_EXPERT_PP) {
+        const auto custom = ggml_cuda_custom_dispatch::get(node);
+        const bool custom_graph_safe = custom.compute && custom.graph_safe && node->ne[1] == 1;
+        if (node->op == GGML_OP_MOE_SLOT_RESOLVE || node->op == GGML_OP_MOE_EXPERT_PP ||
+                (custom.compute && !custom_graph_safe)) {
             use_cuda_graph = false;
         }
         if ((node->op == GGML_OP_MOE_SLOT_RESOLVE_KICK || node->op == GGML_OP_MOE_SLOT_RESOLVE_WAIT ||
@@ -7009,6 +7021,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_info().devices[dev_ctx->device].cc == GGML_CUDA_CC_AMPERE_GA10X &&
+                ggml_cuda_custom_dispatch::get(op).compute != nullptr;
         case GGML_OP_MOE_EXPERT_PP:
             return ggml_cuda_moe_expert_pp_fetch != nullptr;
         case GGML_OP_MOE_SLOT_RESOLVE:

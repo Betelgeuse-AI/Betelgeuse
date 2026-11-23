@@ -134,6 +134,17 @@ struct llama_hparams {
     uint32_t n_embd_head_v_mla_swa   = 0;
 
     float    expert_group_scale   = 0.05f;
+    float    expert_weights_norm_eps = 0.0f;
+    bool     expert_router_f32       = false;
+    float    f_log_scale_alpha      = 0.0f;
+    float    f_qk_clip              = 0.0f;
+    float    f_relative_clip        = 0.0f;
+    uint32_t n_log_scale_floor      = 0;
+    uint32_t n_relative             = 0;
+    uint32_t n_relative_extent      = 0;
+    uint32_t n_sconv_channels       = 0;
+    uint32_t n_vocab_padded         = 0;
+    uint32_t n_vocab_unpadded       = 0;
     float    expert_weights_scale = 0.0f;
     bool     expert_weights_norm  = false;
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;

@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <string>
+#include <utility>
 #include <vector>
 #include <memory>
 
@@ -105,6 +106,12 @@ struct llama_vocab {
     ~llama_vocab();
 
     void load(llama_model_loader & ml, const LLM_KV & kv);
+    void load_hf_bpe(const std::vector<std::string> & tokens,
+                     const std::vector<std::pair<std::string, std::string>> & merges,
+                     const std::vector<bool> & special_tokens,
+                     llama_token bos_id,
+                     llama_token eos_id,
+                     llama_token eot_id);
 
     std::string get_tokenizer_model() const;
     std::string get_tokenizer_pre() const;

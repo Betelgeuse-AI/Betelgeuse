@@ -16,6 +16,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-vocab.h"
 #include "src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
@@ -23,9 +24,13 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
+#ifdef LLAMA_BUILD_INKLING2_ENGINE
+#include "ink2_embedded.h"
+#endif
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
 #include <deque>
 #include <exception>
@@ -34,6 +39,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <sstream>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -45,6 +51,195 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+struct inkling2_worker_result {
+    size_t prompt_tokens = 0;
+    size_t prompt_tokens_processed = 0;
+    size_t prompt_tokens_cached = 0;
+    double prompt_ms = 0.0;
+    double decode_ms = 0.0;
+};
+
+#ifdef LLAMA_BUILD_INKLING2_ENGINE
+struct inkling2_server_worker {
+    ink2::embedded_server engine;
+    std::mutex mutex;
+
+    bool start(const std::vector<std::string> & args) {
+        if (!engine.start(args)) {
+            return false;
+        }
+        std::string line;
+        while (engine.read_line(line)) {
+            if (line.rfind("READY ", 0) == 0) {
+                return true;
+            }
+        }
+        stop();
+        return false;
+    }
+
+    bool generate(const llama_tokens & prompt, int max_new, const common_params_sampling & sampling,
+                  const std::function<bool(llama_token)> & on_token, inkling2_worker_result & result,
+                  std::string & error_message) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!engine.alive()) {
+            error_message = "direct checkpoint engine is not running";
+            return false;
+        }
+
+        std::ostringstream command;
+        const uint64_t seed = sampling.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : sampling.seed;
+        command << "GEN " << max_new << " temperature=" << sampling.temp << " top_p=" << sampling.top_p
+                << " top_k=" << sampling.top_k << " min_p=" << sampling.min_p << " seed=" << seed << ' ';
+        for (size_t i = 0; i < prompt.size(); ++i) {
+            if (i != 0) {
+                command << ',';
+            }
+            command << prompt[i];
+        }
+        command << '\n';
+        if (!engine.write_line(command.str())) {
+            error_message = "failed to send a request to the direct checkpoint engine";
+            return false;
+        }
+
+        bool stop_sent = false;
+        std::string line;
+        while (engine.read_line(line)) {
+            if (line.rfind("T ", 0) == 0) {
+                char * end = nullptr;
+                const long token = std::strtol(line.c_str() + 2, &end, 10);
+                if (end == line.c_str() + 2 || token < 0 || token > INT32_MAX) {
+                    error_message = "direct checkpoint engine returned an invalid token";
+                    return false;
+                }
+                if (!stop_sent && on_token && !on_token((llama_token) token)) {
+                    engine.write_line("STOP");
+                    stop_sent = true;
+                }
+            } else if (line.rfind("DONE ", 0) == 0) {
+                size_t generated = 0;
+                size_t accepted = 0;
+                size_t verify = 0;
+                size_t cached = 0;
+                std::string finish;
+                std::istringstream done(line.substr(5));
+                done >> generated >> result.prompt_tokens >> result.prompt_ms >> result.decode_ms >> finish >> accepted >> verify >> cached;
+                if (done.fail() || cached > result.prompt_tokens) {
+                    error_message = "direct checkpoint engine returned invalid generation statistics";
+                    return false;
+                }
+                result.prompt_tokens_cached = cached;
+                result.prompt_tokens_processed = result.prompt_tokens - cached;
+                return true;
+            } else if (line.rfind("ERR ", 0) == 0) {
+                error_message = line.substr(4);
+                return false;
+            }
+        }
+
+        error_message = "direct checkpoint engine closed its output";
+        return false;
+    }
+
+    void stop() { engine.stop(); }
+};
+#endif
+
+static std::string read_checkpoint_file(const std::filesystem::path & path, size_t max_size) {
+    const auto size = std::filesystem::file_size(path);
+    if (size > max_size) {
+        throw std::runtime_error("checkpoint metadata file is too large: " + path.string());
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("failed to open checkpoint metadata: " + path.string());
+    }
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+static void load_inkling2_tokenizer(const std::filesystem::path & dir, llama_vocab & vocab) {
+    const json tokenizer = json::parse(read_checkpoint_file(dir / "tokenizer.json", 64 * 1024 * 1024));
+    const auto & model = tokenizer.at("model");
+    if (model.at("type").get<std::string>() != "BPE") {
+        throw std::runtime_error("direct checkpoint backend requires a BPE tokenizer");
+    }
+
+    const auto & model_vocab = model.at("vocab");
+    if (!model_vocab.is_object() || model_vocab.size() > 1000000) {
+        throw std::runtime_error("invalid direct checkpoint vocabulary");
+    }
+    size_t n_tokens = 0;
+    for (const auto & item : model_vocab.items()) {
+        n_tokens = std::max(n_tokens, (size_t) item.value().get<uint32_t>() + 1);
+    }
+    const auto & added = tokenizer.at("added_tokens");
+    if (!added.is_array() || added.size() > 100000) {
+        throw std::runtime_error("invalid direct checkpoint added-token list");
+    }
+    for (const auto & item : added) {
+        n_tokens = std::max(n_tokens, (size_t) item.at("id").get<uint32_t>() + 1);
+    }
+    if (n_tokens == 0 || n_tokens > 1000000) {
+        throw std::runtime_error("direct checkpoint vocabulary size is out of range");
+    }
+
+    std::vector<std::string> tokens(n_tokens);
+    std::vector<bool> assigned(n_tokens, false);
+    std::vector<bool> special(n_tokens, false);
+    for (const auto & item : model_vocab.items()) {
+        const uint32_t id = item.value().get<uint32_t>();
+        if (assigned[id]) {
+            throw std::runtime_error("duplicate token ID in direct checkpoint vocabulary");
+        }
+        tokens[id] = item.key();
+        assigned[id] = true;
+    }
+    for (const auto & item : added) {
+        const uint32_t id = item.at("id").get<uint32_t>();
+        if (assigned[id]) {
+            throw std::runtime_error("duplicate token ID in direct checkpoint added tokens");
+        }
+        tokens[id] = item.at("content").get<std::string>();
+        assigned[id] = true;
+        special[id] = item.value("special", false);
+    }
+    if (std::find(assigned.begin(), assigned.end(), false) != assigned.end()) {
+        throw std::runtime_error("direct checkpoint vocabulary has missing token IDs");
+    }
+
+    const auto & merge_json = model.at("merges");
+    if (!merge_json.is_array() || merge_json.size() > 1000000) {
+        throw std::runtime_error("invalid direct checkpoint BPE merges");
+    }
+    std::vector<std::pair<std::string, std::string>> merges;
+    merges.reserve(merge_json.size());
+    for (const auto & merge : merge_json) {
+        if (!merge.is_array() || merge.size() != 2) {
+            throw std::runtime_error("invalid direct checkpoint BPE merge");
+        }
+        merges.emplace_back(merge.at(0).get<std::string>(), merge.at(1).get<std::string>());
+    }
+
+    const auto find_token = [&](const std::string & name) -> llama_token {
+        const auto it = std::find(tokens.begin(), tokens.end(), name);
+        return it == tokens.end() ? LLAMA_TOKEN_NULL : (llama_token) std::distance(tokens.begin(), it);
+    };
+    const json config = json::parse(read_checkpoint_file(dir / "tokenizer_config.json", 1024 * 1024));
+    std::string eos_name = "<|content_model_end_sampling|>";
+    if (config.contains("eos_token")) {
+        eos_name = config.at("eos_token").is_string() ? config.at("eos_token").get<std::string>()
+                                                       : config.at("eos_token").at("content").get<std::string>();
+    }
+    const llama_token bos = find_token("<|begin_of_text|>");
+    const llama_token eos = find_token(eos_name);
+    const llama_token eot = find_token("<|end_message|>");
+    if (bos == LLAMA_TOKEN_NULL || eos == LLAMA_TOKEN_NULL || eot == LLAMA_TOKEN_NULL) {
+        throw std::runtime_error("direct checkpoint is missing required BOS, EOS, or end-message tokens");
+    }
+    vocab.load_hf_bpe(tokens, merges, special, bos, eos, eot);
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -262,6 +457,7 @@ struct server_slot {
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+    const llama_vocab * vocab = nullptr;
 
     common_memory mem;
 
@@ -382,7 +578,9 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(id, -1, -1);
+        if (ctx_tgt) {
+            mem.seq_rm(id, -1, -1);
+        }
 
         prompt.clear();
     }
@@ -454,7 +652,9 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, id, nullptr);
+        if (ctx_tgt) {
+            llama_set_sampler(ctx_tgt, id, nullptr);
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -837,7 +1037,8 @@ struct server_slot {
             });
 
             if (!only_metrics) {
-                res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
+                res["prompt"] = ctx_tgt ? ptask->tokens.detokenize(ctx_tgt, true)
+                                         : vocab ? common_detokenize(vocab, ptask->tokens.get_text_tokens(), true) : "";
                 res["generated"] = generated.empty() ? debug_generated_text : generated.text;
             }
         }
@@ -1025,6 +1226,13 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
+    std::unique_ptr<llama_vocab> direct_vocab;
+#ifdef LLAMA_BUILD_INKLING2_ENGINE
+    std::unique_ptr<inkling2_server_worker> direct_worker;
+#endif
+    bool direct_backend = false;
+    int32_t direct_ctx_train = 0;
+    int32_t direct_n_embd = 0;
 
     mtmd_context * mctx = nullptr;
     mtmd_helper_cap mtmd_cap = {};
@@ -1137,6 +1345,14 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+#ifdef LLAMA_BUILD_INKLING2_ENGINE
+        direct_worker.reset();
+#endif
+        direct_vocab.reset();
+        direct_backend = false;
+        direct_ctx_train = 0;
+        direct_n_embd = 0;
+        vocab = nullptr;
         spec.reset();
         spec_init.reset();
 
@@ -1202,6 +1418,176 @@ private:
         return true;
     }
 
+    bool init_inkling2_backend(common_params & params) {
+        const std::filesystem::path dir(params_base.model.path);
+#ifndef LLAMA_BUILD_INKLING2_ENGINE
+        SRV_ERR("%s", "direct Inkling checkpoint support requires -DLLAMA_BUILD_INKLING2_ENGINE=ON\n");
+        return false;
+#else
+        const std::vector<enum common_speculative_type> no_spec = { COMMON_SPECULATIVE_TYPE_NONE };
+        if (!params_base.mmproj.path.empty() || params_base.embedding ||
+            params_base.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED || params_base.sleep_idle_seconds > 0 ||
+            (!params_base.speculative.types.empty() && params_base.speculative.types != no_spec)) {
+            SRV_ERR("%s", "direct checkpoint mode currently supports text generation without sleep or draft models\n");
+            return false;
+        }
+        if (params_base.n_parallel != 1) {
+            SRV_WRN("%s", "direct checkpoint mode supports one active request; setting --parallel to 1\n");
+            params_base.n_parallel = 1;
+        }
+
+        try {
+            const json config = json::parse(read_checkpoint_file(dir / "config.json", 1024 * 1024));
+            const json text_config = config.value("text_config", json::object());
+            direct_ctx_train = text_config.value("max_position_embeddings", 262144);
+            direct_n_embd = text_config.value("hidden_size", 0);
+            if (direct_ctx_train <= 0) {
+                throw std::runtime_error("invalid max_position_embeddings in checkpoint config");
+            }
+            n_ctx = params_base.n_ctx > 0 ? params_base.n_ctx : std::min(65536, direct_ctx_train);
+            n_ctx = std::min(n_ctx, direct_ctx_train);
+            if (n_ctx <= 0) {
+                throw std::runtime_error("invalid direct checkpoint context size");
+            }
+            params_base.n_ctx = n_ctx;
+            params_base.cache_ram_mib = 0;
+
+            direct_vocab = std::make_unique<llama_vocab>();
+            load_inkling2_tokenizer(dir, *direct_vocab);
+            vocab = direct_vocab.get();
+            if (llama_vocab_n_tokens(vocab) != 200058) {
+                throw std::runtime_error("direct Inkling tokenizer must contain 200058 tokens");
+            }
+            add_bos_token = llama_vocab_get_add_bos(vocab);
+
+            std::string chat_template = params_base.chat_template;
+            if (chat_template.empty()) {
+                chat_template = read_checkpoint_file(dir / "chat_template.jinja", 256 * 1024);
+            }
+            const auto bos_id = llama_vocab_bos(vocab);
+            const auto eos_id = llama_vocab_eos(vocab);
+            const std::string bos = bos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(vocab, bos_id, true) : "";
+            const std::string eos = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(vocab, eos_id, true) : "";
+            auto templates = common_chat_templates_init(nullptr, chat_template, bos, eos);
+            const bool supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(templates.get());
+            chat_params = {
+                /* use_jinja             */ params_base.use_jinja,
+                /* prefill_assistant     */ params_base.prefill_assistant,
+                /* reasoning_format      */ params_base.reasoning_format,
+                /* chat_template_kwargs  */ params_base.default_template_kwargs,
+                /* tmpls                 */ std::move(templates),
+                /* allow_image           */ false,
+                /* allow_audio           */ false,
+                /* allow_video           */ false,
+                /* enable_thinking       */ params_base.enable_reasoning != 0 && supports_thinking,
+                /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
+                /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                /* media_path            */ params_base.media_path,
+                /* media_allow_private   */ params_base.media_allow_private_urls,
+                /* force_pure_content    */ params_base.force_pure_content_parser
+            };
+
+            if (!params_base.ui_config_json.empty()) {
+                json_ui_settings = json::parse(params_base.ui_config_json);
+            }
+
+            model_name = params_base.model_alias.empty() ? dir.filename().string() : *params_base.model_alias.begin();
+            model_aliases = params_base.model_alias;
+            model_tags = params_base.model_tags;
+            slot_prompt_similarity = 0.0f;
+            direct_backend = true;
+            mtmd_cap.chat = true;
+
+            const int cpu_threads = params_base.cpuparams.n_threads > 0 ? params_base.cpuparams.n_threads : 5;
+
+            // The direct engine needs the tuned offload profile; keep explicit user overrides.
+            const auto set_env_default = [](const char * name, const char * value) {
+                if (std::getenv(name) == nullptr) {
+                    setenv(name, value, 0);
+                }
+            };
+            if (std::getenv("INK2_NUMA_POOL") == nullptr && std::getenv("STRATA_NUMA_POOL") == nullptr) {
+                setenv("INK2_NUMA_POOL", "0", 0);
+            }
+            set_env_default("INK2_CPU_ACT", "int8");
+            set_env_default("INK2_CPU_OPT", "29");
+            set_env_default("INK2_OFF_MARGIN_MIB", "64");
+            set_env_default("INK2_MX_POOL_FRACTION", "0.08");
+
+            std::filesystem::path route_profile;
+            if (const char * env = std::getenv("INK2_ROUTE_PROFILE"); env != nullptr && env[0] != '\0') {
+                route_profile = env;
+            } else {
+                // best512 wins at 16K prompt + 512; the long-context profile wins at 32K and above.
+                const char * preferred = (n_ctx > 16384 && n_ctx <= 20480) ? "inkling2-routes-best512.freq" : "inkling2-routes-256k-decode.freq";
+                for (const char * name : { preferred, "inkling2-routes-256k-decode.freq", "inkling2-routes-best512.freq", "inkling2-routes-profiled.freq", "inkling2-routes.freq", "routes.freq" }) {
+                    const auto candidate = dir / name;
+                    if (std::filesystem::exists(candidate)) {
+                        route_profile = candidate;
+                        break;
+                    }
+                }
+            }
+            if (!route_profile.empty() && !std::filesystem::exists(route_profile)) {
+                SRV_WRN("direct Inkling route profile does not exist: %s\n", route_profile.string().c_str());
+                route_profile.clear();
+            }
+            if (route_profile.empty()) {
+                SRV_WRN("%s", "direct Inkling route profile is not set; expert placement will use index order\n");
+            }
+
+            // 4K chunks keep decode throughput; 8K hurts the post-prefill pool refill.
+            const int chunk = 4096;
+            std::vector<std::string> args = {
+                "bel-inkling2", "--model", dir.string(), "--serve", "--max-context", std::to_string(n_ctx),
+                "--chunk", std::to_string(chunk), "--graph", "1", "--tc", "1", "--kv", "i8r",
+                "--vram-reserve-mib", "0", "--cpu-threads", std::to_string(cpu_threads),
+                "--kv-grow", "1", "--kv-grow-step", "4096"
+            };
+            if (!route_profile.empty()) {
+                args.push_back("--expert-frequencies");
+                args.push_back(route_profile.string());
+            }
+            direct_worker = std::make_unique<inkling2_server_worker>();
+            if (!direct_worker->start(args)) {
+                throw std::runtime_error("failed to start direct checkpoint engine");
+            }
+
+            slots.clear();
+            slots.emplace_back();
+            auto & slot = slots.back();
+            slot.id = 0;
+            slot.n_ctx = n_ctx;
+            slot.vocab = vocab;
+            slot.callback_on_release = [this](int id_slot) { queue_tasks.pop_deferred_task(id_slot); };
+            slot.callback_on_reset = [this](const server_slot & released) {
+                if (released.stats.n_gen > 0) {
+                    metrics_on_prediction(released);
+                }
+            };
+            slot.reset();
+
+            queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
+                return process_single_task(std::move(task), is_yielding);
+            });
+            queue_tasks.on_update_slots([this]() { update_slots(); });
+            queue_tasks.on_sleeping_state([this](bool sleeping) { handle_sleeping_state(sleeping); });
+            metrics.init();
+
+            params = params_base;
+            if (callback_state) {
+                callback_state(SERVER_STATE_READY, {});
+            }
+            SRV_INF("loaded direct Inkling checkpoint '%s' with i8r KV, context %d, route profile %s\n",
+                    dir.string().c_str(), n_ctx, route_profile.empty() ? "(none)" : route_profile.string().c_str());
+            return true;
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to initialize direct Inkling checkpoint: %s\n", e.what());
+            return false;
+        }
+#endif
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1212,6 +1598,11 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        const std::filesystem::path model_path(params_base.model.path);
+        if (!is_resume && std::filesystem::is_directory(model_path) &&
+            std::filesystem::exists(model_path / "model-00001-of-00001.safetensors")) {
+            return init_inkling2_backend(params);
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1526,6 +1917,7 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
+            slot.vocab   = vocab;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
@@ -1954,6 +2346,42 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (direct_backend) {
+            if ((task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL) ||
+                task.is_parent() || task.is_child() || task.tokens.has_mtmd) {
+                send_error(task, "direct checkpoint mode supports one text completion per request", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            const auto & sampling = task.params.sampling;
+            if (!sampling.grammar.empty() || !sampling.logit_bias.empty() || sampling.ignore_eos || sampling.n_probs > 0 ||
+                sampling.dynatemp_range != 0.0f || sampling.typ_p != 1.0f || sampling.xtc_probability != 0.0f ||
+                sampling.penalty_repeat != 1.0f || sampling.penalty_freq != 0.0f || sampling.penalty_present != 0.0f ||
+                sampling.dry_multiplier != 0.0f || sampling.mirostat != 0 || sampling.top_n_sigma >= 0.0f) {
+                send_error(task, "direct checkpoint mode supports temperature, top-k, top-p, and min-p sampling", ERROR_TYPE_NOT_SUPPORTED);
+                return false;
+            }
+            for (const auto token : task.tokens.get_tokens()) {
+                if (token < 0 || token >= llama_vocab_n_tokens(vocab)) {
+                    send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+            }
+            if (task.tokens.size() >= (size_t) slot.n_ctx) {
+                send_error(task.id, "prompt exceeds the direct checkpoint context", ERROR_TYPE_EXCEED_CONTEXT_SIZE,
+                           (int32_t) task.tokens.size(), slot.n_ctx);
+                return false;
+            }
+
+            slot.prompt_clear();
+            slot.prompt.tokens.insert(task.tokens.get_text_tokens());
+            slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+            slot.task = std::make_unique<const server_task>(std::move(task));
+            slot.state = SLOT_STATE_STARTED;
+            slot.stats.update_prompt_start();
+            n_empty_consecutive = 0;
+            return true;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2427,7 +2855,8 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
-        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
+        res->prompt          = ctx_tgt ? slot.task->tokens.detokenize(ctx_tgt, true)
+                                       : common_detokenize(vocab, slot.task->tokens.get_text_tokens(), true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
         res->truncated             = slot.truncated;
@@ -3012,6 +3441,16 @@ private:
 
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
+        if (direct_backend && task.type != SERVER_TASK_TYPE_COMPLETION && task.type != SERVER_TASK_TYPE_INFILL &&
+            task.type != SERVER_TASK_TYPE_CANCEL && task.type != SERVER_TASK_TYPE_CONTROL &&
+            task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+            send_error(task, "direct checkpoint mode supports text generation only", ERROR_TYPE_NOT_SUPPORTED);
+            return true;
+        }
+        if (direct_backend && (task.is_parent() || task.is_child())) {
+            send_error(task, "direct checkpoint mode supports one completion per request", ERROR_TYPE_NOT_SUPPORTED);
+            return true;
+        }
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
@@ -3028,7 +3467,7 @@ private:
             case SERVER_TASK_TYPE_TTS:
             case SERVER_TASK_TYPE_DECISION:
                 {
-                    if (task.need_sampling() && !decision.can_generate()) {
+                    if (!direct_backend && task.need_sampling() && !decision.can_generate()) {
                         send_error(task, "This model is a decision model without text generation, use /v1/systemone", ERROR_TYPE_NOT_SUPPORTED);
                         break;
                     }
@@ -3556,7 +3995,77 @@ private:
         return false;
     }
 
+#ifdef LLAMA_BUILD_INKLING2_ENGINE
+    void update_slots_direct() {
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_STARTED || !slot.task) {
+                return;
+            }
+
+            const llama_tokens prompt = slot.task->tokens.get_text_tokens();
+            int max_new = slot.n_predict_max >= 0 ? slot.n_predict_max : slot.n_ctx - (int) prompt.size();
+            max_new = std::max(0, std::min(max_new, slot.n_ctx - (int) prompt.size()));
+            if (slot.task->params.stream) {
+                send_partial_response(slot, {}, false, true);
+            }
+
+            inkling2_worker_result result;
+            std::string error;
+            bool invalid_token = false;
+            const bool ok = direct_worker->generate(prompt, max_new, slot.task->params.sampling,
+                [&](llama_token token) {
+                    if (token < 0 || token >= llama_vocab_n_tokens(vocab)) {
+                        invalid_token = true;
+                        return false;
+                    }
+                    completion_token_output output;
+                    output.tok = token;
+                    const bool accept_special = params_base.special ||
+                        slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+                    output.text_to_send = common_token_to_piece(vocab, token, accept_special);
+                    output.prob = 1.0f;
+                    ++slot.stats.n_gen;
+                    const int64_t t_now = ggml_time_us();
+                    if (slot.stats.n_gen == 1) {
+                        slot.stats.set_prompt_last(t_now);
+                    }
+                    slot.stats.update_gen_last();
+                    return process_token(output, slot);
+                }, result, error);
+
+            if (!ok || invalid_token) {
+                send_error(slot, invalid_token ? "direct checkpoint engine returned an out-of-range token" :
+                    (error.empty() ? "direct checkpoint generation failed" : error));
+                slot.release();
+                return;
+            }
+
+            slot.stats.n_prompt_processed = result.prompt_tokens_processed;
+            slot.stats.n_prompt_cached = result.prompt_tokens_cached;
+            slot.stats.t_prompt_last = std::max<int64_t>(slot.stats.t_start + 1,
+                slot.stats.t_start + (int64_t) (result.prompt_ms * 1000.0));
+            slot.stats.t_gen_last = std::max<int64_t>(slot.stats.t_prompt_last + 1,
+                slot.stats.t_prompt_last + (int64_t) (result.decode_ms * 1000.0));
+            metrics.add_prompt(result.prompt_tokens_processed, (uint64_t) (result.prompt_ms * 1000.0));
+
+            if (slot.stop == STOP_TYPE_NONE) {
+                slot.stop = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
+            }
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+        });
+    }
+#endif
+
     void update_slots() {
+#ifdef LLAMA_BUILD_INKLING2_ENGINE
+        if (direct_backend) {
+            update_slots_direct();
+            return;
+        }
+#endif
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -5106,6 +5615,9 @@ private:
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
     int n_ctx_slot() const {
+        if (direct_backend) {
+            return n_ctx;
+        }
         int res = llama_n_ctx_seq(ctx_tgt);
 
         if (params_base.kv_unified_per_slot > 0) {
@@ -5260,6 +5772,51 @@ server_response_reader server_context::get_response_reader() {
 }
 
 server_context_meta server_context::get_meta() const {
+    if (impl->direct_backend) {
+        const auto bos_id = llama_vocab_bos(impl->vocab);
+        const auto eos_id = llama_vocab_eos(impl->vocab);
+        const auto model_file = std::filesystem::path(impl->params_base.model.path) / "model-00001-of-00001.safetensors";
+        const uint64_t model_size = std::filesystem::exists(model_file) ? std::filesystem::file_size(model_file) : 0;
+        static const std::string ftype_name = "NVFP4 + MXFP8 safetensors";
+        return server_context_meta {
+            /* build_info              */ std::string(llama_build_info()),
+            /* model_name              */ impl->model_name,
+            /* model_aliases           */ impl->model_aliases,
+            /* model_tags              */ impl->model_tags,
+            /* model_path              */ impl->params_base.model.path,
+            /* model_output_modalities */ {"text"},
+            /* has_mtmd                */ false,
+            /* has_inp_image           */ false,
+            /* has_inp_audio           */ false,
+            /* has_inp_video           */ false,
+            /* has_cap_chat            */ true,
+            /* has_cap_tts             */ false,
+            /* has_audio_stream        */ false,
+            /* tts_voices              */ {},
+            /* json_ui_settings        */ impl->json_ui_settings,
+            /* slot_n_ctx              */ impl->n_ctx_slot(),
+            /* pooling_type            */ LLAMA_POOLING_TYPE_NONE,
+            /* chat_params             */ impl->chat_params,
+            /* chat_template_caps      */ common_chat_templates_get_caps(impl->chat_params.tmpls.get()),
+            /* bos_token_str           */ bos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->vocab, bos_id, true) : "",
+            /* eos_token_str           */ eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->vocab, eos_id, true) : "",
+            /* fim_pre_token           */ llama_vocab_fim_pre(impl->vocab),
+            /* fim_sub_token           */ llama_vocab_fim_suf(impl->vocab),
+            /* fim_mid_token           */ llama_vocab_fim_mid(impl->vocab),
+            /* fim_pad_token           */ llama_vocab_fim_pad(impl->vocab),
+            /* fim_rep_token           */ llama_vocab_fim_rep(impl->vocab),
+            /* fim_sep_token           */ llama_vocab_fim_sep(impl->vocab),
+            /* logit_bias_eog          */ impl->params_base.sampling.logit_bias_eog,
+            /* model_vocab_type        */ llama_vocab_type(impl->vocab),
+            /* model_vocab_n_tokens    */ llama_vocab_n_tokens(impl->vocab),
+            /* model_n_ctx_train       */ impl->direct_ctx_train,
+            /* model_n_embd_inp        */ impl->direct_n_embd,
+            /* model_n_params          */ 0,
+            /* model_size              */ model_size,
+            /* model_ftype             */ ftype_name,
+        };
+    }
+
     auto bos_id = llama_vocab_bos(impl->vocab);
     auto eos_id = llama_vocab_eos(impl->vocab);
     auto bos_token_str = bos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, bos_id, true) : "";

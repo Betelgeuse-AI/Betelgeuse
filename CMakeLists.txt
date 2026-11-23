@@ -226,11 +226,21 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
+option(LLAMA_BUILD_INKLING2_ENGINE "llama: build the Inkling-2 direct-checkpoint CUDA backend for bel-server" OFF)
+
 #
 # build the library
 #
 
 add_subdirectory(src)
+
+if (LLAMA_BUILD_INKLING2_ENGINE)
+    if (NOT GGML_CUDA)
+        message(FATAL_ERROR "LLAMA_BUILD_INKLING2_ENGINE requires GGML_CUDA")
+    endif()
+    enable_language(CUDA)
+    add_subdirectory(tools/inkling2)
+endif()
 
 #
 # utils, programs, examples and tests
