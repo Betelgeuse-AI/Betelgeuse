@@ -254,7 +254,7 @@ unsigned kv_grid(size_t n) { return (unsigned) std::min<size_t>((n + 255) / 256,
 struct VisArena { uint8_t* p = nullptr; size_t bytes = 0; int pool_saved = -1; };
 void vis_graphs_drop() {   // the decode graph and the verify graphs bake the slot counts in (as pool_resize)
     if (E.exec) { CK(cudaGraphExecDestroy(E.exec)); E.exec = nullptr; }
-    for (auto& x : g_vexec) if (x) { CK(cudaGraphExecDestroy(x)); x = nullptr; }
+    for (auto& by_output : g_vexec) for (auto& x : by_output) if (x) { CK(cudaGraphExecDestroy(x)); x = nullptr; }
 }
 std::string vis_arena_get(VisArena& a, size_t bytes) {
     CK(cudaDeviceSynchronize());

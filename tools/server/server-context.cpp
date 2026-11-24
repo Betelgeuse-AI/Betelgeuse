@@ -1499,6 +1499,15 @@ private:
             mtmd_cap.chat = true;
 
             const int cpu_threads = params_base.cpuparams.n_threads > 0 ? params_base.cpuparams.n_threads : 5;
+            int spec_draft_n_max = 0;
+            if (const char * env = std::getenv("INK2_SPEC_DRAFT_N_MAX"); env != nullptr && env[0] != '\0') {
+                char * end = nullptr;
+                const long value = std::strtol(env, &end, 10);
+                if (end == env || *end != '\0' || value < 1 || value > 2) {
+                    throw std::runtime_error("INK2_SPEC_DRAFT_N_MAX must be 1 or 2");
+                }
+                spec_draft_n_max = (int) value;
+            }
 
             // The direct engine needs the tuned offload profile; keep explicit user overrides.
             const auto set_env_default = [](const char * name, const char * value) {
@@ -1544,6 +1553,9 @@ private:
                 "--vram-reserve-mib", "0", "--cpu-threads", std::to_string(cpu_threads),
                 "--kv-grow", "1", "--kv-grow-step", "4096"
             };
+            if (spec_draft_n_max > 0) {
+                args.insert(args.end(), {"--spec", "1", "--spec-draft-n-max", std::to_string(spec_draft_n_max)});
+            }
             if (!route_profile.empty()) {
                 args.push_back("--expert-frequencies");
                 args.push_back(route_profile.string());
@@ -1551,6 +1563,9 @@ private:
             direct_worker = std::make_unique<inkling2_server_worker>();
             if (!direct_worker->start(args)) {
                 throw std::runtime_error("failed to start direct checkpoint engine");
+            }
+            if (spec_draft_n_max > 0) {
+                SRV_INF("direct Inkling DSpark verify enabled with max %d draft tokens\n", spec_draft_n_max);
             }
 
             slots.clear();

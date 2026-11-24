@@ -3383,7 +3383,8 @@ size_t kv_mapped_for(int cells) {
 size_t vram_free() { size_t fr = 0, tot = 0; CK(cudaMemGetInfo(&fr, &tot)); return fr; }
 size_t vram_keep() { return ((size_t) std::max(E.reserve_mib, 0) << 20) + ((size_t) g_off_margin_mib << 20); }   // as setup_offload
 void promote_cancel();                   // (CPU experts)
-cudaGraphExec_t g_vexec[2] = {};         // the --spec verify graphs (forward_prefill): the slot counts baked in too
+cudaGraphExec_t g_vexec[9][2] = {};      // verify graphs indexed by rows and argmax/sampling output
+int g_spec_draft_n_max = 0;
 void pool_resize(bool nv, int n) {
     int& ns = nv ? E.nslot_nv : E.nslot_mx;
     VRange& r = nv ? E.vpool_nv : E.vpool_mx;
@@ -3405,7 +3406,7 @@ void pool_resize(bool nv, int n) {
     }
     ns = n;
     if (E.exec) { CK(cudaGraphExecDestroy(E.exec)); E.exec = nullptr; }
-    for (auto& x : g_vexec) if (x) { CK(cudaGraphExecDestroy(x)); x = nullptr; }
+    for (auto& by_output : g_vexec) for (auto& x : by_output) if (x) { CK(cudaGraphExecDestroy(x)); x = nullptr; }
 }
 void refill_lazy_pool() {
     if (!E.lazy_experts) return;
@@ -3863,7 +3864,7 @@ __global__ void k_cache_cpu(int l, const int* __restrict__ ids, const float* __r
 __global__ void k_cache_cpu_batch(int l, int T, const int* __restrict__ ids, const int* __restrict__ slot,
                                   const float* __restrict__ x,
                                   const uint8_t* const* __restrict__ tab, Bells bells, int nodes, unsigned* seq,
-                                  unsigned* cur) {
+                                  unsigned* cur, unsigned* miss_unique, unsigned* miss_rows) {
     __shared__ int nj, experts[ink2cpu::BELL_K], count[ink2cpu::BELL_K];
     __shared__ int rows[ink2cpu::BELL_K][ink2cpu::BELL_T], slots[ink2cpu::BELL_K][ink2cpu::BELL_T];
     if (threadIdx.x == 0) {
@@ -3886,6 +3887,12 @@ __global__ void k_cache_cpu_batch(int l, int T, const int* __restrict__ ids, con
     if (!nj) {
         if (threadIdx.x == 0) *cur = 0;
         return;
+    }
+    if (threadIdx.x == 0) {
+        int nr = 0;
+        for (int j = 0; j < nj; ++j) nr += count[j];
+        if (miss_unique) atomicAdd(miss_unique + l, (unsigned) nj);
+        if (miss_rows) atomicAdd(miss_rows + l, (unsigned) nr);
     }
     for (int b = 0; b < nodes; ++b)
         for (int j = threadIdx.x; j < nj; j += blockDim.x) {
@@ -4425,6 +4432,8 @@ struct Prefill {
     std::vector<uint8_t> verify_mask;
     bool verify_route_misses = false;
     size_t fbytes = 0;
+    unsigned* verify_cpu_unique = nullptr;
+    unsigned* verify_cpu_rows = nullptr;
     // speculative decoding (--spec): per chunk row, the drafter's target features [T][4][H] (h entering layer visits
     // 5, 23, 41, final normed output); verify mode: per-row greedy token into am[T] instead of the last row's logits
     float* feat = nullptr;
@@ -4865,7 +4874,8 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
         }
     }
     kb_moe_plan<<<1, 1024>>>(PF.ids, T, PF.rows, PF.slot, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt);
-    if (cpu_verify) k_cache_cpu_batch<<<1, 256>>>(l, T, PF.ids, PF.slot, x, X.tA, E.bell_d, E.cpu_nodes, E.d_seq, E.d_cur);
+    if (cpu_verify) k_cache_cpu_batch<<<1, 256>>>(l, T, PF.ids, PF.slot, x, X.tA, E.bell_d, E.cpu_nodes, E.d_seq,
+                                                  E.d_cur, PF.verify_cpu_unique, PF.verify_cpu_rows);
     const int nr = T * TOPK, maxt = nr / FM + NE;
     // A short chunk uses few experts: it makes the ones it routes to resident through the decode cache (groups of 8
     // tokens: at most 64 misses per plan) instead of streaming every expert the pools do not hold.
@@ -5359,7 +5369,7 @@ struct Drafter {
     int *drafts, *pi;
     // stats
     long verifies = 0, accepted = 0, hk[DBLK] = {}, plain = 0, switches = 0, gated = 0;
-    long spec_committed = 0, plain_samples = 0;
+    long spec_committed = 0, plain_samples = 0, offered = 0;
     double spec_ms = 0.0, plain_ms = 0.0, draft_ms = 0.0, verify_ms = 0.0;
 };
 Drafter D;
@@ -5567,8 +5577,9 @@ void forward_prefill(const int* toks, int T, int pos0, float* all) {
         CK(cudaMemcpyAsync(PF.x0, e.data(), ES * 4, cudaMemcpyHostToDevice, cudaStreamPerThread));
         CK(cudaStreamSynchronize(cudaStreamPerThread));
     }
-    if (PF.rows_argmax && E.graph && T == DBLK) {   // verify block (offload: through the decode cache): one graph per output variant
-        cudaGraphExec_t& x = g_vexec[PF.rows_copy ? 1 : 0];
+    const bool small_spec_graph = g_spec_draft_n_max > 0 && T == g_spec_draft_n_max + 1;
+    if (PF.rows_argmax && E.graph && (T == DBLK || small_spec_graph)) {
+        cudaGraphExec_t& x = g_vexec[T][PF.rows_copy ? 1 : 0];
         CK(cudaMemcpyToSymbolAsync(d_vpos, &pos0, 4, 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
         if (!x) {
             cudaGraph_t g;
@@ -5576,6 +5587,7 @@ void forward_prefill(const int* toks, int T, int pos0, float* all) {
             forward_prefill_device(T, -1, nullptr);
             CK(cudaStreamEndCapture(cudaStreamPerThread, &g));
             CK(cudaGraphInstantiate(&x, g, 0));
+            if (small_spec_graph) std::fprintf(stderr, "INK2_VERIFY_GRAPH rows=%d rows_copy=%d captured\n", T, PF.rows_copy);
         }
         CK(cudaGraphLaunch(x, cudaStreamPerThread));
         CK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -5733,6 +5745,7 @@ constexpr int EOS_ID = 200006;   // <|content_model_end_sampling|> (generation_c
 }  // namespace
 
 int ink2_engine_main(int argc, char** argv) {
+    const bool spec_diag = std::getenv("INK2_SPEC_DIAG") && std::atoi(std::getenv("INK2_SPEC_DIAG")) != 0;
     if (const char* r = std::getenv("INK2_RPW")) g_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_SEL_RPW")) g_sel_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_GEMV_MINB")) g_gemv_min_blocks = std::atoi(r);
@@ -5779,6 +5792,7 @@ int ink2_engine_main(int argc, char** argv) {
         else if (a == "--tc") PF.tc = std::atoi(v) != 0;
         else if (a == "--vram-reserve-mib") E.reserve_mib = std::atoi(v);
         else if (a == "--spec") spec = std::atoi(v) != 0;
+        else if (a == "--spec-draft-n-max") g_spec_draft_n_max = std::atoi(v);
         else if (a == "--cpu-threads") E.cpu_threads = std::atoi(v);
         else if (a == "--kv-grow") E.grow = std::atoi(v) != 0;
         else if (a == "--conversation-cache-mib") cc_mib = std::atoi(v);
@@ -5827,13 +5841,21 @@ int ink2_engine_main(int argc, char** argv) {
     if (E.grow) vmm_init();
     if (dir.empty() || (ids.empty() && !serve && vis_pixels.empty())) {
         std::fprintf(stderr, "usage: bel-inkling2 --model DIR (--serve | --tokens IDS | --tokens-file F) [--n N] [--ctx N] "
-                             "[--chunk N] [--tc 0|1] [--kv f16|fp16|f32|i8|int8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N [--cpu-threads N]] [--expert-frequencies FILE] [--spec 0|1] [--dump-logits F] [--conversation-cache-mib N [--conversation-cache-min-tokens N]] [--image FILE ... [--image-max-tokens N] [--dump-image-emb F]] [--vis-pixels F]\n");
+                             "[--chunk N] [--tc 0|1] [--kv f16|fp16|f32|i8|int8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N [--cpu-threads N]] [--expert-frequencies FILE] [--spec 0|1 [--spec-draft-n-max 1|2]] [--dump-logits F] [--conversation-cache-mib N [--conversation-cache-min-tokens N]] [--image FILE ... [--image-max-tokens N] [--dump-image-emb F]] [--vis-pixels F]\n");
+        return 2;
+    }
+    if (g_spec_draft_n_max < 0 || g_spec_draft_n_max > 2) {
+        std::fprintf(stderr, "--spec-draft-n-max must be 1 or 2\n");
+        return 2;
+    }
+    if (g_spec_draft_n_max > 0 && (!spec || !E.graph || E.cpu_threads <= 0 || E.reserve_mib < 0)) {
+        std::fprintf(stderr, "--spec-draft-n-max needs --spec 1, --graph 1, --vram-reserve-mib, and --cpu-threads\n");
         return 2;
     }
     if (serve && PF.TP <= 0) { std::fprintf(stderr, "--serve needs --chunk > 0\n"); return 2; }
     if (E.cpu_threads > 0) {   // CPU decode and verifier misses
         if (E.reserve_mib < 0) { std::fprintf(stderr, "--cpu-threads needs --vram-reserve-mib (expert offload)\n"); return 2; }
-        if (spec && E.graph) {
+        if (spec && E.graph && g_spec_draft_n_max == 0) {
             std::fprintf(stderr, "--cpu-threads with --spec needs --graph 0 until the captured CPU verifier matches the uncaptured path\n");
             return 2;
         }
@@ -5868,9 +5890,8 @@ int ink2_engine_main(int argc, char** argv) {
     else load();
     if (PF.TP > 0) PF_RING_EXTRA = PF.TP;
     alloc_state();
-    // CBA: not with --spec: its verify blocks read the prompt buffers between prompts; they stay mapped (fixed) there,
-    // a per-verify map / unmap would cost two device syncs per block
-    g_pf_elastic = E.grow && E.offload && !spec;
+    // Small-batch DSpark uses a compact verify workspace after the prompt buffers are released.
+    g_pf_elastic = E.grow && E.offload && (!spec || g_spec_draft_n_max > 0);
     if (PF.TP > 0) alloc_prefill();
     const size_t rec_n = (size_t) NCALLS * E.ctx * TOPK;
     if (E.rec_mode) E.rec = (int*) dalloc(rec_n * 4);
@@ -5891,6 +5912,10 @@ int ink2_engine_main(int argc, char** argv) {
         PF.am = (int*) dalloc(DBLK * 4);
         CK(cudaHostAlloc((void**) &PF.rows_host, (size_t) DBLK * VOCAB * 4, cudaHostAllocDefault));
         g_fring = dfloats((size_t) FRING * 4 * H);
+        if (spec_diag && E.cpu) {
+            PF.verify_cpu_unique = (unsigned*) dalloc(NL * 4);
+            PF.verify_cpu_rows = (unsigned*) dalloc(NL * 4);
+        }
     }
     if (E.offload) setup_offload();
     if (E.cpu) setup_cpu();
@@ -5933,8 +5958,8 @@ int ink2_engine_main(int argc, char** argv) {
     std::fprintf(stderr, "load %.1f s, %.2f GiB in VRAM (ctx %d)\n", (now_ms() - t_load) / 1000, g_vram / 1073741824.0, E.ctx);
 
     // Speculative continuation (--spec): `first` was sampled for position p (not fed yet; already emitted by the
-    // caller).  Draft 7 / verify 8 until emit() returns false, max_new tokens in all, or stop; the target's per-row
-    // distributions decide (greedy: the draft is the row's argmax; sampling: accept the greedy draft d with
+    // caller). The target checks a fixed window or the selected prefix until emit() returns false, max_new tokens in all,
+    // or stop. Its per-row distributions decide (greedy: the draft is the row's argmax; sampling: accept the draft d with
     // probability P(d), else draw from P without d, which leaves the output distribution exactly the target's).
     // Near the context end: the one-token path.  Returns the number of tokens emitted (first included).
     // Adaptive: after plain probes, compare the EMA time per emitted token and keep the rest of the response plain
@@ -5942,6 +5967,7 @@ int ink2_engine_main(int argc, char** argv) {
     // decode graph's feature ring.
     constexpr int PLAIN_PROBE = 4, SPEC_MIN = 1;
     constexpr double SPEC_MIN_GAIN = 0.05;
+    const int spec_window = g_spec_draft_n_max > 0 ? g_spec_draft_n_max : DBLK - 1;
     const bool spec_force = std::getenv("INK2_SPEC_FORCE") != nullptr;   // tests: never fall back
     auto spec_continue = [&](int first, int p, int max_new, Sampler& s, const std::function<bool(int)>& emit,
                              const std::atomic<bool>* stop) {
@@ -5980,6 +6006,7 @@ int ink2_engine_main(int argc, char** argv) {
             }
             const double t0 = now_ms();
             const double td = now_ms();
+            kv_fit(p + DBLK);
             draft_run(anchor, p);
             int d[DBLK], g[DBLK];
             CK(cudaMemcpy(d, D.drafts, DBLK * 4, cudaMemcpyDeviceToHost));
@@ -5990,41 +6017,75 @@ int ink2_engine_main(int argc, char** argv) {
             PF.rows_copy = rows != nullptr;
             int k = 0, next = -1;
             double verify_ms = 0.0;
-            for (int off = 0; off < DBLK && next < 0; off += 2) {
-                const int t = std::min(2, DBLK - off);
-                const bool dump_rows = debug_verify_logits && debug_logit_pos >= p + off && debug_logit_pos < p + off + t;
+            if (g_spec_draft_n_max > 0) {
+                const int T = spec_window + 1;
+                const bool dump_rows = debug_verify_logits && debug_logit_pos >= p && debug_logit_pos < p + T;
                 PF.rows_copy = rows != nullptr || dump_rows;
-                forward_prefill(d + off, t, p + off, nullptr);
+                forward_prefill(d, T, p, nullptr);
                 if (dump_rows) {
-                    const int r = debug_logit_pos - p - off;
+                    const int r = debug_logit_pos - p;
                     std::fwrite(PF.rows_host + (size_t) r * VOCAB, 4, VOCAB, debug_verify_logits);
                     std::fflush(debug_verify_logits);
                 }
-                CK(cudaMemcpy(g + off, PF.am, (size_t) t * 4, cudaMemcpyDeviceToHost));
-                const float* chunk_rows = rows;
+                CK(cudaMemcpy(g, PF.am, (size_t) T * 4, cudaMemcpyDeviceToHost));
                 int used = 0;
-                for (int r = 0; r < t; ++r) {
-                    const int idx = off + r;
+                for (int r = 0; r < T; ++r) {
                     ++used;
-                    if (idx == DBLK - 1) {
-                        next = chunk_rows ? sample(chunk_rows + (size_t) r * VOCAB, s) : g[idx];
-                        k = idx;
+                    if (r == spec_window) {
+                        next = rows ? sample(rows + (size_t) r * VOCAB, s) : g[r];
+                        k = r;
                         break;
                     }
-                    if (!chunk_rows) {
-                        if (d[idx + 1] != g[idx]) { next = g[idx]; k = idx; break; }
+                    if (!rows) {
+                        if (d[r + 1] != g[r]) { next = g[r]; k = r; break; }
                     } else {
-                        const Dist dist = make_dist(chunk_rows + (size_t) r * VOCAB, s);
+                        const Dist dist = make_dist(rows + (size_t) r * VOCAB, s);
                         const double u = std::uniform_real_distribution<double>(0.0, 1.0)(s.rng);
-                        if (u >= prob(dist, d[idx + 1])) { next = draw(dist, s.rng, d[idx + 1]); k = idx; break; }
+                        if (u >= prob(dist, d[r + 1])) { next = draw(dist, s.rng, d[r + 1]); k = r; break; }
                     }
-                    k = idx + 1;
+                    k = r + 1;
                 }
-                CK(cudaMemcpyAsync(D.vfeat + (size_t) off * 4 * H, PF.feat, (size_t) used * 4 * H * 4,
-                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                CK(cudaMemcpyAsync(D.vfeat, PF.feat, (size_t) used * 4 * H * 4, cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread));
                 verify_ms += now_ms() - tv;
                 CK(cudaStreamSynchronize(cudaStreamPerThread));
-                tv = now_ms();
+            } else {
+                for (int off = 0; off < DBLK && next < 0; off += 2) {
+                    const int t = std::min(2, DBLK - off);
+                    const bool dump_rows = debug_verify_logits && debug_logit_pos >= p + off && debug_logit_pos < p + off + t;
+                    PF.rows_copy = rows != nullptr || dump_rows;
+                    forward_prefill(d + off, t, p + off, nullptr);
+                    if (dump_rows) {
+                        const int r = debug_logit_pos - p - off;
+                        std::fwrite(PF.rows_host + (size_t) r * VOCAB, 4, VOCAB, debug_verify_logits);
+                        std::fflush(debug_verify_logits);
+                    }
+                    CK(cudaMemcpy(g + off, PF.am, (size_t) t * 4, cudaMemcpyDeviceToHost));
+                    const float* chunk_rows = rows;
+                    int used = 0;
+                    for (int r = 0; r < t; ++r) {
+                        const int idx = off + r;
+                        ++used;
+                        if (idx == DBLK - 1) {
+                            next = chunk_rows ? sample(chunk_rows + (size_t) r * VOCAB, s) : g[idx];
+                            k = idx;
+                            break;
+                        }
+                        if (!chunk_rows) {
+                            if (d[idx + 1] != g[idx]) { next = g[idx]; k = idx; break; }
+                        } else {
+                            const Dist dist = make_dist(chunk_rows + (size_t) r * VOCAB, s);
+                            const double u = std::uniform_real_distribution<double>(0.0, 1.0)(s.rng);
+                            if (u >= prob(dist, d[idx + 1])) { next = draw(dist, s.rng, d[idx + 1]); k = idx; break; }
+                        }
+                        k = idx + 1;
+                    }
+                    CK(cudaMemcpyAsync(D.vfeat + (size_t) off * 4 * H, PF.feat, (size_t) used * 4 * H * 4,
+                                       cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                    verify_ms += now_ms() - tv;
+                    CK(cudaStreamSynchronize(cudaStreamPerThread));
+                    tv = now_ms();
+                }
             }
             PF.rows_argmax = PF.rows_copy = false;
             const int n0 = n;
@@ -6036,6 +6097,7 @@ int ink2_engine_main(int argc, char** argv) {
             anchor = next;
             ++D.verifies;
             D.accepted += k;
+            D.offered += spec_window;
             ++D.hk[k];
             CK(cudaDeviceSynchronize());
             const double dt = now_ms() - t0;
@@ -6136,8 +6198,13 @@ int ink2_engine_main(int argc, char** argv) {
             kv_trim((int) pr.size() + 1);
             if (spec && start == pr.size()) start = pr.size() - 1;   // re-fed: the drafter needs its features
             if (E.decode_misses) CK(cudaMemset(E.decode_misses, 0, NL * sizeof(unsigned long long)));
+            if (PF.verify_cpu_unique) {
+                CK(cudaMemsetAsync(PF.verify_cpu_unique, 0, NL * sizeof(unsigned), cudaStreamPerThread));
+                CK(cudaMemsetAsync(PF.verify_cpu_rows, 0, NL * sizeof(unsigned), cudaStreamPerThread));
+                CK(cudaStreamSynchronize(cudaStreamPerThread));
+            }
             const double t0 = now_ms();
-            const long acc0 = D.accepted, ver0 = D.verifies;
+            const long acc0 = D.accepted, ver0 = D.verifies, off0 = D.offered;
             if (const std::string ve = vis_encode(start); !ve.empty()) {
                 ink2_emit("ERR image: %s", ve.c_str());
                 smp.rng = std::move(s.rng);
@@ -6169,9 +6236,12 @@ int ink2_engine_main(int argc, char** argv) {
                 }
                 CK(cudaMemcpy(logits.data(), E.logits, (size_t) VOCAB * 4, cudaMemcpyDeviceToHost));
                 pf_unmap();
+            if (spec && max_new > 0 && g_spec_draft_n_max > 0 && g_pf_elastic) pf_map(g_spec_draft_n_max + 1);
             }
             sess_prompt_end(pr, logits);
             const double t1 = now_ms();
+            const double draft_ms0 = D.draft_ms, verify_ms0 = D.verify_ms;
+            const size_t verify_staging0 = PF.fbytes;
             std::vector<int> gen;
             const char* finish = "length";
             int pos = (int) pr.size();
@@ -6199,7 +6269,34 @@ int ink2_engine_main(int argc, char** argv) {
                     step(next, pos++, true);
                 }
             }
+            if (spec_diag && spec) {
+                const long verifies = D.verifies - ver0;
+                const long accepted = D.accepted - acc0;
+                const long offered = D.offered - off0;
+                unsigned cpu_unique[NL] = {}, cpu_rows[NL] = {};
+                if (PF.verify_cpu_unique) {
+                    CK(cudaMemcpy(cpu_unique, PF.verify_cpu_unique, sizeof(cpu_unique), cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(cpu_rows, PF.verify_cpu_rows, sizeof(cpu_rows), cudaMemcpyDeviceToHost));
+                }
+                unsigned core_unique = 0, outer_unique = 0, core_rows = 0, outer_rows = 0;
+                for (int l = 0; l < NL; ++l) {
+                    const bool core = l >= LOOP_BEGIN && l < LOOP_END;
+                    (core ? core_unique : outer_unique) += cpu_unique[l];
+                    (core ? core_rows : outer_rows) += cpu_rows[l];
+                }
+                const double mean_verifies = std::max(1L, verifies);
+                const size_t staged = PF.fbytes - verify_staging0;
+                std::fprintf(stderr,
+                             "INK2_SPEC_METRICS n_max=%d rows=%d graph=%d verifies=%ld accepted=%ld offered=%ld acceptance=%.4f tokens_per_verify=%.3f draft_ms=%.2f verify_ms=%.2f staged_mb_per_verify=%.4f cpu_unique_core_per_verify=%.3f cpu_unique_outer_per_verify=%.3f cpu_routes_core_per_verify=%.3f cpu_routes_outer_per_verify=%.3f\n",
+                             g_spec_draft_n_max, g_spec_draft_n_max + 1, E.graph, verifies, accepted, offered,
+                             offered ? (double) accepted / offered : 0.0,
+                             verifies ? 1.0 + (double) accepted / verifies : 0.0,
+                             (D.draft_ms - draft_ms0) / mean_verifies, (D.verify_ms - verify_ms0) / mean_verifies,
+                             staged / 1e6 / mean_verifies, core_unique / mean_verifies, outer_unique / mean_verifies,
+                             core_rows / mean_verifies, outer_rows / mean_verifies);
+            }
             const double t2 = now_ms();
+            if (spec && g_spec_draft_n_max > 0 && g_pf_elastic) pf_unmap();
             if (E.decode_misses) {
                 unsigned long long misses[NL] = {};
                 CK(cudaMemcpy(misses, E.decode_misses, sizeof(misses), cudaMemcpyDeviceToHost));
@@ -6214,7 +6311,7 @@ int ink2_engine_main(int argc, char** argv) {
             smp.rng = std::move(s.rng);
             // + drafts accepted / offered, prompt tokens not read (DONE fields 6-8: usage.cached_tokens)
             ink2_emit("DONE %zu %zu %.0f %.0f %s %ld %ld %zu", gen.size(), pr.size(), t1 - t0, t2 - t1, finish,
-                      D.accepted - acc0, (D.verifies - ver0) * (DBLK - 1), start);
+                      D.accepted - acc0, D.offered - off0, start);
         }
         return 0;
     }
@@ -6225,13 +6322,23 @@ int ink2_engine_main(int argc, char** argv) {
         if (ve.empty()) ve = vis_encode(0);
         if (!ve.empty()) { std::fprintf(stderr, "%s\n", ve.c_str()); return 1; }
     }
-    if (spec) {   // greedy speculative decoding: prompt in chunks, then draft 7 / verify 8
+    if (spec) {   // greedy speculative decoding: prompt in chunks, then draft and verify
         const double s0 = now_ms();
-        for (size_t p0 = 0; p0 < ids.size(); p0 += PF.TP) {
-            const int T = (int) std::min((size_t) PF.TP, ids.size() - p0);
+        for (size_t p0 = 0; p0 < ids.size();) {
+            int T = (int) std::min((size_t) PF.TP, ids.size() - p0);
+            if (g_pf_elastic) {
+                T = pf_fit(T, (int) p0);
+                if (T < g_pf_mapped_T) pf_unmap(false);
+                pf_map(T);
+            }
             forward_prefill(&ids[p0], T, (int) p0, nullptr);
             draft_context(PF.feat, (int) p0, T);
             if (p0 + T == ids.size()) draft_frnn(PF.feat + (size_t) (T - 1) * 4 * H);
+            p0 += T;
+        }
+        if (g_pf_elastic) {
+            pf_unmap();
+            if (g_spec_draft_n_max > 0) pf_map(g_spec_draft_n_max + 1);
         }
         CK(cudaMemcpy(logits.data(), E.logits, (size_t) VOCAB * 4, cudaMemcpyDeviceToHost));
         const double s1 = now_ms();
@@ -6248,8 +6355,9 @@ int ink2_engine_main(int argc, char** argv) {
         for (int t : out) std::printf(" %d", t);
         std::printf("\nprompt %zu tokens %.0f ms (%.1f tok/s), decode %zu tokens %.0f ms (%.1f tok/s)\n", ids.size(),
                     s1 - s0, 1000.0 * ids.size() / (s1 - s0), out.size(), s2 - s1, 1000.0 * out.size() / (s2 - s1));
-        std::printf("spec: %ld verifies, %.2f drafts accepted per verify (%.2f tokens per verify); accepted-count histogram:",
-                    D.verifies, (double) D.accepted / std::max(1L, D.verifies), 1.0 + (double) D.accepted / std::max(1L, D.verifies));
+        std::printf("spec: %ld verifies, %.3f acceptance (%.2f drafts accepted per verify, %.2f offered); accepted-count histogram:",
+                    D.verifies, (double) D.accepted / std::max(1L, D.offered),
+                    (double) D.accepted / std::max(1L, D.verifies), (double) D.offered / std::max(1L, D.verifies));
         for (int k = 0; k < DBLK; ++k) std::printf(" %ld", D.hk[k]);
         std::printf("; %ld plain tokens, %ld switches to plain, %ld requests gated\n", D.plain, D.switches, D.gated);
         if (E.lazy_experts) {
@@ -6261,6 +6369,7 @@ int ink2_engine_main(int argc, char** argv) {
             std::printf("mean spec phase per verify: draft %.1f ms, target verify %.1f ms, remaining %.1f ms\n",
                         D.draft_ms / D.verifies, D.verify_ms / D.verifies,
                         (D.spec_ms - D.draft_ms - D.verify_ms) / D.verifies);
+        if (g_pf_elastic) pf_unmap();
         if (debug_step_logits) std::fclose(debug_step_logits);
         if (debug_verify_logits) std::fclose(debug_verify_logits);
         return 0;

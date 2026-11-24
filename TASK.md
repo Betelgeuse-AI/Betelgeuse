@@ -57,3 +57,40 @@ The supplied warm target was 890.1 pp/s, 40.29 tok/s, 31.09 s combined. Mission 
 - [ ] Recover warm 16K prefill while keeping all 1,536 loop-core experts resident for decode; the measured core-floor build is not a performance pass.
 - [x] Removed the experimental 1,536-slot hard floor and phase flag. The paired data shows no decode gain, while existing post-prompt refill restores loop-core experts first.
 - [ ] Pin the bounded nonresident expert source in host RAM after resolving the 8 MiB process memlock limit; do not claim pinned coverage before measuring `VmLck`/`VmPin`.
+
+## Mission 2 - Small-batch DSpark verify
+
+### M1 audit summary
+
+1. M1 found CPU experts plus DSpark were rejected with graph capture because the captured CPU verifier was not considered equivalent to uncaptured execution; capture also required `T == DBLK`, while verify submitted two rows at a time.
+2. The old forced `--graph 0` run staged 252.8 MB per verify from the route-only path at about 3 GB/s; this predates the current CPU-batched verifier.
+3. Current code uses `k_cache_cpu_batch()` for unique nonresident experts across verify rows and skips expert staging for CPU verify; without CPU verify, it stages only routed misses.
+4. Historical acceptance varies by block and path: M1 recorded 0.52-0.72 at one draft in the supplied runs and 0.94 at two drafts, while its later CPU-hybrid DBLK2 record was about 0.51. These are not a controlled `n_max=1` versus `2` comparison, and parity still needs an exact-hash check.
+
+### Task 1 - Graphed `nt=2,3` resident and CPU-miss verify
+
+- [x] Added runtime `--spec-draft-n-max 1|2`. These modes verify 2 or 3 target rows in one call; the default fixed window and plain `nt=1` logic remain on their existing paths.
+- [x] Kept nonresident verification experts on `k_cache_cpu_batch()` and added opt-in counters for unique CPU experts, routed rows, and staged bytes.
+- [x] Captured verify graphs for 2 rows (`n_max=1`) and 3 rows (`n_max=2`); both generated 512 tokens. Graph logs report `rows=2` and `rows=3` captured.
+- [x] Added `INK2_SPEC_DRAFT_N_MAX=1|2` to the direct server backend and rebuilt `bel-inkling2`, `bel-server`, and `bel-cli` in `/home/zyxciss/fluxaeros-data/inkling-m2/build/` after the final KV growth fix.
+- [x] Small-batch mode releases the 4K prompt workspace before reserving compact verify buffers. Runtime placement had 1,536/1,536 loop-core experts resident before verify; after `kv_fit`, the pools held 1,583 NVFP4 + 64 MXFP8 slots.
+- [x] Runtime counters for both modes show 0.000 core CPU misses and 0.000 MB expert staging per verify. Outer CPU misses averaged 89.786 unique experts / 100.513 routed rows for `n_max=1`, and 125.583 / 151.288 for `n_max=2`.
+- [x] Both modes generated 512 greedy tokens matching the plain SHA-256 `7980d86af4291459d792ad069c25b36316371f06ea210dc9bb9fd449f52b397e`; no expert weights were requantized or omitted.
+- [x] `kv_fit(p + DBLK)` before drafting fixed the out-of-range draft K/V access observed in the first parity attempt.
+- [ ] Pin the nonresident expert source in host RAM. Current logs still report mmap-backed expert files and an 8 MiB `RLIMIT_MEMLOCK`; no pinned coverage is claimed.
+
+### Task 2 - One controlled comparison
+
+- [x] Used the single cgroup comparison session for the plain control and both draft modes. The plain arm completed; neither draft mode reached server readiness. Logs and samples are under `/home/zyxciss/fluxaeros-data/inkling-m2/`.
+- [x] The warm plain request processed 16,384 + 512 tokens at 905.84 pp/s / 40.31 tok/s (30.764 s combined). Its SHA-256 `7980d86af4291459d792ad069c25b36316371f06ea210dc9bb9fd449f52b397e` matches M1.
+- [x] The one controlled comparison session's candidate attempts exited during pool setup (5.12 GiB, 1,116 NVFP4 + 52 MXFP8, below the pool floor). After the compact-workspace and KV fixes, parity-only requests measured `n_max=1`: 763.68 pp/s / 20.31 tok/s; `n_max=2`: 773.45 pp/s / 18.87 tok/s. These single-request correctness runs are not a controlled paired speed comparison.
+- [x] Parity-run verify telemetry: `n_max=1` draft/verify 10.85/62.28 ms, acceptance 0.4839, 1.484 tokens/verify; `n_max=2` 10.86/75.37 ms, acceptance 0.3125, 1.625 tokens/verify. Both reported zero staged bytes and zero core misses.
+- [x] Cgroup values were `memory.high=14495514624`, `memory.max=15032385536`, `memory.swap.max=0`; `memory.peak=13054365696` bytes. `memory.events` reported `high=0`, `max=0`, `oom=0`, and `oom_kill=0`. Sampled VRAM peaked at 11,832 MiB during the plain arm; draft startup reached 6,420 MiB before exiting.
+- [x] VRAM sampled at 11,830 MiB (`n_max=1`) and 11,832 MiB (`n_max=2`), both below the 11,895 MiB limit. `n_max=1` cgroup peak was `14398156800` bytes with `memory.events.high=0`. The first `n_max=2` parity run recorded peak `14505472000` and 15,968 high events while its sampler repeatedly launched `nvidia-smi` inside the cgroup. An isolated rerun with the observer outside the model cgroup recorded peak `14489419776` bytes and `memory.events.high=0`; max, swap, and OOM events were also zero.
+- [x] Rebuilt and validated the draft K/V growth fix with exact output hashes. The single comparison allowance is used; do not run another speed comparison. Do not push.
+- [x] Repeated only `n_max=2` parity/resource validation with VRAM monitoring outside the model cgroup. It again generated 512 tokens with the plain hash, captured the 3-row graph, and stayed below both memory limits with zero `memory.events.high` events. This was not a speed comparison.
+- [ ] Complete a valid paired plain/DSpark speed comparison and meet the expected decode target. The sole comparison slot was used before the candidate pool fix; parity-only timings show a regression and cannot replace a paired comparison.
+
+### M2 run outcome
+
+The fixed 4K prompt workspace plus the loaded drafter left too little VRAM for expert pools in the only controlled comparison, so it produced a valid warm plain baseline but no DSpark comparison. The compact workspace and draft-KV growth fixes then passed greedy hash parity for both verify sizes. Parity-only decode measured 20.31 tok/s (`n_max=1`) and 18.87 tok/s (`n_max=2`), far below plain's 40.31 tok/s. Both modes met the isolated memory/VRAM envelope with the observer outside the model cgroup; the first instrumented n_max=2 run recorded high events. Graph correctness, hash parity, zero core misses, and zero staging are verified, but host pinning and the expected speed gain are not. The speed-comparison allowance is exhausted, so do not claim a paired DSpark speed result or rerun it.
