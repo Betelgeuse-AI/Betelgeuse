@@ -53,12 +53,24 @@ build/bin/bel-cli -m /home/zyxciss/Models/Inkling-2-Mini -c 1536 -t 5 \
   -p "Hello, my name is" -n 8 --no-display-prompt -st
 ```
 
-The server sets the same tuned environment as the standalone command, defaults to 5 CPU threads,
-uses i8r KV with a 4096-token chunk, and picks a route profile beside the checkpoint:
+The server forces the tuned engine environment (`STRATA_NUMA_POOL=0`, `INK2_CPU_ACT=int8`,
+`INK2_CPU_OPT=29`, `INK2_OFF_MARGIN_MIB=64`, `INK2_MX_POOL_FRACTION=0.08`), defaults to 5 CPU
+threads, uses `--spec 0`, i8r KV unless server flags select another supported cache format, and a
+4096-token chunk. It picks a route profile beside the checkpoint:
 `inkling2-routes-best512.freq` for a 16K prompt plus 512 output (`-c 16896`) and
-`inkling2-routes-256k-decode.freq` otherwise. Set `INK2_ROUTE_PROFILE` to override the choice, or
-set any of the `INK2_*` variables explicitly to override the defaults. Direct
-mode supports one active text request; no images, sleep/reload, draft models, or parallel requests.
+`inkling2-routes-256k-decode.freq` otherwise. Stale `INK2_SPEC_DRAFT_N_MAX`, `INK2_SPEC_FORCE`,
+`INK2_SPEC_DIAG`, and `INK2_ROUTE_PROFILE` values from an earlier shell are ignored so a DSpark
+experiment cannot silently slow a normal request. Set `INK2_ALLOW_TUNING_OVERRIDE` to opt back into
+environment overrides; use `bel-inkling2 --spec 1 --spec-draft-n-max N` for DSpark tests. Direct
+mode supports one active text request and temperature, top-k, top-p, min-p, seed, `ignore_eos`, and
+`cache_prompt`, which defaults to enabled. Keep `cache_prompt` enabled for production-style runs.
+`--cache-type-k q8_0 --cache-type-v q4_0` selects direct K8/V4 KV; the direct engine always uses
+tiled CUDA attention, including when `-fa on` is supplied. It also copies up to 512 MiB of
+route-ranked nonresident experts from the safetensors mapping into a pinned host pool, capped by
+available cgroup headroom and a 768 MiB safety reserve; colder experts remain file-backed. Set
+both `INK2_ALLOW_TUNING_OVERRIDE=1` and `INK2_PIN_HOST_MIB=N` to change that budget. Grammar, logit bias,
+repetition/frequency/presence penalties, mirostat, dry, and similar sampling options return an
+unsupported error. No images, sleep/reload, external draft models, or parallel requests.
 
 The embedded engine uses `ink2::embedded_server` for its line protocol, so a rebuild keeps
 `bel-server` and `bel-cli` working. The checkpoint reader is shared with the reference executable.

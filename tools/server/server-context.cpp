@@ -79,7 +79,7 @@ struct inkling2_server_worker {
         return false;
     }
 
-    bool generate(const llama_tokens & prompt, int max_new, const common_params_sampling & sampling,
+    bool generate(const llama_tokens & prompt, int max_new, bool cache_prompt, const common_params_sampling & sampling,
                   const std::function<bool(llama_token)> & on_token, inkling2_worker_result & result,
                   std::string & error_message) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -91,7 +91,8 @@ struct inkling2_server_worker {
         std::ostringstream command;
         const uint64_t seed = sampling.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : sampling.seed;
         command << "GEN " << max_new << " temperature=" << sampling.temp << " top_p=" << sampling.top_p
-                << " top_k=" << sampling.top_k << " min_p=" << sampling.min_p << " seed=" << seed << ' ';
+                << " top_k=" << sampling.top_k << " min_p=" << sampling.min_p << " ignore_eos="
+                << (sampling.ignore_eos ? 1 : 0) << " cache_prompt=" << (cache_prompt ? 1 : 0) << " seed=" << seed << ' ';
         for (size_t i = 0; i < prompt.size(); ++i) {
             if (i != 0) {
                 command << ',';
@@ -1499,34 +1500,33 @@ private:
             mtmd_cap.chat = true;
 
             const int cpu_threads = params_base.cpuparams.n_threads > 0 ? params_base.cpuparams.n_threads : 5;
-            int spec_draft_n_max = 0;
-            if (const char * env = std::getenv("INK2_SPEC_DRAFT_N_MAX"); env != nullptr && env[0] != '\0') {
-                char * end = nullptr;
-                const long value = std::strtol(env, &end, 10);
-                if (end == env || *end != '\0' || value < 1 || value > 2) {
-                    throw std::runtime_error("INK2_SPEC_DRAFT_N_MAX must be 1 or 2");
-                }
-                spec_draft_n_max = (int) value;
-            }
 
-            // The direct engine needs the tuned offload profile; keep explicit user overrides.
-            const auto set_env_default = [](const char * name, const char * value) {
-                if (std::getenv(name) == nullptr) {
-                    setenv(name, value, 0);
+            // A direct request must not inherit experiment settings from a DSpark session.
+            // Keep plain decode unless the caller explicitly asks to override the tuned profile.
+            const bool allow_tuning_override = std::getenv("INK2_ALLOW_TUNING_OVERRIDE") != nullptr;
+            const auto set_engine_env = [allow_tuning_override](const char * name, const char * value) {
+                if (!allow_tuning_override || std::getenv(name) == nullptr) {
+                    setenv(name, value, 1);
                 }
             };
-            if (std::getenv("INK2_NUMA_POOL") == nullptr && std::getenv("STRATA_NUMA_POOL") == nullptr) {
-                setenv("INK2_NUMA_POOL", "0", 0);
-            }
-            set_env_default("INK2_CPU_ACT", "int8");
-            set_env_default("INK2_CPU_OPT", "29");
-            set_env_default("INK2_OFF_MARGIN_MIB", "64");
-            set_env_default("INK2_MX_POOL_FRACTION", "0.08");
+            set_engine_env("STRATA_NUMA_POOL", "0");
+            set_engine_env("INK2_CPU_ACT", "int8");
+            set_engine_env("INK2_CPU_OPT", "29");
+            set_engine_env("INK2_OFF_MARGIN_MIB", "64");
+            set_engine_env("INK2_MX_POOL_FRACTION", "0.08");
+            set_engine_env("INK2_PIN_HOST_MIB", "512");
+            unsetenv("INK2_NUMA_POOL");
+            unsetenv("INK2_SPEC_DRAFT_N_MAX");
+            unsetenv("INK2_SPEC_FORCE");
+            unsetenv("INK2_SPEC_DIAG");
 
             std::filesystem::path route_profile;
-            if (const char * env = std::getenv("INK2_ROUTE_PROFILE"); env != nullptr && env[0] != '\0') {
-                route_profile = env;
-            } else {
+            if (allow_tuning_override) {
+                if (const char * env = std::getenv("INK2_ROUTE_PROFILE"); env != nullptr && env[0] != '\0') {
+                    route_profile = env;
+                }
+            }
+            if (route_profile.empty()) {
                 // best512 wins at 16K prompt + 512; the long-context profile wins at 32K and above.
                 const char * preferred = (n_ctx > 16384 && n_ctx <= 20480) ? "inkling2-routes-best512.freq" : "inkling2-routes-256k-decode.freq";
                 for (const char * name : { preferred, "inkling2-routes-256k-decode.freq", "inkling2-routes-best512.freq", "inkling2-routes-profiled.freq", "inkling2-routes.freq", "routes.freq" }) {
@@ -1545,17 +1545,21 @@ private:
                 SRV_WRN("%s", "direct Inkling route profile is not set; expert placement will use index order\n");
             }
 
+            std::string direct_kv = "i8r";
+            if (params_base.cache_type_k == GGML_TYPE_Q8_0 && params_base.cache_type_v == GGML_TYPE_Q4_0) {
+                direct_kv = "k8v4";
+            } else if (params_base.cache_type_k != GGML_TYPE_F16 || params_base.cache_type_v != GGML_TYPE_F16) {
+                throw std::runtime_error("direct checkpoint KV supports -ctk q8_0 -ctv q4_0 or the default KV mode");
+            }
+
             // 4K chunks keep decode throughput; 8K hurts the post-prefill pool refill.
             const int chunk = 4096;
             std::vector<std::string> args = {
                 "bel-inkling2", "--model", dir.string(), "--serve", "--max-context", std::to_string(n_ctx),
-                "--chunk", std::to_string(chunk), "--graph", "1", "--tc", "1", "--kv", "i8r",
+                "--chunk", std::to_string(chunk), "--graph", "1", "--tc", "1", "--kv", direct_kv,
                 "--vram-reserve-mib", "0", "--cpu-threads", std::to_string(cpu_threads),
-                "--kv-grow", "1", "--kv-grow-step", "4096"
+                "--kv-grow", "1", "--kv-grow-step", "4096", "--spec", "0"
             };
-            if (spec_draft_n_max > 0) {
-                args.insert(args.end(), {"--spec", "1", "--spec-draft-n-max", std::to_string(spec_draft_n_max)});
-            }
             if (!route_profile.empty()) {
                 args.push_back("--expert-frequencies");
                 args.push_back(route_profile.string());
@@ -1563,9 +1567,6 @@ private:
             direct_worker = std::make_unique<inkling2_server_worker>();
             if (!direct_worker->start(args)) {
                 throw std::runtime_error("failed to start direct checkpoint engine");
-            }
-            if (spec_draft_n_max > 0) {
-                SRV_INF("direct Inkling DSpark verify enabled with max %d draft tokens\n", spec_draft_n_max);
             }
 
             slots.clear();
@@ -1593,8 +1594,8 @@ private:
             if (callback_state) {
                 callback_state(SERVER_STATE_READY, {});
             }
-            SRV_INF("loaded direct Inkling checkpoint '%s' with i8r KV, context %d, route profile %s\n",
-                    dir.string().c_str(), n_ctx, route_profile.empty() ? "(none)" : route_profile.string().c_str());
+            SRV_INF("loaded direct Inkling checkpoint '%s' with %s KV and tiled CUDA attention, context %d, route profile %s\n",
+                    dir.string().c_str(), direct_kv.c_str(), n_ctx, route_profile.empty() ? "(none)" : route_profile.string().c_str());
             return true;
         } catch (const std::exception & e) {
             SRV_ERR("failed to initialize direct Inkling checkpoint: %s\n", e.what());
@@ -2368,7 +2369,7 @@ private:
                 return false;
             }
             const auto & sampling = task.params.sampling;
-            if (!sampling.grammar.empty() || !sampling.logit_bias.empty() || sampling.ignore_eos || sampling.n_probs > 0 ||
+            if (!sampling.grammar.empty() || !sampling.logit_bias.empty() || sampling.n_probs > 0 ||
                 sampling.dynatemp_range != 0.0f || sampling.typ_p != 1.0f || sampling.xtc_probability != 0.0f ||
                 sampling.penalty_repeat != 1.0f || sampling.penalty_freq != 0.0f || sampling.penalty_present != 0.0f ||
                 sampling.dry_multiplier != 0.0f || sampling.mirostat != 0 || sampling.top_n_sigma >= 0.0f) {
@@ -4027,7 +4028,7 @@ private:
             inkling2_worker_result result;
             std::string error;
             bool invalid_token = false;
-            const bool ok = direct_worker->generate(prompt, max_new, slot.task->params.sampling,
+            const bool ok = direct_worker->generate(prompt, max_new, slot.task->params.cache_prompt, slot.task->params.sampling,
                 [&](llama_token token) {
                     if (token < 0 || token >= llama_vocab_n_tokens(vocab)) {
                         invalid_token = true;

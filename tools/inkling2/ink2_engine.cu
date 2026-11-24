@@ -51,6 +51,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <filesystem>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -2606,6 +2608,8 @@ struct Engine {
     bool lazy_experts = false;          // safetensors experts stay file-backed; CPU reads only routed misses
     std::vector<uint8_t*> xh;            // [NL * NE] host address of expert (l, e) (regions placed per NUMA node)
     std::vector<ink2cpu::ExpertParts> expert_parts; // [NL * NE] source tensor views for lazy offload
+    uint8_t* pinned_host_experts = nullptr;
+    size_t pinned_host_expert_bytes = 0;
     std::vector<uint32_t> expert_freq;   // optional route counts for initial expert placement
     std::vector<uint8_t> home;           // [NL * NE] its node
     const uint8_t** xsrc_d = nullptr;    // device [NL * NE]: its device view (mapped)
@@ -4108,6 +4112,75 @@ void expert_cpu_ring(int l, const float* x) {
                             nv ? E.nwant_nv : E.nwant_mx, E.bell_d, E.cpu_nodes, E.d_seq, E.d_cur, E.cnt, E.sync, E.decode_misses);
     if (E.sync.us_nv > 0.0f) k_fetch<<<dim3(FETCH_BLOCKS, SYNC_MAX), 256>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
 }
+size_t host_pin_budget(size_t requested) {
+    std::ifstream cg("/proc/self/cgroup");
+    std::string line, rel;
+    while (std::getline(cg, line)) {
+        if (line.rfind("0::", 0) == 0) { rel = line.substr(3); break; }
+    }
+    if (rel.empty()) return requested;
+    const std::filesystem::path dir = std::filesystem::path("/sys/fs/cgroup") / rel.substr(1);
+    auto read_value = [](const std::filesystem::path& path) -> size_t {
+        std::ifstream f(path);
+        std::string value;
+        if (!(f >> value) || value == "max") return 0;
+        try { return (size_t) std::stoull(value); } catch (...) { return 0; }
+    };
+    size_t limit = read_value(dir / "memory.high");
+    if (!limit) limit = read_value(dir / "memory.max");
+    const size_t current = read_value(dir / "memory.current");
+    if (!limit || !current) return requested;
+    constexpr size_t reserve = (size_t) 768 << 20;
+    if (limit <= current || limit - current <= reserve) return 0;
+    return std::min(requested, limit - current - reserve);
+}
+void pin_host_experts(size_t requested) {
+    if (!E.lazy_experts || requested == 0) return;
+    const size_t budget = host_pin_budget(requested);
+    if (budget < NV_BYTES) {
+        std::fprintf(stderr, "host expert pin pool: skipped, safe budget is %zu MiB\n", budget >> 20);
+        return;
+    }
+    std::vector<int> selected;
+    size_t bytes = 0;
+    const std::vector<int> order = expert_placement_order();
+    for (int key : order) {
+        if (E.htabA[key]) continue;
+        const ink2cpu::ExpertParts& p = E.expert_parts[key];
+        const size_t expert_bytes = p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes;
+        const size_t aligned = (expert_bytes + 255) & ~(size_t) 255;
+        if (bytes + aligned > budget) continue;
+        selected.push_back(key);
+        bytes += aligned;
+    }
+    if (selected.empty()) return;
+    uint8_t* pool = nullptr;
+    const cudaError_t alloc_err = cudaHostAlloc((void**) &pool, bytes, cudaHostAllocDefault);
+    if (alloc_err != cudaSuccess) {
+        std::fprintf(stderr, "host expert pin pool: allocation of %zu MiB failed: %s\n", bytes >> 20,
+                     cudaGetErrorString(alloc_err));
+        (void) cudaGetLastError();
+        return;
+    }
+    size_t off = 0;
+    for (int key : selected) {
+        off = (off + 255) & ~(size_t) 255;
+        const ink2cpu::ExpertParts src = E.expert_parts[key];
+        uint8_t* dst = pool + off;
+        std::memcpy(dst, src.w13, src.w13_bytes);
+        std::memcpy(dst + src.w13_bytes, src.s13, src.s13_bytes);
+        std::memcpy(dst + src.w13_bytes + src.s13_bytes, src.w2, src.w2_bytes);
+        std::memcpy(dst + src.w13_bytes + src.s13_bytes + src.w2_bytes, src.s2, src.s2_bytes);
+        E.expert_parts[key] = {dst, dst + src.w13_bytes, dst + src.w13_bytes + src.s13_bytes,
+                               dst + src.w13_bytes + src.s13_bytes + src.w2_bytes,
+                               src.w13_bytes, src.s13_bytes, src.w2_bytes, src.s2_bytes};
+        off += (src.w13_bytes + src.s13_bytes + src.w2_bytes + src.s2_bytes + 255) & ~(size_t) 255;
+    }
+    E.pinned_host_experts = pool;
+    E.pinned_host_expert_bytes = bytes;
+    std::fprintf(stderr, "host expert pin pool: %zu MiB across %zu route-ranked experts; remaining sources use safetensors mmap\n",
+                 bytes >> 20, selected.size());
+}
 void setup_cpu() {
     if (const char* p = std::getenv("INK2_PROMOTE")) std::sscanf(p, "%d,%d", &g_promote_nv, &g_promote_mx);
     if (const char* p = std::getenv("INK2_BG_BLOCKS")) g_bg_blocks = std::max(1, std::atoi(p));
@@ -4123,11 +4196,11 @@ void setup_cpu() {
             const ink2cpu::ExpertParts& p = E.expert_parts[key];
             nonresident_bytes += p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes;
         }
-        struct rlimit lim{};
-        const double lock_mib = getrlimit(RLIMIT_MEMLOCK, &lim) == 0
-            ? (double) lim.rlim_cur / (1024.0 * 1024.0) : 0.0;
-        std::fprintf(stderr, "host experts: %zu MiB nonresident, RLIMIT_MEMLOCK %.0f MiB; sources remain mmap-backed\n",
-                     nonresident_bytes >> 20, lock_mib);
+        const char* pin_env = std::getenv("INK2_PIN_HOST_MIB");
+        const size_t pin_mib = pin_env ? (size_t) std::max(0, std::atoi(pin_env)) : 0;
+        pin_host_experts(pin_mib << 20);
+        std::fprintf(stderr, "host experts: %zu MiB nonresident source, %zu MiB pinned host copy\n",
+                     nonresident_bytes >> 20, E.pinned_host_expert_bytes >> 20);
     }
     if (const char* p = std::getenv("INK2_MISS_DIAG"); p && std::atoi(p) != 0) {
         E.decode_misses = (unsigned long long*) dalloc(NL * sizeof(unsigned long long));
@@ -5677,10 +5750,13 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+constexpr int EOS_ID = 200006;   // <|content_model_end_sampling|> (generation_config.json)
+
 // sampling on the host: greedy without a temperature
 struct Sampler {
     float temp = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 0;
+    bool ignore_eos = false;
     std::mt19937_64 rng{std::random_device{}()};
 };
 // the sampler's distribution over the logits lg (temp > 0): candidates within 20.8 temp of the max, sorted, top_k,
@@ -5693,10 +5769,13 @@ struct Dist {
 };
 Dist make_dist(const float* lg, const Sampler& s) {
     Dist d;
-    const int best = (int) (std::max_element(lg, lg + VOCAB) - lg);
+    int best = -1;
+    for (int i = 0; i < VOCAB; ++i)
+        if (!(s.ignore_eos && i == EOS_ID) && (best < 0 || lg[i] > lg[best])) best = i;
+    if (best < 0) return d;
     const float mx = lg[best], thr = mx - 20.8f * s.temp;   // exp(-20.8) ~ 1e-9 of the top probability: never matters
     for (int i = 0; i < VOCAB; ++i)
-        if (lg[i] >= thr) d.c.push_back({lg[i], i});
+        if (lg[i] >= thr && !(s.ignore_eos && i == EOS_ID)) d.c.push_back({lg[i], i});
     std::sort(d.c.begin(), d.c.end(), [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
     if (s.top_k > 0 && (int) d.c.size() > s.top_k) d.c.resize(s.top_k);
     d.p.resize(d.c.size());
@@ -5733,12 +5812,15 @@ double prob(const Dist& d, int tok) {
     return 0.0;
 }
 int sample(const float* lg, Sampler& s) {
-    if (s.temp <= 0.0f) return (int) (std::max_element(lg, lg + VOCAB) - lg);
+    if (s.temp <= 0.0f) {
+        int best = -1;
+        for (int i = 0; i < VOCAB; ++i)
+            if (!(s.ignore_eos && i == EOS_ID) && (best < 0 || lg[i] > lg[best])) best = i;
+        return best;
+    }
     return draw(make_dist(lg, s), s.rng);
 }
 int sample(const vec& lg, Sampler& s) { return sample(lg.data(), s); }
-
-constexpr int EOS_ID = 200006;   // <|content_model_end_sampling|> (generation_config.json)
 
 #include "ink2_session.cuh"
 
@@ -6167,6 +6249,7 @@ int ink2_engine_main(int argc, char** argv) {
             int max_new = std::atoi(f[1].c_str());
             std::vector<int> pr = parse_ids(f.back().c_str());
             Sampler s;
+            bool cache_prompt = true;
             s.rng = std::move(smp.rng);
             std::vector<std::string> imgs;   // image=<path> keys, one per placeholder (ink2_vision.cuh)
             for (size_t k = 2; k + 1 < f.size(); ++k) {   // unknown keys are ignored
@@ -6177,6 +6260,8 @@ int ink2_engine_main(int argc, char** argv) {
                 else if (key == "top_p") s.top_p = std::strtof(val.c_str(), nullptr);
                 else if (key == "top_k") s.top_k = std::atoi(val.c_str());
                 else if (key == "min_p") s.min_p = std::strtof(val.c_str(), nullptr);
+                else if (key == "ignore_eos") s.ignore_eos = std::atoi(val.c_str()) != 0;
+                else if (key == "cache_prompt") cache_prompt = std::atoi(val.c_str()) != 0;
                 else if (key == "seed") s.rng.seed(std::strtoull(val.c_str(), nullptr, 10));
                 else if (key == "image") imgs.push_back(ink2img::pct_decode(val));
             }
@@ -6192,9 +6277,22 @@ int ink2_engine_main(int argc, char** argv) {
                 continue;
             }
             max_new = std::max(0, std::min(max_new, E.ctx - (int) pr.size()));
-            const bool reuse = !hist.empty() && pr.size() >= hist.size() && std::equal(hist.begin(), hist.end(), pr.begin());
+            if (!cache_prompt) {
+                hist.clear();
+                last_logits.clear();
+                if (g_sess.on) sess_discard_live();
+                for (int si = 0; si < NCALLS; ++si) {
+                    Slot& S = E.S[si];
+                    CK(cudaMemsetAsync(S.khist, 0, (size_t) HR * KVD * sizeof(float), cudaStreamPerThread));
+                    CK(cudaMemsetAsync(S.vhist, 0, (size_t) HR * KVD * sizeof(float), cudaStreamPerThread));
+                    CK(cudaMemsetAsync(S.ahist, 0, (size_t) HR * H * sizeof(float), cudaStreamPerThread));
+                    CK(cudaMemsetAsync(S.mhist, 0, (size_t) HR * H * sizeof(float), cudaStreamPerThread));
+                }
+                CK(cudaDeviceSynchronize());
+            }
+            const bool reuse = cache_prompt && !hist.empty() && pr.size() >= hist.size() && std::equal(hist.begin(), hist.end(), pr.begin());
             size_t start = reuse ? hist.size() : 0;
-            if (g_sess.on) start = sess_begin(pr, hist, last_logits, start);   // conversation cache (ink2_session.cuh)
+            if (g_sess.on && cache_prompt) start = sess_begin(pr, hist, last_logits, start);   // conversation cache (ink2_session.cuh)
             kv_trim((int) pr.size() + 1);
             if (spec && start == pr.size()) start = pr.size() - 1;   // re-fed: the drafter needs its features
             if (E.decode_misses) CK(cudaMemset(E.decode_misses, 0, NL * sizeof(unsigned long long)));
@@ -6224,7 +6322,7 @@ int ink2_engine_main(int argc, char** argv) {
                         draft_context(PF.feat, (int) p0, T);
                         if (p0 + T == pr.size()) draft_frnn(PF.feat + (size_t) (T - 1) * 4 * H);
                     }
-                    sess_after_chunk((int) (p0 + T));
+                    if (cache_prompt) sess_after_chunk((int) (p0 + T));
                     const double ms = now_ms() - t0;
                     ink2_emit("PP %zu %zu %.0f %.1f", p0 + T, pr.size(), ms, 1000.0 * (p0 + T - start) / std::max(ms, 1.0));
                 }
@@ -6238,7 +6336,7 @@ int ink2_engine_main(int argc, char** argv) {
                 pf_unmap();
             if (spec && max_new > 0 && g_spec_draft_n_max > 0 && g_pf_elastic) pf_map(g_spec_draft_n_max + 1);
             }
-            sess_prompt_end(pr, logits);
+            if (cache_prompt) sess_prompt_end(pr, logits);
             const double t1 = now_ms();
             const double draft_ms0 = D.draft_ms, verify_ms0 = D.verify_ms;
             const size_t verify_staging0 = PF.fbytes;
@@ -6304,10 +6402,15 @@ int ink2_engine_main(int argc, char** argv) {
                 for (int l = 0; l < NL; ++l) std::fprintf(stderr, " %d:%llu", l, misses[l]);
                 std::fputc('\n', stderr);
             }
-            hist = pr;
             g_vis.pending = false;
-            if (!gen.empty()) hist.insert(hist.end(), gen.begin(), gen.end() - 1);   // the last token was never fed
-            last_logits = logits;
+            if (cache_prompt) {
+                hist = pr;
+                if (!gen.empty()) hist.insert(hist.end(), gen.begin(), gen.end() - 1);   // the last token was never fed
+                last_logits = logits;
+            } else {
+                hist.clear();
+                last_logits.clear();
+            }
             smp.rng = std::move(s.rng);
             // + drafts accepted / offered, prompt tokens not read (DONE fields 6-8: usage.cached_tokens)
             ink2_emit("DONE %zu %zu %.0f %.0f %s %ld %ld %zu", gen.size(), pr.size(), t1 - t0, t2 - t1, finish,

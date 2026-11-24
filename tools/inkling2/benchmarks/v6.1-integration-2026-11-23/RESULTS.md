@@ -128,13 +128,16 @@ GPU, fit disabled, flash attention enabled, Q4 K/V cache. Marlin placement used 
 - Cold 16K decode is 37.86 tok/s (best512) and 36.13 tok/s with the 256K profile. The target table
   behavior is the warm row at 40.29 tok/s. A second request on the same engine is representative
   of steady state.
-- Direct checkpoint mode supports one active text request and temperature, top-k, top-p, and
-  min-p sampling. Image input, sleep/reload, external draft models, and parallel requests are not
-  supported. Visible `<|end_message|>` cleanup still needs a model-aware parser fix.
+- Direct checkpoint mode supports one active text request and temperature, top-k, top-p, min-p,
+  seed, `ignore_eos`, and `cache_prompt`. K8/V4 is selected with
+  `--cache-type-k q8_0 --cache-type-v q4_0`; the engine uses tiled CUDA attention. Image input,
+  sleep/reload, external draft models, and parallel requests are not supported. Visible
+  `<|end_message|>` cleanup still needs a model-aware parser fix.
 - All rates are single runs, not medians.
 
 ## Artifacts
 
+- Controlled-versus-shell run difference and environment fix: `RUN-DIFFERENCE.md`
 - Raw benchmark logs and measurements: `raw/`
 - Route profiles beside the checkpoint: `inkling2-routes-best512.freq`,
   `inkling2-routes-256k-decode.freq`
@@ -201,6 +204,57 @@ forced runs favored one draft but remained slower than plain; the later CPU-hybr
 output and no staging. No DSpark run was made for this mission.
 
 The core-floor experiment achieved zero loop-core misses and output parity, but it did not improve
-decode and caused a large prefill regression, so the floor was removed. Host pinning remains unavailable
-under the current 8 MiB hard memlock limit. See the replaced `TASK.md` for the current checkbox
-ledger and open work.
+decode and caused a large prefill regression, so the floor was removed. At the time of this mission,
+there was no bounded host pin copy. Mission 5 below records the later 511 MiB pinned-host pool. See
+`TASK.md` for the current task ledger.
+
+## Mission 5 - coherent prompt and bounded pinned-host pool
+
+Date: 2026-11-24. This paired run checks a natural, coherent 16,384-token input and compares the
+existing mmap-backed expert source with the new bounded pinned-host copy. Every measured request
+used `cache_prompt: true`, `ignore_eos: true`, greedy sampling, 512 generated tokens, context 16,896,
+5 CPU threads, `--cache-type-k q8_0 --cache-type-v q4_0 -fa on`, and the `best512` route profile.
+The direct backend maps K8/V4 to its `k8v4` KV implementation and uses tiled CUDA attention. The
+prompt is a server-documentation briefing, not the archived repeated-token prompt: it is 48,144
+characters, 16,384 token IDs, SHA-256 `ae012289b87cc6909e812fa5e8d818ebb824870a20ddcd555f83c901d91f47a4`.
+The prompt text, token IDs, request script, JSON results, and memory samples are under
+`/home/zyxciss/fluxaeros-data/inkling-m5/`.
+
+| Expert source | Request | Prefill | Decode | Combined |
+| --- | --- | ---: | ---: | ---: |
+| mmap-backed | first | 853.69 pp/s | 26.27 tok/s | 38.647 s |
+| mmap-backed | warm second | 909.87 pp/s | 27.94 tok/s | 36.294 s |
+| 511 MiB pinned pool | first | 766.86 pp/s | 25.52 tok/s | 41.385 s |
+| 511 MiB pinned pool | warm second | 900.52 pp/s | 27.26 tok/s | 36.940 s |
+
+The pinned pool did not improve the warm result; its one warm request was 0.68 tok/s slower than
+the mmap-backed run. There is only one warm request per build, so run-to-run noise is not bounded.
+The old target, 857.35 pp/s / 40.17 tok/s, is not reproduced by this coherent prompt. It came from
+archived token IDs that detokenize to incoherent word fragments, so it is not a representative
+natural-prompt decode baseline. The new warm prefill is faster than that reference, while decode is
+lower. Different routes and CPU miss rates are plausible causes, but this run did not collect
+per-layer miss counters, so the cause is not established.
+
+The direct engine reported 1,536/1,536 loop-core experts resident; the remaining GPU placement was
+394/1,024 outer NVFP4 and 91/512 MXFP8 experts. The host pool copied 511 MiB across 68 route-ranked
+experts. The other 5,987 MiB of nonresident expert data stayed in the safetensors mmap. Peak sampled
+VRAM was 11,814 MiB without the pool and 11,832 MiB with it. Process `VmHWM` was 12,833,348 KiB and
+13,150,476 KiB; cgroup memory peaks were 13,307,138,048 and 12,444,647,424 bytes, respectively.
+Both runs had zero cgroup high, max, or OOM events under `MemoryHigh=14G`, `MemoryMax=15G`, and
+swap disabled. These results support the tested 511 MiB pool only; pinning all 5,987 MiB was not
+attempted because the available headroom does not cover that copy safely.
+
+Prompt caching remained enabled for all four measured requests. Each reports zero cached prompt
+tokens: after generation, the next identical standalone prompt is shorter than the saved
+prompt-plus-generation history, so it does not form a reusable prefix. The warm row therefore means
+the same engine process and resident placement, with full prefill. Output hashes match between
+the two expert-source modes for each request index: `25b1e50f8028a162d32303b626608ba537ffa867ff93413749b2ceccd7346471`
+for request one and `31ec30eed64f1cbccd2ef1440ed6c1157eb3b51b124801292a1f3ed8d0fed4a3` for request
+two. The first and second request hashes differ, so this result does not establish cold-to-warm
+output identity.
+
+The `/completion` direct path now accepts and forwards `ignore_eos` and `cache_prompt`, maps the
+requested Q8 K / Q4 V flags to K8/V4, and reports the selected KV mode in its startup line. The
+embedded protocol remains connected through its in-process queue after rebuild. `bel-server`,
+`bel-cli`, and `bel-inkling2` were rebuilt. The old 501 error for `ignore_eos` is covered by the
+compatibility smoke request; the measured requests all kept prompt caching enabled.

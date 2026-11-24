@@ -70,6 +70,12 @@ struct Sess {
     std::string note;      // this request's log line
 } g_sess;
 
+void sess_discard_live() {
+    g_sess.live.clear();
+    g_sess.live_prompt = 0;
+    g_sess.split = -1;
+}
+
 void sess_init(int mib, int min_tokens) {
     if (mib <= 0) return;
     g_sess.min_tokens = min_tokens;
