@@ -471,3 +471,69 @@ Median decode improved from `36.6 tok/s` to `40.8 tok/s` (peak `42.2 tok/s`), an
 `context-16384.ids` (`--kv-grow 1 --ctx 32768`) completed at `522.8 pp/s` prefill / `38.8 tok/s` decode.
 The remaining gap to `48-50 tok/s` is set by the single-channel DDR4 PCIe bandwidth (`23.0 GB/s`)
 at the online cache miss rate (`~110-135 MB/tok`).
+
+**Invalidation notice**: All Strata GPU-fetch performance numbers recorded above from `feat-latest`
+are invalid because of the zero-filled 8.19 GiB expert arena bug and resulting degenerate loops.
+Commit `39c6ca980` (`40.8 tok/s` 5-task median, `38.8 tok/s` at 16K) is the verified baseline.
+
+## CUPTI critical-path breakdown and compute optimisations (2026-11-26)
+
+### CUPTI profile of `39c6ca980`
+
+Hardware verified via `cudaGetDeviceProperties`: RTX 3060, 28 SMs, 7501 MHz memClk, 192-bit bus,
+**360.0 GB/s** theoretical peak DRAM bandwidth (`~5.525 GB/tok` model weights -> `~15.35 ms/tok`
+theoretical weight-read floor before attention/convs/residuals/launch gaps).
+
+CUPTI Activity trace (`cupti_lru64.tsv`, 63 steady decode tokens on `task-lru_ttl.ids`, `155.3 MB/tok` H2D):
+
+- Total GPU active union: `24.905 ms/tok` (`19.868 ms` compute union + `5.037 ms` exposed fetch;
+  `6.507 ms` raw `k_fetch` with `1.470 ms` overlapped behind Pass-1 `k_gemv` hits).
+- Kernel breakdown of `39c6ca980` (`1015` graph nodes+memcpys/tok):
+  - `moe_nv` (`k_gemv_nvfp4_sel<2>`): `5.677 ms` (`3.628 ms` gate_up + `2.049 ms` down; 52 calls)
+  - Dense BF16 projections (`proj` + `qkv`): `5.529 ms` (`2.313 + 2.285 + 0.931 ms`; `80-88 regs`,
+    up to `27.6 KB` smem -> 2-3 CTAs/SM occupancy)
+  - `unembed` (`k_gemv_bf16<8>`): `2.605 ms` (`353.9 GB/s`)
+  - `wo` (`k_gemv_bf16<4>`, 48 calls, 72 CTAs): `2.063 ms`
+  - `attention` (`k_attn_prep` / `k_attn_partial_gqa` / `k_attn_merge` / `k_attn_tail`): `1.451 ms`
+    short context, rising to `2.592 ms` at 16K context (`21.298 ms` 16K compute union)
+  - `moe_mx` (`k_gemv_mxfp8_sel<2>`): `1.026 ms` (`0.649 + 0.377 ms`, `9.2 KB` / `4.6 KB` smem,
+    redundant per-CTA `swiglu1`)
+  - `k_cache_cpu` + `k_cpu_wait` still executing on all 36 loop-core calls: `0.226 ms` (`72` launches)
+
+### Implemented compute & host staging improvements
+
+1. **Zero-smem `__ldg` BF16 GEMVs + compact pointer arithmetic**: Replaced `shared__ float xs[]` staging
+   and `w[R]` pointer arrays in `gemv_bf16_dot`, `k_gemv_bf16`, `k_gemv_bf16_qkv`, and `k_gemv_bf16_gate`
+   with direct `__ldg(const float4*)` reads and a single compact base pointer; launched `wo`-sized
+   matrices (`n <= 4096`) with 128 threads (`144` CTAs across 28 SMs). `unembed` reached `2.531 ms`
+   (`364 GB/s`), `proj+qkv` dropped `5.529 -> 5.340 ms`, `wo` dropped `2.063 -> 2.009 ms`.
+2. **Half-warp NVFP4 `down` GEMV (`g_nv_h16`, `16` lanes/row, `128` threads)**: `K=1152` (`144` `uint32_t`
+   words/row) leaves 50% of 32-lane warp inactive on iteration 5; 16 lanes run `9` full iterations
+   (`2.049 -> 1.940 ms` in CUPTI).
+3. **Zero-smem fused-ACT MXFP8 (`k_gemv_mxfp8_sel`)**: Computes SwiGLU once in `gate_up` into `E.act`
+   and reads `x`/`E.act` via `__ldg` (`0` smem), dropping MXFP8 compute `1.026 -> 0.849 ms`.
+4. **Loop-core CPU ring skip & pinned host buffers**: Gated `expert_cpu_ring` + `k_cpu_wait` on
+   `cpu_active_for_decode() && !gf` (cutting `1015 -> 943` launches/tok) and pre-allocated pinned
+   `E.h_emb`, `E.h_pos`, and `E.h_argmax`.
+
+Final CUPTI (`cupti_final2_lru64.tsv`): compute union dropped `19.868 -> 19.026 ms/tok` (`-0.842 ms/tok`).
+
+### Updated benchmark results (512 tokens, default settings, `INK2_GPU_FETCH=1`)
+
+All generated outputs remain coherent; `task-lru_ttl.ids` matches CPU reference `128/128` tokens.
+
+| Task | `39c6ca980` baseline | Updated decode | H2D/token |
+| --- | ---: | ---: | ---: |
+| LRU + TTL | 40.7 tok/s | **41.8 tok/s** | 133.6 MB |
+| Directed cycle | 40.6 tok/s | **41.9 tok/s** | 132.3 MB |
+| Race condition | 42.2 tok/s | **43.9 tok/s** | 103.6 MB |
+| Rate limiter | 40.8 tok/s | **41.6 tok/s** | 135.9 MB |
+| Serializability | 41.7 tok/s | **42.9 tok/s** | 118.1 MB |
+| 16K (`context-16384.ids`, `--n 128`) | 38.8 tok/s | **40.3 tok/s** | 122.8 MB |
+
+- **5-task median**: `40.8 -> 41.9 tok/s` (mean `42.42 tok/s`, peak `43.9 tok/s`).
+- **Coherent 16K prefill / decode**: `530.0 pp/s` prefill, `40.3 tok/s` decode (`--kv-grow 1 --ctx 32768`).
+- **Physical ceiling note**: With GPU compute kernels now running at `93-101%` of RTX 3060 `360.0 GB/s`
+  peak DRAM (`19.03 ms` compute union) and `23.0 GB/s` single-channel DDR4 PCIe H2D (`~5.2 ms` exposed),
+  reaching `45-50 tok/s` under natural routing on this hardware requires either dual-channel system RAM
+  (~`2x` PCIe H2D bandwidth) or a major reduction in outer-layer miss bytes beyond standard decayed-LFU.

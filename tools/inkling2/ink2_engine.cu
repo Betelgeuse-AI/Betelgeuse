@@ -155,18 +155,15 @@ __device__ float block_max(float v) {
     return warp_max(t);
 }
 
-// y[row] = W[row] . x  (BF16 W [N, K], K % 8 == 0), one warp per row, x staged in shared memory and read as float4
-// (lane stride 32 B: 2-way bank conflicts at most)
-// R rows per warp: the staged x serves 8R rows per block, R independent loads in flight per lane.  Each row's sum is
-// the same sequence of operations whatever R (bit-identical results).
+// y[row] = W[row] . x  (BF16 W [N, K], K % 8 == 0), one warp per R rows, x read through __ldg float4.
+// Uses one compact base pointer + row stride to keep register usage low.
 template <int R>
-__device__ __forceinline__ void gemv_bf16_dot(const uint16_t* __restrict__ W, const float* xs, float* __restrict__ y,
+__device__ __forceinline__ void gemv_bf16_dot(const uint16_t* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
                                               int N, int K, int row0) {
     const int lane = threadIdx.x & 31;
-    const uint4* w[R];
-#pragma unroll
-    for (int r = 0; r < R; ++r) w[r] = reinterpret_cast<const uint4*>(W + (size_t) min(row0 + r, N - 1) * K);
-    const float4* x4 = reinterpret_cast<const float4*>(xs);
+    const size_t ks = (size_t) K / 8;
+    const uint4* w0 = reinterpret_cast<const uint4*>(W);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
@@ -174,8 +171,8 @@ __device__ __forceinline__ void gemv_bf16_dot(const uint16_t* __restrict__ W, co
     for (int i = lane; i < K / 8; i += 32) {
         uint4 v[R];
 #pragma unroll
-        for (int r = 0; r < R; ++r) v[r] = __ldg(w[r] + i);
-        const float4 a = x4[2 * i], b = x4[2 * i + 1];
+        for (int r = 0; r < R; ++r) v[r] = __ldg(w0 + (size_t) min(row0 + r, N - 1) * ks + i);
+        const float4 a = __ldg(x4 + 2 * i), b = __ldg(x4 + 2 * i + 1);
 #pragma unroll
         for (int r = 0; r < R; ++r)
             acc[r] += bf16lo(v[r].x) * a.x + bf16hi(v[r].x) * a.y + bf16lo(v[r].y) * a.z + bf16hi(v[r].y) * a.w +
@@ -190,12 +187,9 @@ __device__ __forceinline__ void gemv_bf16_dot(const uint16_t* __restrict__ W, co
 template <int R>
 __device__ __forceinline__ void gemv_bf16_rows(const uint16_t* __restrict__ W, const float* __restrict__ x,
                                                float* __restrict__ y, int N, int K) {
-    extern __shared__ float xs[];
-    for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = x[i];
-    __syncthreads();
     const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
     if (row0 >= N) return;
-    gemv_bf16_dot<R>(W, xs, y, N, K, row0);
+    gemv_bf16_dot<R>(W, x, y, N, K, row0);
 }
 template <int R>
 __global__ void k_gemv_bf16(const uint16_t* __restrict__ W, const float* __restrict__ x, float* __restrict__ y, int N,
@@ -203,19 +197,13 @@ __global__ void k_gemv_bf16(const uint16_t* __restrict__ W, const float* __restr
     gemv_bf16_rows<R>(W, x, y, N, K);
 }
 // q / k / v projections with three inputs in one launch: rows [0, b1) . xq, [b1, b2) . xk, [b2, N) . xv (R divides b1 and
-// b2: a warp's rows share an input).  A block stages only the inputs its rows touch (smem 3K).
+// b2: a warp's rows share an input).
 template <int R>
 __global__ void k_gemv_bf16_qkv(const uint16_t* __restrict__ W, const float* __restrict__ xq, const float* __restrict__ xk,
                                 const float* __restrict__ xv, int b1, int b2, float* __restrict__ y, int N, int K) {
-    extern __shared__ float xs[];
-    const int rb = blockIdx.x * (blockDim.x / 32) * R, re = min(rb + (int) (blockDim.x / 32) * R, N);
-    if (rb < b1) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = xq[i];
-    if (rb < b2 && re > b1) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[K + i] = xk[i];
-    if (re > b2) for (int i = threadIdx.x; i < K; i += blockDim.x) xs[2 * K + i] = xv[i];
-    __syncthreads();
     const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R;
     if (row0 >= N) return;
-    gemv_bf16_dot<R>(W, xs + (row0 < b1 ? 0 : row0 < b2 ? K : 2 * K), y, N, K, row0);
+    gemv_bf16_dot<R>(W, row0 < b1 ? xq : row0 < b2 ? xk : xv, y, N, K, row0);
 }
 
 // Up to 3 independent message gates per launch (gate j = blockIdx.y, or blockIdx.x for the one-block kernels): the
@@ -260,7 +248,7 @@ __device__ __forceinline__ float swiglu1(float g, float u) {
 // the staged version vs this one: gate_up 41 -> 38 us, down 33 -> 22 us (with ACT below).
 // ACT (gate_up, R even): a warp holds rows 2j (gate j) and 2j + 1 (up j) and also writes act[k][j], their SwiGLU, the
 // down GEMV's input: computed once per expert instead of once per down block.  Same values, same operations as before.
-template <int R, bool ACT = false>
+template <int R, bool ACT = false, bool H16 = false>
 __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
                                  const float* __restrict__ factors, const int* __restrict__ ids,
                                  const float* __restrict__ x, int x_stride, float* __restrict__ y, int N, int K,
@@ -271,7 +259,8 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
     __shared__ float e4[256];   // scale table, * 2^14
     for (int i = threadIdx.x; i < 256; i += blockDim.x) e4[i] = e4m3_decode(i) * 16384.0f;
     __syncthreads();
-    const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
+    constexpr int WL = H16 ? 16 : 32;
+    const int row0 = (blockIdx.x * (blockDim.x / WL) + threadIdx.x / WL) * R, lane = threadIdx.x & (WL - 1);
     if (row0 >= N) return;
     const uint8_t* W = tab[e];
     if (!W) return;   // computed on the CPU (--cpu-threads): k_cpu_wait writes its output
@@ -289,7 +278,7 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
 #pragma unroll 2
-    for (int i = lane; i < K / 8; i += 32) {
+    for (int i = lane; i < K / 8; i += WL) {
         uint32_t v[R];
         uint8_t sc[R];
 #pragma unroll
@@ -307,7 +296,9 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
     float t[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        t[r] = warp_sum(acc[r]) * factors[e];
+        float sum = acc[r];
+        for (int o = WL / 2; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        t[r] = sum * factors[e];
         if (!ACT && !lane && row0 + r < N) y[(size_t) blockIdx.y * N + row0 + r] = t[r];
     }
     if (ACT && !lane)
@@ -317,16 +308,12 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
 }
 
 // MXFP8: lane reads 4 bytes = 4 columns; the ue8m0 exponent per 32 columns (8 words): 2^(s - 127) * 2^8
-template <int R, bool SWI = false>
+template <int R, bool ACT = false>
 __global__ void k_gemv_mxfp8_sel(const uint8_t* const* __restrict__ tab, const int* __restrict__ ids, const float* __restrict__ x, int x_stride,
-                                 float* __restrict__ y, int N, int K) {
+                                 float* __restrict__ y, int N, int K, float* __restrict__ act = nullptr) {
+    static_assert(!ACT || R % 2 == 0, "ACT needs the gate / up pair in one warp");
     const int e = ids[blockIdx.y];
     if (e < 0) return;   // handled in the other pass
-    extern __shared__ float sm[];
-    float* xs = sm;
-    const float* xk = x + (size_t) blockIdx.y * x_stride;
-    for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i] = SWI ? swiglu1(xk[2 * i], xk[2 * i + 1]) : xk[i];
-    __syncthreads();
     const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
     if (row0 >= N) return;
     const uint8_t* W = tab[e];
@@ -340,7 +327,7 @@ __global__ void k_gemv_mxfp8_sel(const uint8_t* const* __restrict__ tab, const i
         w[r] = reinterpret_cast<const uint32_t*>(W + row * K);
         s[r] = S + row * (K / 32);
     }
-    const float4* x4 = reinterpret_cast<const float4*>(xs);
+    const float4* x4 = reinterpret_cast<const float4*>(x + (size_t) blockIdx.y * x_stride);
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
@@ -350,7 +337,7 @@ __global__ void k_gemv_mxfp8_sel(const uint8_t* const* __restrict__ tab, const i
         uint8_t sc[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) { v[r] = __ldg(w[r] + i); sc[r] = __ldg(s[r] + (i >> 3)); }
-        const float4 a = x4[i];
+        const float4 a = __ldg(x4 + i);
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const float2 p01 = e4m3x2((v[r] & 0xffu) | ((v[r] & 0xff00u) << 8));
@@ -359,11 +346,16 @@ __global__ void k_gemv_mxfp8_sel(const uint8_t* const* __restrict__ tab, const i
             acc[r] += part * exp2f((float) sc[r] - 119.0f);   // 2^(s-127) * 2^8
         }
     }
+    float t[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        const float t = warp_sum(acc[r]);
-        if (!lane && row0 + r < N) y[(size_t) blockIdx.y * N + row0 + r] = t;
+        t[r] = warp_sum(acc[r]);
+        if (!ACT && !lane && row0 + r < N) y[(size_t) blockIdx.y * N + row0 + r] = t[r];
     }
+    if (ACT && !lane)
+#pragma unroll
+        for (int r = 0; r < R; r += 2)
+            if (row0 + r + 1 < N) act[(size_t) blockIdx.y * (N / 2) + (row0 + r) / 2] = swiglu1(t[r], t[r + 1]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -2732,6 +2724,8 @@ struct Engine {
     VRange vpool_nv, vpool_mx;   // --kv-grow: the pools as growable ranges (owner / stamp sized for every expert)
     int *slot_of = nullptr, *owner_nv = nullptr, *owner_mx = nullptr, *nfetch = nullptr;
     int *hit_ids = nullptr, *miss_ids = nullptr, *d_argmax = nullptr;
+    float* h_emb = nullptr;
+    int *h_pos = nullptr, *h_argmax = nullptr;
     float* am_v = nullptr;
     int* am_i = nullptr;
     unsigned *stamp_nv = nullptr, *stamp_mx = nullptr, *clock = nullptr;
@@ -3934,6 +3928,9 @@ void alloc_state() {
     E.gu = dfloats((size_t) TOPK * 2 * FF); E.act = dfloats((size_t) TOPK * FF); E.ey = dfloats((size_t) TOPK * H);
     E.moe = dfloats(H); E.y2 = dfloats(H); E.logits = dfloats(VOCAB_ROWS); E.emb_in = dfloats(H); E.pout = dfloats(OFF_K + 2 * (KVD + NKV * KC)); E.gfg = dfloats(3 * 2 * H);
     E.d_argmax = (int*) dalloc(4);
+    CK(cudaHostAlloc((void**) &E.h_emb, (size_t) H * 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &E.h_pos, 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &E.h_argmax, 4, cudaHostAllocDefault));
     E.am_v = dfloats(256);
     E.am_i = (int*) dalloc(256 * 4);
     const int nc = std::max(E.nchunk_full, E.nchunk_slide);
@@ -3963,11 +3960,14 @@ void gemv(const DMat& W, const float* x, float* y, int rows = -1, int first = 0)
         return;
     }
     const uint16_t* w = W.d + (size_t) first * W.k;
+    const int blk = (n <= 4096 && R == 4 && g_gemv_min_blocks <= 64) ? 128 : 256;
+    const int wp_blk = blk / 32;
+    const unsigned bg = (unsigned) ((n + wp_blk * R - 1) / (wp_blk * R));
     switch (R) {
-    case 1: k_gemv_bf16<1><<<g, 256, sm>>>(w, x, y, n, W.k); break;
-    case 2: k_gemv_bf16<2><<<g, 256, sm>>>(w, x, y, n, W.k); break;
-    case 8: k_gemv_bf16<8><<<g, 256, sm>>>(w, x, y, n, W.k); break;
-    default: k_gemv_bf16<4><<<g, 256, sm>>>(w, x, y, n, W.k);
+    case 1: k_gemv_bf16<1><<<bg, blk>>>(w, x, y, n, W.k); break;
+    case 2: k_gemv_bf16<2><<<bg, blk>>>(w, x, y, n, W.k); break;
+    case 8: k_gemv_bf16<8><<<bg, blk>>>(w, x, y, n, W.k); break;
+    default: k_gemv_bf16<4><<<bg, blk>>>(w, x, y, n, W.k);
     }
 }
 void rms(const float* x, const float* w, float* y, int n = H) { k_rms<<<1, 512>>>(x, w, y, n); }
@@ -3988,12 +3988,11 @@ void message_gates(int n, const Gate* const g[], const float* const x[], const f
     int R = g_rpw;
     while (R > 1 && (N + 8 * R - 1) / (8 * R) < g_gemv_min_blocks) R /= 2;
     const dim3 grid((unsigned) ((N + 8 * R - 1) / (8 * R)), n);
-    const size_t sm = (size_t) K * 4;
     switch (R) {
-    case 1: k_gemv_bf16_gate<1><<<grid, 256, sm>>>(a, E.gdown, E.gfg, N, K); break;
-    case 2: k_gemv_bf16_gate<2><<<grid, 256, sm>>>(a, E.gdown, E.gfg, N, K); break;
-    case 8: k_gemv_bf16_gate<8><<<grid, 256, sm>>>(a, E.gdown, E.gfg, N, K); break;
-    default: k_gemv_bf16_gate<4><<<grid, 256, sm>>>(a, E.gdown, E.gfg, N, K);
+    case 1: k_gemv_bf16_gate<1><<<grid, 256>>>(a, E.gdown, E.gfg, N, K); break;
+    case 2: k_gemv_bf16_gate<2><<<grid, 256>>>(a, E.gdown, E.gfg, N, K); break;
+    case 8: k_gemv_bf16_gate<8><<<grid, 256>>>(a, E.gdown, E.gfg, N, K); break;
+    default: k_gemv_bf16_gate<4><<<grid, 256>>>(a, E.gdown, E.gfg, N, K);
     }
     k_gate_mix_rms<<<n, 512>>>(a, E.gfg);
 }
@@ -4037,10 +4036,10 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
             default: k_gemv_q8_qkv<4><<<g, 256, sm>>>(Y.proj.q, Y.proj.qs, xq, xk, xv, Y.off_k, Y.off_v, P, N, K);
             }
         } else switch (R) {
-        case 1: k_gemv_bf16_qkv<1><<<g, 256, sm>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
-        case 2: k_gemv_bf16_qkv<2><<<g, 256, sm>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
-        case 8: k_gemv_bf16_qkv<8><<<g, 256, sm>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
-        default: k_gemv_bf16_qkv<4><<<g, 256, sm>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K);
+        case 1: k_gemv_bf16_qkv<1><<<g, 256>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
+        case 2: k_gemv_bf16_qkv<2><<<g, 256>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
+        case 8: k_gemv_bf16_qkv<8><<<g, 256>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K); break;
+        default: k_gemv_bf16_qkv<4><<<g, 256>>>(Y.proj.d, xq, xk, xv, Y.off_k, Y.off_v, P, N, K);
         }
     }
     float *q = P, *k = P + Y.off_k, *v = P + Y.off_v;
@@ -4806,6 +4805,8 @@ void gg_sel(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs,
     }
 }
 
+bool g_nv_h16 = true;
+bool cpu_active_for_decode();
 void launch_moe_gemvs(const Experts& X, const int* ids, const float* x) {
     if (X.gg13) {
         gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
@@ -4814,13 +4815,17 @@ void launch_moe_gemvs(const Experts& X, const int* ids, const float* x) {
 #define SEL(R) \
         k_gemv_nvfp4_sel<((R) < 2 ? 2 : (R)), true><<<dim3(2 * FF / (8 * ((R) < 2 ? 2 : (R))), TOPK), 256>>>( \
             X.tA, X.f13, ids, x, 0, E.gu, 2 * FF, H, E.act); \
-        k_gemv_nvfp4_sel<R><<<dim3(H / (8 * R), TOPK), 256>>>(X.tB, X.f2, ids, E.act, FF, E.ey, H, FF);
+        if (g_nv_h16 && (R) == 2 && FF == 1152) \
+            k_gemv_nvfp4_sel<2, false, true><<<dim3(H / 16, TOPK), 128>>>(X.tB, X.f2, ids, E.act, FF, E.ey, H, FF); \
+        else \
+            k_gemv_nvfp4_sel<R><<<dim3(H / (8 * R), TOPK), 256>>>(X.tB, X.f2, ids, E.act, FF, E.ey, H, FF);
         switch (g_sel_rpw) { case 1: SEL(1) break; case 2: SEL(2) break; case 8: SEL(8) break; default: SEL(4) }
 #undef SEL
     } else {
 #define SEL(R) \
-        k_gemv_mxfp8_sel<R><<<dim3(2 * FF / (8 * R), TOPK), 256, H * 4>>>(X.tA, ids, x, 0, E.gu, 2 * FF, H); \
-        k_gemv_mxfp8_sel<R, true><<<dim3(H / (8 * R), TOPK), 256, FF * 4>>>(X.tB, ids, E.gu, 2 * FF, E.ey, H, FF);
+        k_gemv_mxfp8_sel<((R) < 2 ? 2 : (R)), true><<<dim3(2 * FF / (8 * ((R) < 2 ? 2 : (R))), TOPK), 256>>>( \
+            X.tA, ids, x, 0, E.gu, 2 * FF, H, E.act); \
+        k_gemv_mxfp8_sel<R><<<dim3(H / (8 * R), TOPK), 256>>>(X.tB, ids, E.act, FF, E.ey, H, FF);
         switch (g_sel_rpw) { case 1: SEL(1) break; case 2: SEL(2) break; case 8: SEL(8) break; default: SEL(4) }
 #undef SEL
     }
@@ -4835,7 +4840,8 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     if (E.rec_mode == 1) k_rec_ids<<<1, TOPK>>>(E.ids, E.rec + (size_t) g_slot * E.ctx * TOPK, E.d_pos);
     const int ml = int(&Y - E.L);
     const bool gf = E.gpu_fetch_active && E.fetch_layer[ml] && E.xsrc_d != nullptr;
-    if (E.cpu && !gf) expert_cpu_ring(ml, x);
+    const bool run_cpu = cpu_active_for_decode() && !gf;
+    if (run_cpu) expert_cpu_ring(ml, x);
     const bool use_cache = gf || (!E.cpu && E.offload);
     const bool split_fetch = use_cache && g_split_fetch && !Y.ex.gg13 && E.fetch_stream != nullptr;
     if (use_cache) expert_cache(ml, E.ids, TOPK, split_fetch);
@@ -4846,8 +4852,8 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     } else {
         launch_moe_gemvs(Y.ex, E.ids, x);
     }
-    if (E.cpu && !gf) k_cpu_wait<<<TOPK, 256>>>(E.bell_d, E.home_d, E.d_cur, E.cpu_nodes, E.ey, E.sync,
-                                                E.wait_ticks, E.d_pos, g_slot, E.ctx);
+    if (run_cpu) k_cpu_wait<<<TOPK, 256>>>(E.bell_d, E.home_d, E.d_cur, E.cpu_nodes, E.ey, E.sync,
+                                            E.wait_ticks, E.d_pos, g_slot, E.ctx);
     k_moe_tail<<<(H + 255) / 256, 256>>>(E.ey, E.wts, mhist, mlp_conv, r, out, E.d_pos);
 }
 
@@ -4935,9 +4941,10 @@ void embed_row(int tok, float* out) {
 
 // the token's embedding row (host table) into E.emb_in
 void upload_embed(int tok) {
-    vec e(H);
-    embed_row(tok, e.data());
-    CK(cudaMemcpyAsync(E.emb_in, e.data(), H * 4, cudaMemcpyHostToDevice));
+    float* dst = E.h_emb;
+    if (!dst) { vec e(H); embed_row(tok, e.data()); CK(cudaMemcpyAsync(E.emb_in, e.data(), H * 4, cudaMemcpyHostToDevice)); return; }
+    embed_row(tok, dst);
+    CK(cudaMemcpyAsync(E.emb_in, dst, H * 4, cudaMemcpyHostToDevice));
 }
 
 // one token: embedding in E.emb_in, position in E.d_pos; writes E.logits.  Device work only (captured in a graph):
@@ -6415,6 +6422,7 @@ int ink2_engine_main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_GAIN")) g_gain = (float) std::atof(r);
     if (const char* r = std::getenv("INK2_SPLIT_FETCH")) g_split_fetch = std::atoi(r) != 0;
     if (const char* r = std::getenv("INK2_FETCH_BLOCKS")) g_fetch_blocks = std::clamp(std::atoi(r), 1, FETCH_BLOCKS);
+    if (const char* r = std::getenv("INK2_NV_H16")) g_nv_h16 = std::atoi(r) != 0;
     {
         int major = 0, sm_count = 0;   // default Q8 wide before Ampere only; tune GEMV min blocks / RPW per SM count
         CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
@@ -6654,7 +6662,8 @@ int ink2_engine_main(int argc, char** argv) {
         kv_fit(pos + 1);
         full_split_fit(pos);
         g_slide_last_pos = pos;
-        CK(cudaMemcpyAsync(E.d_pos, &pos, 4, cudaMemcpyHostToDevice));
+        *E.h_pos = pos;
+        CK(cudaMemcpyAsync(E.d_pos, E.h_pos, 4, cudaMemcpyHostToDevice));
         upload_embed(tok);
         if (!E.graph) {
             forward_device();
@@ -6678,10 +6687,9 @@ int ink2_engine_main(int argc, char** argv) {
     };
     auto step_greedy = [&](int tok, int pos) {
         step(tok, pos, false);
-        int next = 0;
-        CK(cudaMemcpyAsync(&next, E.d_argmax, 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpyAsync(E.h_argmax, E.d_argmax, 4, cudaMemcpyDeviceToHost));
         CK(cudaStreamSynchronize(cudaStreamPerThread));
-        return next;
+        return *E.h_argmax;
     };
     // warm-up at position 0 (builds the decode graph outside any timing; position 0 is rewritten by the first prompt)
     step(0, 0, false);
