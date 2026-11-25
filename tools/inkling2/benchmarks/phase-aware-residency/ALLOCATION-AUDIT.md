@@ -2,7 +2,7 @@
 
 Base revision: `e1538e9954a191d352cae0697b5908b0e477c913` (`betelgeuse-v6.1` mmap-backed runtime)
 
-This is a source-level audit of the direct-checkpoint CUDA engine. Runtime allocation snapshots and the 4K/8K baseline still need a free GPU. At audit time, `bel-server` owned 11,832 MiB of the RTX 3060's 12,288 MiB, so I did not stop or benchmark over it.
+This is a source-level audit of the direct-checkpoint CUDA engine at the base revision, with runtime measurements from the phase-aware branch below. The stale `bel-server` that initially occupied the GPU was confirmed by the user and terminated before benchmarking.
 
 ## Allocation ownership and lifetime
 
@@ -14,15 +14,15 @@ This is a source-level audit of the direct-checkpoint CUDA engine. Runtime alloc
 | K/V state | `alloc_state()`; sliding layers use `cudaMalloc`, full-attention layers use growable `VRange` with `--kv-grow` | Prefill and decode | Sliding allocation lasts for process lifetime; full-attention physical pages grow and shrink by context need |
 | Convolution and recurrent state | Per-call `Slot` arrays in `alloc_state()` | Prefill and decode | Entire process |
 | Decode activations, router, expert outputs, attention scratch, logits | `alloc_state()` | Decode | Entire process, even though these buffers are not used by the batched prefill path |
-| Batched prefill workspace | `alloc_prefill()`; `pf_alloc()` sends buffers >= 8 MiB to VMM ranges when `g_pf_elastic` is true | Prompt processing | VMM addresses remain reserved; physical pages are mapped for the chunk and unmapped after prefill. Small control arrays stay `cudaMalloc`-backed for process lifetime. |
+| Batched prefill workspace | `alloc_prefill()`; `pf_alloc()` sends buffers >= 8 MiB to VMM ranges when `g_pf_elastic` is true | Prompt processing | VMM addresses remain reserved; physical pages are mapped for the chunk and moved to a shared VMM handle cache after the prompt. Small control arrays stay `cudaMalloc`-backed for process lifetime. |
 | Prefill expert staging | Two 64 MiB VMM device halves plus two 64 MiB pinned host halves | Long/non-routed prefill streaming | Device pages are mapped only when streaming is selected; host halves live for process lifetime |
 | Optional DSpark draft and verify state | `draft_load()`, `alloc_state()` and `alloc_prefill()` | Draft and verify | Entire process when enabled; excluded from the plain-decode figures below |
 | Optional vision workspace | `vis_run()` temporary device arena | Image prefill only | Temporary; released after image processing |
 | CUDA graphs and cuBLAS internal workspace | CUDA/cuBLAS runtime | Captured decode or GEMM calls | Runtime-owned and shape/device dependent; not included in the source-derived PF byte totals |
 
-`pool_resize()` synchronizes, evicts only the pool tail, and destroys the decode and verify graph executables. `pf_unmap()` synchronizes, unmaps all mapped prefill ranges, then calls `pools_fill()`. `kv_fit()` can take pool slots back before mapping more full-attention KV. These paths preserve the model, existing prefix slots, CPU workers, and K/V state; they do not reload the model.
+`pool_resize()` synchronizes, evicts only the pool tail, and destroys the decode and verify graph executables. `pf_unmap()` synchronizes, unmaps mapped prefill ranges into the shared VMM handle cache, then calls `pools_fill()`. New expert slots can map those same handles. `kv_fit()` can take pool slots back before mapping more full-attention K/V. These paths preserve the model, existing prefix slots, CPU workers, and K/V state; they do not reload the model.
 
-The current handoff does return physical pages after prefill, but each page is `cuMemUnmap`'d and its allocation handle is released. A later pool expansion creates new handles. The proposed arena will retain released handles for immediate remapping between prefill ranges, expert pools, and growable KV, and will drain unused handles before unrelated `cudaMalloc` calls.
+At base revision `e1538e995`, an unmapped page's allocation handle was released, and a later pool expansion created a new handle. This branch retains released handles for reuse between prefill ranges, expert pools, and growable KV. `vram_free()` counts cached handles as reusable capacity; `dalloc()` releases cached handles before a regular `cudaMalloc` needs that memory.
 
 ## Persistent decode and state allocations
 
@@ -89,15 +89,23 @@ For K8/V4, one K/V cell uses 1,024 B K codes, 512 B V codes, 32 B K scales, and 
 
 Full-attention K/V at 16K is 204 MiB; at 32K it is 408 MiB; at 256K it is 3,264 MiB. Sliding K/V is fixed by `WINDOW + PF_RING_EXTRA`, independent of conversation length. `kv_fit()` rounds full-attention growth to `--kv-grow-step` and shrinks expert pools first; `pf_fit()` includes planned KV growth and the configured VRAM margin before admitting a chunk.
 
-## Issues to address
+## Phase-aware implementation
 
-1. Reuse unmapped VMM physical handles across prefill, expert pools, and full-attention KV to avoid release/create churn. Preserve virtual addresses and only remap after device synchronization.
-2. Add post-prefill telemetry for actual reclaimed bytes, transition time, pool counts, and peak process/device memory.
-3. Count routes from the actual prompt and retain existing expert residents. Fill only newly available slots, ranking cold candidates with prompt route count and measured CPU worker latency per expert byte.
-4. Record CPU worker latency by NVFP4/MXFP8 from real decode rings. The existing `InkBell.us_job` measures ring-to-ack latency per job but mixes formats; the repeated-expert standalone bandwidth result is not used.
-5. Add a fixed sliding-ring-capacity control for the 4K/8K chunk comparison. Preserve the current default behavior.
-6. Keep the existing grow guard and pool floors so later KV growth can reclaim decode slots safely.
+- `VRange::unmap_to()` now places physical handles in `g_vmm_cached`. `VRange::map_to()` reuses them before creating new handles. The virtual addresses stay fixed.
+- `vram_free()` adds cached VMM bytes to CUDA's reported free memory. `dalloc()` drains the cache before a regular allocation so unused VMM handles do not block other engine allocations.
+- `pf_unmap()` reports actual mapped bytes, handles reused, transition time, pool counts, and refill size.
+- The prefill route planner counts selected experts for the active prompt. The post-prompt refill keeps current residents and fills empty slots using prompt routes, the static profile, decayed decode counts, and measured CPU ring-to-ack cost per layer and format. Looped core layers 6-17 are admitted first.
+- `InkBell` records per-format and per-layer CPU service time from real inference jobs. No standalone repeated-expert throughput is used for placement.
+- `INK2_RING_EXTRA` fixes the sliding K/V capacity in the 4K/8K comparison. The default remains the configured chunk size; the benchmark set it to 8192 for both variants.
 
-## Pending runtime measurements
+## Runtime measurements
 
-The experiment must fill in the active GPU free memory, RAM limit, exact loaded dense/state allocations, baseline 4K/8K pool counts, and all requested throughput/memory metrics. Those measurements were not run during this audit because the running `bel-server` occupied 11,832 MiB of the GPU. Do not infer those values from the static workspace calculation.
+Hardware was an RTX 3060 with 12,288 MiB VRAM and 16,151,204 kB system RAM. `nvidia-smi` showed 11,857 MiB total GPU use during the runs, including 11,834 MiB for `bel-server`. The server's peak RSS was 12,137 MiB for the 8K run and 12,439 MiB for the 4K run. The lowest sampled `MemAvailable` was 12,046 MiB and 12,132 MiB, respectively.
+
+The engine loaded the checkpoint experts from a 6,246 MiB file-backed mapping. It kept a bounded 511 MiB pinned host copy; it did not create or pin a 14.6 GiB anonymous expert arena. Startup placement was 1,875 NVFP4 + 88 MXFP8 slots for the 8K run and 1,876 + 88 for the 4K run. All 1,536 experts in physical layers 6-17 were resident at startup and had zero CPU misses in the captured decode traces.
+
+At a 16K prompt, K/V growth reached 20,480 cells and 0.27 GiB. After the prompt, the 4K variant held 1,826-1,837 NVFP4 + 88 MXFP8 slots across its three repeats. The 8K variant held 1,836 NVFP4 + 88 MXFP8 slots in its warm matrix run and route-capture run. The 8K chunk increased prompt workspace and prefill rate, but did not increase final decode residency at 16K because both variants returned their workspace to the pool and retained the same K/V capacity.
+
+Actual workspace at handoff was 2,706 MiB for a 4K chunk and 5,166 MiB for an 8K chunk. The 4K run remapped about 2,704-2,708 MiB of VMM handles at the handoff and admitted 589-590 NVFP4 + 24 MXFP8 slots. The 8K run remapped about 5,164-5,168 MiB and admitted 1,165-1,166 NVFP4 + 24 MXFP8 slots. A fresh 16K route-capture run measured a 1,168.6 ms transition; the warm matrix run was about 0.90-0.92 s. The 4K 16K transitions were about 0.47-0.48 s.
+
+The working data and caveats are in [RESULTS.md](RESULTS.md). The benchmark prompts are complete Inkling messages ending with the review question and model prefix. Prompt caching stayed enabled. Repeated identical prompts reported `cache_n=0`, so these measurements do not demonstrate a cache hit or conversation continuation. Exact greedy output matching across repeats was not achieved. Only prompts through 16K were run; 32K and 256K stability remain unverified.

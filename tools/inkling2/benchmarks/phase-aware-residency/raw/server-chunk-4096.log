@@ -1,0 +1,141 @@
+0.00.000.836 I srv  llama_server: initializing ...
+0.00.065.373 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.065.724 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.067.647 W srv  init_inkling: direct checkpoint mode supports one active request; setting --parallel to 1
+expert placement: read 3072 route-count entries
+expert source: file-backed safetensors, CPU misses read on demand
+loaded layer 1/24, 0.9 GiB in VRAMloaded layer 2/24, 1.0 GiB in VRAMloaded layer 3/24, 1.0 GiB in VRAMloaded layer 4/24, 1.1 GiB in VRAMloaded layer 5/24, 1.1 GiB in VRAMloaded layer 6/24, 1.2 GiB in VRAMloaded layer 7/24, 1.2 GiB in VRAMloaded layer 8/24, 1.3 GiB in VRAMloaded layer 9/24, 1.3 GiB in VRAMloaded layer 10/24, 1.4 GiB in VRAMloaded layer 11/24, 1.4 GiB in VRAMloaded layer 12/24, 1.5 GiB in VRAMloaded layer 13/24, 1.6 GiB in VRAMloaded layer 14/24, 1.6 GiB in VRAMloaded layer 15/24, 1.7 GiB in VRAMloaded layer 16/24, 1.7 GiB in VRAMloaded layer 17/24, 1.8 GiB in VRAMloaded layer 18/24, 1.8 GiB in VRAMloaded layer 19/24, 1.9 GiB in VRAMloaded layer 20/24, 1.9 GiB in VRAMloaded layer 21/24, 2.0 GiB in VRAMloaded layer 22/24, 2.0 GiB in VRAMloaded layer 23/24, 2.1 GiB in VRAMloaded layer 24/24, 2.1 GiB in VRAM
+offload: 8.56 GiB free after the rest, reserve 0 MiB -> 1876 NVFP4 + 88 MXFP8 expert slots (8.50 GiB, 58 % of the experts)
+expert placement: loop core 1536/1536 resident; outer NVFP4 340/1024, MXFP8 88/512
+host expert pin pool: 511 MiB across 73 route-ranked experts; remaining sources use safetensors mmap
+host experts: 6242 MiB nonresident source, 511 MiB pinned host copy
+cpu experts: avx2, NVFP4 activations int8, 1 node(s) (NUMA placement off: INK2_NUMA_POOL=0), threads per node: 5
+load 15.8 s, 11.30 GiB in VRAM (ctx 32768)
+0.39.892.291 I srv  init_inkling: loaded direct Inkling checkpoint '/home/zyxciss/Models/Inkling-2-Mini' with k8v4 KV and tiled CUDA attention, context 32768, route profile /home/zyxciss/Models/Inkling-2-Mini/inkling2-routes-256k-decode.freq
+0.39.895.466 I srv  server_run_i: model loaded
+0.39.895.495 I srv  server_on_li: listening on http://127.0.0.1:18090
+1.11.567.311 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+pools: 1871 NVFP4 + 88 MXFP8 slots (8.48 GiB)
+pool refill: restored 172 NVFP4 + 24 MXFP8 experts (0.90 GiB), evicted 0
+INK2_DECODE_MISSES 0:2375 1:2323 2:3060 3:2750 4:2684 5:2740 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:2872 19:2942 20:3030 21:3003 22:3033 23:3503
+1.34.493.830 I slot print_timing: id  0 | task 0 | prompt eval time =    3661.00 ms /  1024 tokens (    3.58 ms per token,   279.70 tokens per second)
+1.34.493.833 I slot print_timing: id  0 | task 0 |        eval time =   19256.00 ms /   512 tokens (   37.68 ms per token,    26.54 tokens per second)
+1.34.493.833 I slot print_timing: id  0 | task 0 |       total time =   22917.00 ms /  1536 tokens
+1.34.493.840 I slot print_timing: id  0 | task 0 |    graphs reused =          0
+1.34.493.840 I slot print_timing: id  0 | task 0 |   graph reallocs =          0    /     0        (same size) / (changed size)
+1.34.495.825 I slot      release: id  0 | task 0 | stop processing: n_tokens = 1024, truncated = 0
+1.34.529.739 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 1024, t_last = 44551188922
+pools: 1871 NVFP4 + 88 MXFP8 slots (8.48 GiB)
+pool refill: restored 172 NVFP4 + 24 MXFP8 experts (0.90 GiB), evicted 0
+INK2_DECODE_MISSES 0:2375 1:2323 2:3060 3:2750 4:2684 5:2740 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:2872 19:2942 20:3030 21:3003 22:3033 23:3503
+1.56.125.535 I slot print_timing: id  0 | task 1 | prompt eval time =    2353.00 ms /  1024 tokens (    2.30 ms per token,   435.19 tokens per second)
+1.56.125.537 I slot print_timing: id  0 | task 1 |        eval time =   19243.00 ms /   512 tokens (   37.66 ms per token,    26.56 tokens per second)
+1.56.125.538 I slot print_timing: id  0 | task 1 |       total time =   21596.00 ms /  1536 tokens
+1.56.125.539 I slot print_timing: id  0 | task 1 |    graphs reused =          0
+1.56.125.539 I slot print_timing: id  0 | task 1 |   graph reallocs =          0    /     0        (same size) / (changed size)
+1.56.125.629 I slot      release: id  0 | task 1 | stop processing: n_tokens = 1024, truncated = 0
+1.56.129.913 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 1024, t_last = 44572818725
+pools: 1871 NVFP4 + 88 MXFP8 slots (8.48 GiB)
+pool refill: restored 172 NVFP4 + 24 MXFP8 experts (0.90 GiB), evicted 0
+INK2_DECODE_MISSES 0:2375 1:2323 2:3060 3:2750 4:2684 5:2740 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:2872 19:2942 20:3030 21:3003 22:3033 23:3503
+2.18.308.030 I slot print_timing: id  0 | task 2 | prompt eval time =    2296.00 ms /  1024 tokens (    2.24 ms per token,   445.99 tokens per second)
+2.18.308.032 I slot print_timing: id  0 | task 2 |        eval time =   19881.00 ms /   512 tokens (   38.91 ms per token,    25.70 tokens per second)
+2.18.308.033 I slot print_timing: id  0 | task 2 |       total time =   22177.00 ms /  1536 tokens
+2.18.308.034 I slot print_timing: id  0 | task 2 |    graphs reused =          0
+2.18.308.034 I slot print_timing: id  0 | task 2 |   graph reallocs =          0    /     0        (same size) / (changed size)
+2.18.308.088 I slot      release: id  0 | task 2 | stop processing: n_tokens = 1024, truncated = 0
+2.18.345.215 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 1024, t_last = 44595001185
+pools: 1871 NVFP4 + 88 MXFP8 slots (8.48 GiB)
+pool refill: restored 589 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+kv-grow: 8192 cells (0.12 GiB K/V), expert slots 1871 + 82
+INK2_DECODE_MISSES 0:3132 1:2551 2:2816 3:2080 4:2290 5:3339 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:1759 19:2396 20:2760 21:2812 22:2750 23:3087
+2.44.805.683 I slot print_timing: id  0 | task 3 | prompt eval time =    6922.00 ms /  4096 tokens (    1.69 ms per token,   591.74 tokens per second)
+2.44.805.686 I slot print_timing: id  0 | task 3 |        eval time =   19537.00 ms /   512 tokens (   38.23 ms per token,    26.16 tokens per second)
+2.44.805.686 I slot print_timing: id  0 | task 3 |       total time =   26459.00 ms /  4608 tokens
+2.44.805.687 I slot print_timing: id  0 | task 3 |    graphs reused =          0
+2.44.805.687 I slot print_timing: id  0 | task 3 |   graph reallocs =          0    /     0        (same size) / (changed size)
+2.44.810.582 I slot      release: id  0 | task 3 | stop processing: n_tokens = 4096, truncated = 0
+2.44.861.779 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 4096, t_last = 44621503680
+pools: 1860 NVFP4 + 88 MXFP8 slots (8.43 GiB)
+pool refill: restored 590 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+INK2_DECODE_MISSES 0:3028 1:2525 2:2421 3:2151 4:2260 5:3466 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:1675 19:2472 20:2709 21:2842 22:2647 23:2969
+3.08.456.447 I slot print_timing: id  0 | task 4 | prompt eval time =    5052.00 ms /  4096 tokens (    1.23 ms per token,   810.77 tokens per second)
+3.08.456.449 I slot print_timing: id  0 | task 4 |        eval time =   18542.00 ms /   512 tokens (   36.29 ms per token,    27.56 tokens per second)
+3.08.456.450 I slot print_timing: id  0 | task 4 |       total time =   23594.00 ms /  4608 tokens
+3.08.456.450 I slot print_timing: id  0 | task 4 |    graphs reused =          0
+3.08.456.451 I slot print_timing: id  0 | task 4 |   graph reallocs =          0    /     0        (same size) / (changed size)
+3.08.456.669 I slot      release: id  0 | task 4 | stop processing: n_tokens = 4096, truncated = 0
+3.08.466.278 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 4096, t_last = 44645149767
+pools: 1860 NVFP4 + 88 MXFP8 slots (8.43 GiB)
+pool refill: restored 590 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+INK2_DECODE_MISSES 0:3028 1:2525 2:2421 3:2151 4:2260 5:3466 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:1675 19:2472 20:2709 21:2842 22:2647 23:2969
+3.32.922.237 I slot print_timing: id  0 | task 5 | prompt eval time =    5079.00 ms /  4096 tokens (    1.24 ms per token,   806.46 tokens per second)
+3.32.922.258 I slot print_timing: id  0 | task 5 |        eval time =   19377.00 ms /   512 tokens (   37.92 ms per token,    26.37 tokens per second)
+3.32.922.259 I slot print_timing: id  0 | task 5 |       total time =   24456.00 ms /  4608 tokens
+3.32.922.260 I slot print_timing: id  0 | task 5 |    graphs reused =          0
+3.32.922.261 I slot print_timing: id  0 | task 5 |   graph reallocs =          0    /     0        (same size) / (changed size)
+3.32.923.193 I slot      release: id  0 | task 5 | stop processing: n_tokens = 4096, truncated = 0
+3.32.969.607 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 4096, t_last = 44669616291
+pools: 1860 NVFP4 + 88 MXFP8 slots (8.43 GiB)
+pool refill: restored 590 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+kv-grow: 12288 cells (0.17 GiB K/V), expert slots 1861 + 81
+INK2_DECODE_MISSES 0:2895 1:1902 2:3408 3:2665 4:2332 5:3083 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:2496 19:2861 20:2977 21:3058 22:3009 23:3099
+4.01.770.177 I slot print_timing: id  0 | task 6 | prompt eval time =    9368.00 ms /  8192 tokens (    1.14 ms per token,   874.47 tokens per second)
+4.01.770.180 I slot print_timing: id  0 | task 6 |        eval time =   19431.00 ms /   512 tokens (   38.03 ms per token,    26.30 tokens per second)
+4.01.770.181 I slot print_timing: id  0 | task 6 |       total time =   28799.00 ms /  8704 tokens
+4.01.770.181 I slot print_timing: id  0 | task 6 |    graphs reused =          0
+4.01.770.181 I slot print_timing: id  0 | task 6 |   graph reallocs =          0    /     0        (same size) / (changed size)
+4.01.770.536 I slot      release: id  0 | task 6 | stop processing: n_tokens = 8192, truncated = 0
+4.01.786.923 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 8192, t_last = 44698463633
+pools: 1849 NVFP4 + 88 MXFP8 slots (8.39 GiB)
+pool refill: restored 590 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+INK2_DECODE_MISSES 0:2148 1:2063 2:2153 3:1682 4:2247 5:2390 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:1463 19:2479 20:2811 21:2659 22:3128 23:3418
+4.29.323.418 I slot print_timing: id  0 | task 7 | prompt eval time =    9235.00 ms /  8192 tokens (    1.13 ms per token,   887.06 tokens per second)
+4.29.323.420 I slot print_timing: id  0 | task 7 |        eval time =   18301.00 ms /   512 tokens (   35.81 ms per token,    27.92 tokens per second)
+4.29.323.439 I slot print_timing: id  0 | task 7 |       total time =   27536.00 ms /  8704 tokens
+4.29.323.440 I slot print_timing: id  0 | task 7 |    graphs reused =          0
+4.29.323.440 I slot print_timing: id  0 | task 7 |   graph reallocs =          0    /     0        (same size) / (changed size)
+4.29.323.711 I slot      release: id  0 | task 7 | stop processing: n_tokens = 8192, truncated = 0
+4.29.342.643 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 8192, t_last = 44726016809
+pools: 1849 NVFP4 + 88 MXFP8 slots (8.39 GiB)
+pool refill: restored 590 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+INK2_DECODE_MISSES 0:2148 1:2063 2:2153 3:1682 4:2247 5:2390 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:1463 19:2479 20:2811 21:2659 22:3128 23:3418
+4.56.779.002 I slot print_timing: id  0 | task 8 | prompt eval time =    9190.00 ms /  8192 tokens (    1.12 ms per token,   891.40 tokens per second)
+4.56.779.005 I slot print_timing: id  0 | task 8 |        eval time =   18245.00 ms /   512 tokens (   35.70 ms per token,    28.01 tokens per second)
+4.56.779.006 I slot print_timing: id  0 | task 8 |       total time =   27435.00 ms /  8704 tokens
+4.56.779.006 I slot print_timing: id  0 | task 8 |    graphs reused =          0
+4.56.779.007 I slot print_timing: id  0 | task 8 |   graph reallocs =          0    /     0        (same size) / (changed size)
+4.56.779.260 I slot      release: id  0 | task 8 | stop processing: n_tokens = 8192, truncated = 0
+4.56.854.549 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 8192, t_last = 44753472358
+kv-grow: 16384 cells (0.22 GiB K/V), expert slots 1248 + 64
+pools: 1837 NVFP4 + 88 MXFP8 slots (8.34 GiB)
+pool refill: restored 589 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+kv-grow: 20480 cells (0.27 GiB K/V), expert slots 1837 + 82
+INK2_DECODE_MISSES 0:2431 1:2223 2:2926 3:3029 4:2580 5:2867 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:2553 19:2721 20:2992 21:2739 22:3046 23:3373
+5.34.658.959 I slot print_timing: id  0 | task 9 | prompt eval time =   18297.00 ms / 16384 tokens (    1.12 ms per token,   895.45 tokens per second)
+5.34.658.961 I slot print_timing: id  0 | task 9 |        eval time =   19506.00 ms /   512 tokens (   38.17 ms per token,    26.20 tokens per second)
+5.34.658.962 I slot print_timing: id  0 | task 9 |       total time =   37803.00 ms / 16896 tokens
+5.34.658.983 I slot print_timing: id  0 | task 9 |    graphs reused =          0
+5.34.658.983 I slot print_timing: id  0 | task 9 |   graph reallocs =          0    /     0        (same size) / (changed size)
+5.34.659.510 I slot      release: id  0 | task 9 | stop processing: n_tokens = 16384, truncated = 0
+5.34.689.165 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 16384, t_last = 44791352608
+pools: 1826 NVFP4 + 88 MXFP8 slots (8.29 GiB)
+pool refill: restored 590 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+INK2_DECODE_MISSES 0:2327 1:2280 2:2836 3:2841 4:2348 5:2830 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:2488 19:2899 20:2861 21:2958 22:2907 23:3376
+6.12.395.990 I slot print_timing: id  0 | task 10 | prompt eval time =   18248.00 ms / 16384 tokens (    1.11 ms per token,   897.85 tokens per second)
+6.12.395.992 I slot print_timing: id  0 | task 10 |        eval time =   19457.00 ms /   512 tokens (   38.08 ms per token,    26.26 tokens per second)
+6.12.395.992 I slot print_timing: id  0 | task 10 |       total time =   37705.00 ms / 16896 tokens
+6.12.395.993 I slot print_timing: id  0 | task 10 |    graphs reused =          0
+6.12.396.025 I slot print_timing: id  0 | task 10 |   graph reallocs =          0    /     0        (same size) / (changed size)
+6.12.396.488 I slot      release: id  0 | task 10 | stop processing: n_tokens = 16384, truncated = 0
+6.12.425.906 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 16384, t_last = 44829089586
+pools: 1826 NVFP4 + 88 MXFP8 slots (8.29 GiB)
+pool refill: restored 589 NVFP4 + 24 MXFP8 experts (2.64 GiB), evicted 0
+INK2_DECODE_MISSES 0:2327 1:2280 2:2836 3:2841 4:2348 5:2830 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:2488 19:2899 20:2861 21:2958 22:2907 23:3376
+6.50.132.178 I slot print_timing: id  0 | task 11 | prompt eval time =   18315.00 ms / 16384 tokens (    1.12 ms per token,   894.57 tokens per second)
+6.50.132.180 I slot print_timing: id  0 | task 11 |        eval time =   19390.00 ms /   512 tokens (   37.95 ms per token,    26.35 tokens per second)
+6.50.132.181 I slot print_timing: id  0 | task 11 |       total time =   37705.00 ms / 16896 tokens
+6.50.132.181 I slot print_timing: id  0 | task 11 |    graphs reused =          0
+6.50.132.203 I slot print_timing: id  0 | task 11 |   graph reallocs =          0    /     0        (same size) / (changed size)
+6.50.132.655 I slot      release: id  0 | task 11 | stop processing: n_tokens = 16384, truncated = 0
+8.48.215.811 I srv    operator(): operator(): cleaning up before exit...

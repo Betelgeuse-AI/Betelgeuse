@@ -1,27 +1,31 @@
-# Phase-aware residency experiment
+# Phase-aware residency
 
-## Audit and control measurements
+Branch: `feat/phase-aware-residency`
+Base: `e1538e9954a191d352cae0697b5908b0e477c913`
+Model files: existing local checkpoint only. No model files were downloaded.
 
-- [x] Preserve `feat/selective-expert-staging` and its commits/results; do not pursue Phase 2B or GPU staging.
-- [x] Create `feat/phase-aware-residency` from `e1538e995` mmap-backed CPU runtime.
-- [x] Audit source allocation formulas, lifetimes, expert sizes, KV/chunk interaction, graph invalidation, and current refill path.
-- [ ] Capture actual GPU/RAM availability and allocation snapshots when the GPU is free.
-- [ ] Build coherent source-review prompts from the fixed base revision; store prompts and IDs under this experiment.
-- [ ] Measure 4K vs 8K with identical settings and fixed sliding-ring capacity; record routes, KV, pool counts, and performance.
+## Completed
 
-## Implementation
+- [x] Preserve the mmap-backed CPU expert path and the separate `feat/selective-expert-staging` experiment.
+- [x] Audit allocation ownership, lifetimes, exact expert sizes, prefill workspace sizes, K/V growth, and graph invalidation in `ALLOCATION-AUDIT.md`.
+- [x] Record current GPU and host memory snapshots on the RTX 3060.
+- [x] Add a shared VMM backing-handle cache between prefill workspace, decode expert pools, and growable K/V. Drain unused cached handles before ordinary CUDA allocations.
+- [x] Preserve existing expert residents during post-prefill refill; fill only newly available slots.
+- [x] Rank new slots with actual prompt routes, static route counts, decayed decode routes, and measured per-layer CPU ring-to-ack cost per MiB. Prioritize layers 6-17.
+- [x] Add runtime logging for mapped workspace, transition time, reused VMM bytes, pool sizes, and CPU service costs.
+- [x] Add a fixed `INK2_RING_EXTRA` control for an apples-to-apples 4K/8K chunk comparison; keep the current default behavior.
+- [x] Build and run the direct-checkpoint server with Q8 K / Q4 V, flash attention, five CPU threads, and prompt caching enabled.
+- [x] Benchmark coherent source-review prompts at about 1K, 4K, 8K, and 16K, with 512 generated tokens and three repeats per context for both chunk sizes.
+- [x] Save timing responses, the 4K server trace, an 8K 16K route capture, and RAM/VRAM samples under `raw/`.
+- [x] Confirm zero CPU misses in looped layers 6-17 in the captured decode traces.
+- [x] Stop the stale server the user identified; later start and stop a fresh best512-profile server for the requested coherent 16K rerun.
 
-- [ ] Reuse VMM backing handles across prefill workspace, decode expert pools, and growable KV.
-- [ ] Add a fixed ring-capacity override for controlled chunk comparisons, preserving the current default.
-- [ ] Accumulate actual prompt route frequencies for post-prefill admission.
-- [ ] Record CPU worker latency separately for NVFP4 and MXFP8 during actual inference.
-- [ ] Refill only newly available expert slots from mmap, preserving existing residents and accounting for future KV growth.
-- [ ] Log reclaimed bytes, transition latency, resident counts, CPU misses, and allocation peaks.
-- [ ] Rebuild and run correctness and long-context stability checks.
+## Follow-up required
 
-## Benchmarks and closeout
-
-- [ ] Run real technical/programming prompts at 1K, 4K, 8K, and 16K, with production prompt caching enabled.
-- [ ] Compare baseline and new runtime prefill throughput, decode throughput, TTFT, transition latency, RAM/VRAM, and CPU misses.
-- [ ] Save commands, logs, prompt source, and a concise results report.
-- [ ] Commit the audit, implementation changes, and benchmark report as independent changes.
+- [ ] Establish exact output/logit parity against the base runtime. Greedy output hashes differed across repeated identical prompts, so exact numerical equivalence is not proven.
+- [ ] Exercise an actual cached conversation continuation. Prompt caching remained enabled, but repeated full prompts reported zero cached tokens.
+- [ ] Run a long-context stability check at 32K or above. This round reached a 16K prompt and 20,480 K/V cells only.
+- [ ] Preserve and compare an 8K full-matrix server trace if per-run CPU miss counts are needed; the saved 8K server log is a one-run 16K route capture.
+- [ ] Make a before/after speed comparison against the unmodified base binary if the project needs a direct feature speedup claim. Current throughput numbers compare 4K and 8K chunks on the phase-aware build.
+- [ ] Reproduce the 40.17 tok/s decode reference on the coherent 16K prompt; the fresh best512-profile run measured 28.99 tok/s median.
+- [ ] Create separate commits after the user provides commit subjects. Repository instructions prohibit AI-written commit messages; do not commit or push without that input.

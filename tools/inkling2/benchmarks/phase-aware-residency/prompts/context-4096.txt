@@ -1,0 +1,221 @@
+<|message_system|><|content_text|>You are reviewing a real CUDA inference runtime. Give a concise, technically grounded analysis. Treat the code below as a production system: preserve output correctness, long-context safety, prompt caching, and the mmap-backed CPU expert path. Do not invent measurements. Do not write or continue source code; answer the review task at the end.<|end_message|><|message_user|><|content_text|>Task: Review this direct-checkpoint Inkling-2-Mini runtime before implementing phase-aware VRAM residency. The target design gives prefill the workspace it needs for large prompt chunks, then reuses released GPU pages for more permanently resident decode experts. Dense weights, current expert slots, KV state, CPU workers, and server conversation caching must remain valid. The checkpoint experts stay mmap-backed in host RAM; do not pin the whole checkpoint. The source excerpts are unmodified files from the mmap-backed runtime at commit e1538e995. They are selected excerpts, ordered by execution flow; omitted code is not available. Excerpts may end at a source line boundary.
+
+Source excerpts:
+
+Source file: tools/inkling2/ink2_engine.cu, lines 2388-2510. CUDA allocation helpers and growable VMM ranges.
+```cpp
+            }
+        } else { std::fprintf(stderr, "%s: dtype %s\n", name.c_str(), d.dtype.c_str()); std::exit(1); }
+        return out;
+    }
+};
+
+size_t g_vram = 0;
+
+void* dalloc(size_t bytes) {
+    if (!bytes) return nullptr;   // an empty pool (GGUF: no MXFP8 slots)
+    void* d = nullptr;
+    CK(cudaMalloc(&d, bytes));
+    CK(cudaMemset(d, 0, bytes));
+    g_vram += bytes;
+    return d;
+}
+float* dfloats(size_t n) { return (float*) dalloc(n * 4); }
+void* upload(const void* p, size_t bytes) {
+    void* d = dalloc(bytes);
+    if (!d) return nullptr;
+    CK(cudaMemcpy(d, p, bytes, cudaMemcpyHostToDevice));
+    return d;
+}
+float* dvec(const vec& v) { return (float*) upload(v.data(), v.size() * 4); }
+// ---------------------------------------------------------------------------------------------------------------------
+// Growable device ranges (CUDA virtual memory): an address range reserved once, physical chunks of the allocation
+// granularity mapped and unmapped at its end.  The addresses never move.  Driver entry points resolved at run time
+// (no link to libcuda), as in src/core/vmm.cpp.
+struct Vmm {
+    bool ok = false;
+    size_t gran = 0;
+    int dev = 0;
+    decltype(&cuMemAddressReserve) reserve = nullptr;
+    decltype(&cuMemCreate) create = nullptr;
+    decltype(&cuMemRelease) release = nullptr;
+    decltype(&cuMemMap) map = nullptr;
+    decltype(&cuMemUnmap) unmap = nullptr;
+    decltype(&cuMemSetAccess) access = nullptr;
+};
+Vmm g_vmm;
+template <class F> bool vmm_resolve(const char* name, F& f) {
+    cudaDriverEntryPointQueryResult q{};
+    void* p = nullptr;
+#if CUDART_VERSION >= 12050
+    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
+#else
+    const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
+#endif
+    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || !p) { (void) cudaGetLastError(); return false; }
+    f = (F) p;
+    return true;
+}
+void vmm_init() {
+    Vmm& a = g_vmm;
+    decltype(&cuMemGetAllocationGranularity) granularity = nullptr;
+    CK(cudaGetDevice(&a.dev));
+    if (!vmm_resolve("cuMemGetAllocationGranularity", granularity) || !vmm_resolve("cuMemAddressReserve", a.reserve) ||
+        !vmm_resolve("cuMemCreate", a.create) || !vmm_resolve("cuMemRelease", a.release) || !vmm_resolve("cuMemMap", a.map) ||
+        !vmm_resolve("cuMemUnmap", a.unmap) || !vmm_resolve("cuMemSetAccess", a.access)) {
+        std::fprintf(stderr, "--kv-grow: the driver's virtual memory entry points are missing\n");
+        std::exit(1);
+    }
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = a.dev;
+    if (granularity(&a.gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || !a.gran) {
+        std::fprintf(stderr, "--kv-grow: no allocation granularity\n");
+        std::exit(1);
+    }
+    a.ok = true;
+}
+struct VRange {
+    CUdeviceptr base = 0;
+    size_t reserved = 0, mapped = 0;
+    std::vector<CUmemGenericAllocationHandle> h;
+    void* ptr() const { return (void*) base; }
+    static size_t up(size_t b) { return (b + g_vmm.gran - 1) / g_vmm.gran * g_vmm.gran; }
+    void init(size_t bytes) {
+        reserved = up(std::max<size_t>(bytes, 1));
+        if (g_vmm.reserve(&base, reserved, 0, 0, 0) != CUDA_SUCCESS) {
+            std::fprintf(stderr, "cuMemAddressReserve of %zu bytes failed\n", reserved);
+            std::exit(1);
+        }
+    }
+    size_t need(size_t bytes) const { return std::min(up(bytes), reserved); }   // mapped bytes for `bytes`
+    bool map_to(size_t bytes) {   // false: out of memory (what was mapped stays)
+        const size_t want = need(bytes);
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = g_vmm.dev;
+        CUmemAccessDesc acc{};
+        acc.location = prop.location;
+        acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        while (mapped < want) {
+            CUmemGenericAllocationHandle hd = 0;
+            if (g_vmm.create(&hd, g_vmm.gran, &prop, 0) != CUDA_SUCCESS) return false;
+            if (g_vmm.map(base + mapped, g_vmm.gran, 0, hd, 0) != CUDA_SUCCESS ||
+                g_vmm.access(base + mapped, g_vmm.gran, &acc, 1) != CUDA_SUCCESS) {
+                std::fprintf(stderr, "cuMemMap failed\n");
+                std::exit(1);
+            }
+            h.push_back(hd);
+            mapped += g_vmm.gran;
+            g_vram += g_vmm.gran;
+        }
+        return true;
+    }
+    void unmap_to(size_t bytes) {
+        const size_t want = need(bytes);
+        while (mapped > want) {
+            mapped -= g_vmm.gran;
+            g_vmm.unmap(base + mapped, g_vmm.gran);
+            g_vmm.release(h.back());
+            h.pop_back();
+            g_vram -= g_vmm.gran;
+        }
+    }
+};
+
+struct DMat {
+    const uint16_t* d = nullptr;   // BF16 [n][k]
+```
+
+Source file: tools/inkling2/ink2_engine.cu, lines 2540-2624. Engine ownership and expert pool state.
+```cpp
+    DMat proj, wo, router;
+    int off_k = 0, off_v = 0, n_k = 0, n_v = 0;
+    const float *q_scale, *rel_scale, *rel_proj, *k_conv = nullptr, *v_conv = nullptr, *k_static = nullptr,
+                *v_static = nullptr, *attn_conv, *mlp_conv, *attn_norm = nullptr, *q_norm = nullptr,
+                *k_norm = nullptr, *v_norm = nullptr, *mlp_norm, *attn_query = nullptr, *mlp_query, *router_bias;
+    Experts ex;
+    Gate gates[4];
+};
+
+struct Slot {
+    void *K, *V;    // [cap][KVD] fp32 / fp16 / int8 codes with ksc / vsc (--kv, see kv_st)
+    __half *ksc = nullptr, *vsc = nullptr;   // [cap][KVD / KVG]
+    int cap = 0;
+    bool full = false;
+    float *khist, *vhist, *ahist, *mhist;   // [HR][C]
+};
+
+struct Bells { ink2cpu::InkBell* b[2]; };   // device views of the per-node doorbells
+constexpr int SYNC_MAX = 2;   // misses of a visit computed on the GPU over PCIe (the PCIe share), at most
+struct SyncArgs {             // the PCIe share's state, for k_cache_cpu and k_cpu_wait
+    const uint8_t* const* xsrc;   // [NL * NE] device views of the experts in host memory
+    const uint8_t** tabA;
+    const uint8_t** tabB;
+    uint8_t* stage;               // [SYNC_MAX] staging slots of MX_BYTES
+    const uint8_t** fsrc;
+    uint8_t** fdst;
+    int* nfetch;
+    int* keys;                    // [SYNC_MAX] the visit's PCIe experts (their table entries point at the staging)
+    unsigned long long* fbytes;
+    const uint8_t* home;          // [NL * NE] node of each expert
+    float us_nv, us_mx;           // one expert over PCIe, us (0: the share off)
+    float margin;                 // us the GPU side adds to the copies (its GEMVs, the background copies' PCIe)
+};
+
+struct Engine {
+    const Ckpt* ck = nullptr;
+    int ctx = 8192, nchunk_full = 0, nchunk_slide = WINDOW / CHUNK;
+    std::vector<uint16_t> embed;   // host BF16
+    std::vector<uint8_t> embed_q8; // or (GGUF) host Q8_0 rows of H / 32 blocks
+    const float *embed_norm, *norm, *final_query, *msg_queries;
+    DMat unembed;
+    Layer L[NL];
+    Slot S[NCALLS];
+    int* d_pos;
+    // activations
+    float *h, *out, *Bbuf, *preB, *pre_h, *prev_stack, *msgs;
+    float *a, *t[4], *xq, *xk, *xv, *q, *k, *v, *kc, *vc, *dw, *rs, *rel, *sink, *gate, *att, *attn_out, *att2, *r;
+    float *m, *mn, *cat, *gdown, *gf, *gg, *rl, *wts, *gu, *act, *ey, *moe, *y2, *logits;
+    float *pm, *pl, *po, *emb_in, *pout, *gfg;
+    int* ids;
+    bool graph = true;
+    cudaGraphExec_t exec = nullptr;
+    int* rec = nullptr;   // routing record / forcing [NCALLS][ctx][TOPK] (verification only)
+    int rec_mode = 0;     // 1 record (one-token path), 2 force (prefill)
+    bool grow = false;    // --kv-grow 1: the full-attention slots' K/V mapped as the context grows (VRange), the expert
+    int grow_step = 8192; //   pools (offload) give memory up and take it back (--kv-grow-step cells)
+    int kv_cells = 0;     //   cells mapped now
+    int kvm = 1;          // --kv f32 (0) | f16 (1, default) | i8 (2: int8 cells + fp16 scale per 64
+                          // layout) | i8r (3: i8 + Walsh-Hadamard rotation)
+    // experts: every expert in layout order (NVFP4 layers 0-19 then MXFP8 layers 20-23, NE per layer, one slot
+    // each); resident = the device pool holds them all, in that order
+    uint8_t *pool_nv = nullptr, *pool_mx = nullptr;
+    const uint8_t **tabA = nullptr, **tabB = nullptr;   // device [NL * NE]: part A / part B of expert (l, e)
+    std::vector<const uint8_t*> htabA, htabB;            // host mirrors
+    // offload (--vram-reserve-mib N: leave N MiB of the card free, the expert pools take what remains): every expert
+    // in mapped host memory (xh), the pools hold nslot_nv / nslot_mx of them, LRU (k_cache_plan)
+    int reserve_mib = -1;   // < 0: everything resident
+    bool offload = false;
+    bool lazy_experts = false;          // safetensors experts stay file-backed; CPU reads only routed misses
+    std::vector<uint8_t*> xh;            // [NL * NE] host address of expert (l, e) (regions placed per NUMA node)
+    std::vector<ink2cpu::ExpertParts> expert_parts; // [NL * NE] source tensor views for lazy offload
+    uint8_t* pinned_host_experts = nullptr;
+    size_t pinned_host_expert_bytes = 0;
+    std::vector<uint32_t> expert_freq;   // optional route counts for initial expert placement
+    std::vector<uint8_t> home;           // [NL * NE] its node
+    const uint8_t** xsrc_d = nullptr;    // device [NL * NE]: its device view (mapped)
+    std::vector<std::pair<void*, size_t>> regions;
+    int nslot_nv = 0, nslot_mx = 0, mx_target = 0;   // mx_target: configured MXFP8 slots, restored after a prompt
+    // CPU experts (--cpu-threads N, with offload): misses of a decode visit computed on the CPU (ink2_cpu), wanted
+    // experts promoted into the pools in the background (copied during the next token, committed at its end)
+    int cpu_threads = 0;
+    bool cpu = false;
+    unsigned long long* decode_misses = nullptr;    // optional per-physical-layer miss counts for plain decode
+    int cpu_nodes = 1;
+    // one doorbell per node, in that node's memory: its pool reads and writes local memory only, the GPU crosses
+```
+
+Review request: Based only on the supplied source, identify allocation ownership and lifetimes, which GPU pages can move from prefill workspace to decode expert slots, when that move is safe, and what must happen to CUDA graphs and future KV growth. State what must remain unchanged for CPU fallback and prompt-cache continuation. Separate source facts from hypotheses, and list the runtime evidence needed to validate the design. If an excerpt does not provide enough information, say so. Do not claim benchmark results. Answer the review now.<|end_message|><|message_model|><|content_text|>

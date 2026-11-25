@@ -1,0 +1,48 @@
+0.00.001.056 I srv  llama_server: initializing ...
+0.00.084.007 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.084.366 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.086.260 W srv  init_inkling: direct checkpoint mode supports one active request; setting --parallel to 1
+expert placement: read 3072 route-count entries
+expert source: file-backed safetensors, CPU misses read on demand
+loaded layer 1/24, 0.9 GiB in VRAMloaded layer 2/24, 1.0 GiB in VRAMloaded layer 3/24, 1.0 GiB in VRAMloaded layer 4/24, 1.1 GiB in VRAMloaded layer 5/24, 1.1 GiB in VRAMloaded layer 6/24, 1.2 GiB in VRAMloaded layer 7/24, 1.2 GiB in VRAMloaded layer 8/24, 1.3 GiB in VRAMloaded layer 9/24, 1.3 GiB in VRAMloaded layer 10/24, 1.4 GiB in VRAMloaded layer 11/24, 1.4 GiB in VRAMloaded layer 12/24, 1.5 GiB in VRAMloaded layer 13/24, 1.6 GiB in VRAMloaded layer 14/24, 1.6 GiB in VRAMloaded layer 15/24, 1.7 GiB in VRAMloaded layer 16/24, 1.7 GiB in VRAMloaded layer 17/24, 1.8 GiB in VRAMloaded layer 18/24, 1.8 GiB in VRAMloaded layer 19/24, 1.9 GiB in VRAMloaded layer 20/24, 1.9 GiB in VRAMloaded layer 21/24, 2.0 GiB in VRAMloaded layer 22/24, 2.0 GiB in VRAMloaded layer 23/24, 2.1 GiB in VRAMloaded layer 24/24, 2.1 GiB in VRAM
+offload: 8.56 GiB free after the rest, reserve 0 MiB -> 1875 NVFP4 + 88 MXFP8 expert slots (8.49 GiB, 58 % of the experts)
+expert placement: loop core 1536/1536 resident; outer NVFP4 339/1024, MXFP8 88/512
+host expert pin pool: 509 MiB across 76 route-ranked experts; remaining sources use safetensors mmap
+host experts: 6246 MiB nonresident source, 509 MiB pinned host copy
+cpu experts: avx2, NVFP4 activations int8, 1 node(s) (NUMA placement off: INK2_NUMA_POOL=0), threads per node: 5
+load 13.1 s, 11.30 GiB in VRAM (ctx 16896)
+0.37.280.718 I srv  init_inkling: loaded direct Inkling checkpoint '/home/zyxciss/Models/Inkling-2-Mini' with k8v4 KV and tiled CUDA attention, context 16896, route profile /home/zyxciss/Models/Inkling-2-Mini/inkling2-routes-best512.freq
+0.37.282.526 I srv  server_run_i: model loaded
+0.37.282.533 I srv  server_on_li: listening on http://127.0.0.1:18090
+1.24.244.520 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+prefill workspace: chunk 8192, mapped 5166 MiB, peak 5166 MiB
+kv-grow: 8192 cells (0.12 GiB K/V), expert slots 694 + 64
+prefill workspace: chunk 8146, mapped 5166 MiB, peak 5166 MiB
+kv-grow: 16384 cells (0.22 GiB K/V), expert slots 671 + 64
+pools: 1837 NVFP4 + 88 MXFP8 slots (8.34 GiB)
+pool refill: added 1166 NVFP4 + 24 MXFP8 experts (5.05 GiB); existing residents kept
+pool admission: layer CPU cost 652.38-1764.85 us/MiB; format means 1456.18 NVFP4, 1077.04 MXFP8; routes current prompt + profile + decode
+prefill->decode: released 5166 MiB, reused 5168 MiB, transition 1070.9 ms, experts 1837 + 88 (+1166 + +24), cached VMM 18 MiB
+kv-grow: 16896 cells (0.25 GiB K/V), expert slots 1837 + 84
+INK2_DECODE_MISSES 0:1006 1:2171 2:1380 3:3071 4:2873 5:2287 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:1358 19:1522 20:2356 21:3097 22:3156 23:2885
+2.03.559.340 I slot print_timing: id  0 | task 0 | prompt eval time =   21365.00 ms / 16338 tokens (    1.31 ms per token,   764.71 tokens per second)
+2.03.559.343 I slot print_timing: id  0 | task 0 |        eval time =   17938.00 ms /   512 tokens (   35.10 ms per token,    28.49 tokens per second)
+2.03.559.344 I slot print_timing: id  0 | task 0 |       total time =   39303.00 ms / 16850 tokens
+2.03.559.352 I slot print_timing: id  0 | task 0 |    graphs reused =          0
+2.03.559.353 I slot print_timing: id  0 | task 0 |   graph reallocs =          0    /     0        (same size) / (changed size)
+2.03.568.577 I slot      release: id  0 | task 0 | stop processing: n_tokens = 16338, truncated = 0
+2.03.671.188 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 16338, t_last = 64917641567
+prefill workspace: chunk 8192, mapped 5166 MiB, peak 5166 MiB
+prefill workspace: chunk 8146, mapped 5166 MiB, peak 5166 MiB
+pools: 1829 NVFP4 + 88 MXFP8 slots (8.30 GiB)
+pool refill: added 1165 NVFP4 + 24 MXFP8 experts (5.04 GiB); existing residents kept
+pool admission: layer CPU cost 47.06-73.71 us/MiB; format means 48.11 NVFP4, 48.84 MXFP8; routes current prompt + profile + decode
+prefill->decode: released 5166 MiB, reused 5164 MiB, transition 900.4 ms, experts 1829 + 88 (+1165 + +24), cached VMM 20 MiB
+INK2_DECODE_MISSES 0:1180 1:2133 2:2362 3:2263 4:1804 5:2018 6:0 7:0 8:0 9:0 10:0 11:0 12:0 13:0 14:0 15:0 16:0 17:0 18:1356 19:1122 20:2439 21:2214 22:3110 23:2848
+2.36.521.350 I slot print_timing: id  0 | task 1 | prompt eval time =   15520.00 ms / 16338 tokens (    0.95 ms per token,  1052.71 tokens per second)
+2.36.521.354 I slot print_timing: id  0 | task 1 |        eval time =   17328.00 ms /   512 tokens (   33.91 ms per token,    29.49 tokens per second)
+2.36.521.354 I slot print_timing: id  0 | task 1 |       total time =   32848.00 ms / 16850 tokens
+2.36.521.355 I slot print_timing: id  0 | task 1 |    graphs reused =          0
+2.36.521.355 I slot print_timing: id  0 | task 1 |   graph reallocs =          0    /     0        (same size) / (changed size)
+2.36.522.106 I slot      release: id  0 | task 1 | stop processing: n_tokens = 16338, truncated = 0
+350.20.449.516 I srv    operator(): operator(): cleaning up before exit...
