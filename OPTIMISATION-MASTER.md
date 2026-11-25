@@ -189,3 +189,56 @@ For short prompts a large budget does not pay back its transition cost.
 - Fetch stats show most misses still use CPU; registration selection needs decode-history feedback
   across multiple turns in a persistent server.
 - Reuse distance and exposed CPU/GPU dependency timing are not yet logged separately.
+
+## Correction: retire archived synthetic word-salad benchmark (2026-11-25)
+
+The archived 16K synthetic word-salad prompt (`~/fluxaeros-data/inkling-m2/prompt-16384.ids`) is
+**invalid for real-world performance comparisons**. All historical results from it, including the
+905.84 pp/s / 40.31 tok/s controlled run and the 40 tok/s Betelgeuse warm results, are marked
+invalid. It is not to be run again. Accepted workloads are actual Python programming tasks and the
+coherent 16,338-token source-review prompt
+(`tools/inkling2/benchmarks/phase-aware-residency/prompts/source-review-prompt.txt`).
+
+## Direct reproduction attempt: Strata mechanism in Bel
+
+The selective/scoring/k_fetch_parts machinery was removed. Bel now uses the original successful
+Strata mechanism: after prefill it packs every evictable outer expert into one pinned host arena,
+publishes device pointers through `E.xsrc_d`, and uses the original `k_fetch` GPU cache path. The
+arena is released before the next substantial prefill. The recurrent core stays in VRAM. CPU
+mmap fallback remains for any configuration where the arena cannot be allocated or registers are
+released.
+
+Identical settings for both engines: Python-cache prompt, 83 tokens + 2048 generated, i8r,
+chunk 4096, graph 1, spec 0, `--vram-reserve-mib 0`, `--cpu-threads 1`, KV growth 4096,
+256K-decode route profile, cgroup 14 GB / no swap.
+
+| Engine | Prefill | Decode | Fetch counters (fetch/hit/evict/cpu-miss) | H2D/token |
+| --- | ---: | ---: | --- | ---: |
+| Strata `feat-latest` original GPU fetch | 12.8 tok/s | **48.3 tok/s** | not exposed by that binary | 8.4 MB |
+| Bel CPU fallback | 27.5 tok/s | 18.4 tok/s | none | 0.0 MB |
+| Bel packed GPU fetch, first attempt | 7.0 tok/s | 20.1 tok/s | 30503 / 166105 / 30503 / 0 | 121.3 MB |
+| Bel packed GPU fetch, loop-core protected | 7.4 tok/s | 36.3 tok/s | 52006 / 144602 / 52006 / 0 | 163.6 MB |
+
+Bel did **not** reproduce 48.3 tok/s. Loop-core eviction protection raised decode from 20.1 to
+36.3 tok/s, but the Bel cache plan still fetches about 25 experts/token, versus about one to two in
+the Strata result. Enabling the original promotion counters did not change it. This remains the
+single largest unresolved difference.
+
+## Coherent source-review prompt (16,338 tokens + 512)
+
+| Configuration | Prefill | Decode |
+| --- | ---: | ---: |
+| Bel CPU fallback, 5 workers | 687.8 pp/s | 29.0 tok/s |
+| Bel packed GPU fetch | - | failed after KV growth; CPU fallback required |
+
+GPU fetching on the coherent long prompt becomes unstable when `--kv-grow` shrinks the MX pool
+after the prefill-to-decode boundary. Registrations are released on shrink, but a graph replay
+still hit an illegal memory access. Use the CPU fallback for this workload until fixed. The CPU
+fallback preserves correctness and the existing prefill rate.
+
+## State
+
+- The original Strata 48.3 tok/s result is reproduced on the Strata binary, not yet in Bel.
+- Archived synthetic word-salad numbers are invalid and must not be used as a baseline.
+- No quantisation, expert skipping, speculative decoding or scheduler was added.
+- All routed experts are still executed; the CPU fallback remains intact.
