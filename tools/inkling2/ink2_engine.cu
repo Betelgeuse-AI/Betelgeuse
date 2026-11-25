@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <set>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -2247,6 +2248,8 @@ struct CacheArgs {
     uint8_t* pool;
     size_t eb, partA;
     const uint8_t* const* host;   // device views of layer l's experts in mapped host memory ([NE])
+    const uint8_t* const* host4[4] = {};   // registered sources for the four packed parts (GPU fetch)
+    const uint8_t** fsrc4[4] = {};
     const uint8_t** fsrc;
     uint8_t** fdst;
     int* nfetch;
@@ -2291,7 +2294,11 @@ __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArg
             c.stamp[v] = ++clk;
             c.tabA[key] = d;
             c.tabB[key] = d + c.partA;
-            c.fsrc[m] = c.host[e];
+            if (c.host4[0]) {
+                for (int p = 0; p < 4; ++p) c.fsrc4[p][m] = c.host4[p][key];
+            } else {
+                c.fsrc[m] = c.host[e];
+            }
             c.fdst[m] = d;
         }
         __syncthreads();
@@ -2315,6 +2322,32 @@ __global__ void k_fetch(const uint8_t* const* __restrict__ fsrc, uint8_t* const*
         dst[i] = a; dst[i + st] = b; dst[i + 2 * st] = cc; dst[i + 3 * st] = d;
     }
     for (; i < n; i += st) dst[i] = src[i];
+}
+
+// registered-source fetch: the four packed parts live in separate mmap tensors, so copy each into its slot offset
+__global__ void k_fetch_parts(const uint8_t* const* __restrict__ s0, const uint8_t* const* __restrict__ s1,
+                              const uint8_t* const* __restrict__ s2, const uint8_t* const* __restrict__ s3,
+                              uint8_t* const* __restrict__ dst, const int* __restrict__ nfetch,
+                              size_t b0, size_t b1, size_t b2, size_t b3) {
+    if ((int) blockIdx.y >= *nfetch) return;
+    const size_t sizes[4] = {b0, b1, b2, b3};
+    const uint8_t* const* src[4] = {s0, s1, s2, s3};
+    uint8_t* d = dst[blockIdx.y];
+    const size_t st = (size_t) gridDim.x * blockDim.x;
+    size_t off = 0;
+    for (int p = 0; p < 4; ++p) {
+        const uint8_t* s = src[p][blockIdx.y];
+        const size_t n = sizes[p] / 16;
+        size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+        for (; i + 3 * st < n; i += 4 * st) {
+            const uint4 a = reinterpret_cast<const uint4*>(s)[i], b = reinterpret_cast<const uint4*>(s)[i + st];
+            const uint4 cc = reinterpret_cast<const uint4*>(s)[i + 2 * st], dd = reinterpret_cast<const uint4*>(s)[i + 3 * st];
+            uint4* o = reinterpret_cast<uint4*>(d + off);
+            o[i] = a; o[i + st] = b; o[i + 2 * st] = cc; o[i + 3 * st] = dd;
+        }
+        for (; i < n; i += st) reinterpret_cast<uint4*>(d + off)[i] = reinterpret_cast<const uint4*>(s)[i];
+        off += sizes[p];
+    }
 }
 
 // --kv-grow: slots [from, to) leave a pool: their experts out of the tables (the next use fetches them again)
@@ -2645,6 +2678,15 @@ struct Engine {
     int reserve_mib = -1;   // < 0: everything resident
     bool offload = false;
     bool lazy_experts = false;          // safetensors experts stay file-backed; CPU reads only routed misses
+    bool gpu_fetch = false;             // INK2_GPU_FETCH=1: phase-aware registered-source GPU fetch
+    bool gpu_fetch_active = false;      // registrations live only in the decode phase
+    size_t fetch_budget = 640ull << 20; // INK2_GPU_FETCH_MIB, bounded host registration budget
+    uint8_t* fetch_alias = nullptr;     // PROT_READ|PROT_WRITE MAP_PRIVATE alias of the checkpoint
+    size_t fetch_alias_size = 0;
+    std::vector<std::pair<void*, size_t>> fetch_regs; // registered page-aligned ranges
+    uint8_t fetch_layer[NL] = {};        // layers whose sources are registered for GPU fetch
+    const uint8_t** xsrc4_d[4] = {};     // device [NL * NE] source views for the four packed parts
+    const uint8_t** fsrc4_d[4] = {};     // fetch lists, one per part
     std::vector<uint8_t*> xh;            // [NL * NE] host address of expert (l, e) (regions placed per NUMA node)
     std::vector<ink2cpu::ExpertParts> expert_parts; // [NL * NE] source tensor views for lazy offload
     uint8_t* pinned_host_experts = nullptr;
@@ -4064,11 +4106,28 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
 // offload: make layer l's experts ids[0..n) resident (plan + fetch, device side, graph-capturable)
 void expert_cache(int l, const int* ids, int n) {
     const bool nv = ex_nv(l);
-    CacheArgs c{E.slot_of, nv ? E.owner_nv : E.owner_mx, nv ? E.stamp_nv : E.stamp_mx, E.clock,
-                nv ? E.nslot_nv : E.nslot_mx, E.tabA, E.tabB, nv ? E.pool_nv : E.pool_mx, ex_bytes(l), ex_partA(l),
-                E.xsrc_d + (size_t) l * NE, E.fsrc, E.fdst, E.nfetch, E.fbytes};
+    const bool parts = E.gpu_fetch_active && E.fetch_layer[l] && E.xsrc4_d[0] != nullptr;
+    CacheArgs c{};
+    c.slot_of = E.slot_of;
+    c.owner = nv ? E.owner_nv : E.owner_mx;
+    c.stamp = nv ? E.stamp_nv : E.stamp_mx;
+    c.clock = E.clock;
+    c.nslot = nv ? E.nslot_nv : E.nslot_mx;
+    c.tabA = E.tabA; c.tabB = E.tabB;
+    c.pool = nv ? E.pool_nv : E.pool_mx;
+    c.eb = ex_bytes(l); c.partA = ex_partA(l);
+    c.host = E.xsrc_d + (size_t) l * NE;
+    c.fsrc = E.fsrc; c.fdst = E.fdst; c.nfetch = E.nfetch; c.fbytes = E.fbytes;
+    if (parts) for (int p = 0; p < 4; ++p) { c.host4[p] = E.xsrc4_d[p] + (size_t) l * NE; c.fsrc4[p] = E.fsrc4_d[p]; }
     k_cache_plan<<<1, 1024>>>(l, ids, n, c);
-    k_fetch<<<dim3(FETCH_BLOCKS, std::min(n, FETCH_MAX)), 256>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+    if (parts) {
+        const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) l * NE];
+        k_fetch_parts<<<dim3(FETCH_BLOCKS, std::min(n, FETCH_MAX)), 256>>>(
+            E.fsrc4_d[0], E.fsrc4_d[1], E.fsrc4_d[2], E.fsrc4_d[3], E.fdst, E.nfetch,
+            p.w13_bytes, p.s13_bytes, p.w2_bytes, p.s2_bytes);
+    } else {
+        k_fetch<<<dim3(FETCH_BLOCKS, std::min(n, FETCH_MAX)), 256>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+    }
 }
 
 // ---- CPU experts (--cpu-threads).  A decode visit: k_cache_cpu stamps the resident experts, hands the others to the
@@ -4557,6 +4616,126 @@ void pin_host_experts(size_t requested) {
     std::fprintf(stderr, "host expert pin pool: %zu MiB across %zu route-ranked experts; remaining sources use safetensors mmap\n",
                  bytes >> 20, selected.size());
 }
+// Phase-aware GPU fetch.  At the prefill->decode boundary we map a writable private alias of the
+// checkpoint and register only the route-ranked nonresident experts that fit the budget.  No expert
+// bytes are duplicated into anonymous RAM.  The four packed parts stay in their original mmap
+// tensors; k_fetch_parts copies each part straight into a GPU pool slot.
+void gpu_fetch_release() {
+    if (!E.gpu_fetch_active) return;
+    CK(cudaDeviceSynchronize());
+    for (auto& r : E.fetch_regs) cudaHostUnregister(r.first);
+    E.fetch_regs.clear();
+    if (E.fetch_alias) { munmap(E.fetch_alias, E.fetch_alias_size); E.fetch_alias = nullptr; }
+    E.fetch_alias_size = 0;
+    if (E.xsrc4_d[0]) for (int p = 0; p < 4; ++p)
+        CK(cudaMemset(E.xsrc4_d[p], 0, (size_t) NL * NE * sizeof(void*)));
+    std::memset(E.fetch_layer, 0, sizeof(E.fetch_layer));
+    E.gpu_fetch_active = false;
+    invalidate_engine_graphs();
+}
+void gpu_fetch_enable() {
+    if (!E.gpu_fetch || !E.lazy_experts || !E.ck || E.gpu_fetch_active || E.fetch_budget == 0) return;
+    const size_t count = (size_t) NL * NE;
+    std::vector<float> decode(count, 0.0f);
+    std::vector<unsigned long long> prompt(count, 0);
+    if (E.cnt) CK(cudaMemcpy(decode.data(), E.cnt, count * sizeof(float), cudaMemcpyDeviceToHost));
+    if (g_pf_route_active && E.prefill_routes)
+        CK(cudaMemcpy(prompt.data(), E.prefill_routes, count * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    std::vector<std::pair<double, int>> layers;
+    for (int l = 0; l < NL; ++l) {
+        if (l >= LOOP_BEGIN && l < LOOP_END) continue;   // recurrent core stays resident
+        if (!ex_nv(l)) continue;                         // MXFP8 layers use a separate pool; keep them on CPU
+        double s = 0.0;
+        for (int e = 0; e < NE; ++e) {
+            const size_t k = (size_t) l * NE + e;
+            s += decode[k] + (double) prompt[k] / 1024.0 + (double) E.expert_freq[k] / 16.0;
+        }
+        layers.emplace_back(s, l);
+    }
+    std::sort(layers.begin(), layers.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<int> selected;
+    size_t bytes = 0;
+    constexpr size_t PAGE = 4096;
+    const auto align_down = [](size_t x) { return x & ~(PAGE - 1); };
+    const auto align_up = [](size_t x) { return (x + PAGE - 1) & ~(PAGE - 1); };
+    // Register whole layers: every expert of a fetched layer has a valid source, so the GPU cache
+    // never has to hand a null pointer to k_fetch_parts.  Unselected layers keep the CPU path.
+    int max_layers = 1;
+    if (const char* env = std::getenv("INK2_GPU_FETCH_LAYERS")) max_layers = std::max(1, std::atoi(env));
+    int used_layers = 0;
+    for (const auto& r : layers) {
+        if (used_layers >= max_layers) break;
+        const size_t layer_bytes = (size_t) NE * ex_bytes(r.second);
+        if (bytes + layer_bytes > E.fetch_budget) continue;
+        for (int e = 0; e < NE; ++e) selected.push_back(r.second * NE + e);
+        bytes += layer_bytes;
+        ++used_layers;
+    }
+    if (selected.empty()) return;
+    const int fd = ::open(E.ck->path.c_str(), O_RDONLY);
+    if (fd < 0) return;
+    void* alias = mmap(nullptr, E.ck->mapped_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (alias == MAP_FAILED) return;
+    std::set<std::pair<size_t, size_t>> ranges;
+    for (int key : selected) {
+        const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) key];
+        const uint8_t* parts[4] = {p.w13, p.s13, p.w2, p.s2};
+        const size_t sizes[4] = {p.w13_bytes, p.s13_bytes, p.w2_bytes, p.s2_bytes};
+        for (int q = 0; q < 4; ++q) {
+            const size_t a = (const uint8_t*) parts[q] - (const uint8_t*) E.ck->mapped;
+            ranges.insert({align_down(a), align_up(a + sizes[q])});
+        }
+    }
+    std::vector<std::pair<size_t, size_t>> merged(ranges.begin(), ranges.end());
+    std::sort(merged.begin(), merged.end());
+    std::vector<std::pair<size_t, size_t>> coalesced;
+    for (const auto& r : merged) {
+        if (!coalesced.empty() && r.first <= coalesced.back().second) coalesced.back().second = std::max(coalesced.back().second, r.second);
+        else coalesced.push_back(r);
+    }
+    for (const auto& r : coalesced) {
+        const cudaError_t e = cudaHostRegister((uint8_t*) alias + r.first, r.second - r.first,
+                                               cudaHostRegisterMapped | cudaHostRegisterPortable);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "gpu fetch: host register failed at %zu MiB: %s\n", r.first >> 20, cudaGetErrorString(e));
+            for (auto& done : E.fetch_regs) cudaHostUnregister(done.first);
+            E.fetch_regs.clear();
+            munmap(alias, E.ck->mapped_size);
+            return;
+        }
+        E.fetch_regs.push_back({(uint8_t*) alias + r.first, r.second - r.first});
+    }
+    E.fetch_alias = (uint8_t*) alias;
+    E.fetch_alias_size = E.ck->mapped_size;
+    if (!E.xsrc4_d[0]) {
+        for (int p = 0; p < 4; ++p) {
+            E.xsrc4_d[p] = (const uint8_t**) dalloc(count * sizeof(void*));
+            CK(cudaMemset(E.xsrc4_d[p], 0, count * sizeof(void*)));
+            E.fsrc4_d[p] = (const uint8_t**) dalloc((size_t) FETCH_MAX * sizeof(void*));
+        }
+    }
+    std::vector<const uint8_t*> hp[4];
+    for (int p = 0; p < 4; ++p) hp[p].assign(count, nullptr);
+    for (int key : selected) {
+        const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) key];
+        const uint8_t* src[4] = {p.w13, p.s13, p.w2, p.s2};
+        for (int q = 0; q < 4; ++q) {
+            const size_t off = src[q] - (const uint8_t*) E.ck->mapped;
+            void* dv = nullptr;
+            CK(cudaHostGetDevicePointer(&dv, E.fetch_alias + off, 0));
+            hp[q][(size_t) key] = (const uint8_t*) dv;
+            E.fetch_layer[key / NE] = 1;
+        }
+    }
+    for (int p = 0; p < 4; ++p)
+        CK(cudaMemcpy(E.xsrc4_d[p], hp[p].data(), count * sizeof(void*), cudaMemcpyHostToDevice));
+    E.gpu_fetch_active = true;
+    invalidate_engine_graphs();   // recapture the decode graph with the GPU-fetch path
+    std::fprintf(stderr, "gpu fetch: registered %zu experts / %zu MiB from mmap aliases, no anonymous copy\n",
+                 selected.size(), bytes >> 20);
+}
+
 void setup_cpu() {
     if (const char* p = std::getenv("INK2_PROMOTE")) std::sscanf(p, "%d,%d", &g_promote_nv, &g_promote_mx);
     if (const char* p = std::getenv("INK2_BG_BLOCKS")) g_bg_blocks = std::max(1, std::atoi(p));
@@ -4697,8 +4876,9 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     else
         k_router<<<1, NE>>>(E.rl, Y.router_bias, E.ids, E.wts);
     if (E.rec_mode == 1) k_rec_ids<<<1, TOPK>>>(E.ids, E.rec + (size_t) g_slot * E.ctx * TOPK, E.d_pos);
-    if (E.cpu) expert_cpu_ring(int(&Y - E.L), x);
-    else if (E.offload) expert_cache(int(&Y - E.L), E.ids, TOPK);
+    const int ml = int(&Y - E.L);
+    if (E.cpu && !(E.gpu_fetch_active && E.fetch_layer[ml])) expert_cpu_ring(ml, x);
+    else if (E.offload) expert_cache(ml, E.ids, TOPK);
     const Experts& X = Y.ex;
     if (X.gg13) {
         gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
@@ -5088,6 +5268,7 @@ void pf_unmap(bool refill) {
     if (refill) slide_compact();
     pools_fill(refill);
     if (refill) {
+        gpu_fetch_enable();
         const double elapsed = now_ms() - t0;
         g_pf_route_active = false;
         std::fprintf(stderr,
@@ -6040,6 +6221,7 @@ void draft_device(int p) {
 void forward_prefill_device(int T, int pos0, float* all);
 void forward_prefill(const int* toks, int T, int pos0, float* all) {
     if (E.prefill_routes && !PF.rows_argmax && !g_pf_route_active) {
+        gpu_fetch_release();
         CK(cudaMemset(E.prefill_routes, 0, (size_t) NL * NE * sizeof(unsigned long long)));
         g_pf_route_active = true;
     }
@@ -6253,6 +6435,8 @@ int ink2_engine_main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_ROUTED_MAX")) g_pf_routed_max = std::atoi(r);
     if (const char* r = std::getenv("INK2_DQ_MIN")) g_dq_min = std::atoi(r);
     if (const char* r = std::getenv("INK2_MX_POOL_FRACTION")) g_off_mx_fraction = std::clamp((float) std::atof(r), 0.05f, 0.95f);
+    if (const char* r = std::getenv("INK2_GPU_FETCH")) E.gpu_fetch = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_GPU_FETCH_MIB")) E.fetch_budget = (size_t) std::max(0, std::atoi(r)) << 20;
     {
         int major = 0;   // default on before Ampere only: Turing gains, 3090 decode 91.7 -> 90.5 tok/s with it
         CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
