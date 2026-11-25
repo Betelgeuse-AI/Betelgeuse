@@ -266,12 +266,13 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
                                  const float* __restrict__ x, int x_stride, float* __restrict__ y, int N, int K,
                                  float* __restrict__ act = nullptr) {
     static_assert(!ACT || R % 2 == 0, "ACT needs the gate / up pair in one warp");
+    const int e = ids[blockIdx.y];
+    if (e < 0) return;   // handled in the other pass
     __shared__ float e4[256];   // scale table, * 2^14
     for (int i = threadIdx.x; i < 256; i += blockDim.x) e4[i] = e4m3_decode(i) * 16384.0f;
     __syncthreads();
     const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
     if (row0 >= N) return;
-    const int e = ids[blockIdx.y];
     const uint8_t* W = tab[e];
     if (!W) return;   // computed on the CPU (--cpu-threads): k_cpu_wait writes its output
     const uint8_t* S = W + (size_t) N * (K / 2);
@@ -319,6 +320,8 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
 template <int R, bool SWI = false>
 __global__ void k_gemv_mxfp8_sel(const uint8_t* const* __restrict__ tab, const int* __restrict__ ids, const float* __restrict__ x, int x_stride,
                                  float* __restrict__ y, int N, int K) {
+    const int e = ids[blockIdx.y];
+    if (e < 0) return;   // handled in the other pass
     extern __shared__ float sm[];
     float* xs = sm;
     const float* xk = x + (size_t) blockIdx.y * x_stride;
@@ -326,7 +329,6 @@ __global__ void k_gemv_mxfp8_sel(const uint8_t* const* __restrict__ tab, const i
     __syncthreads();
     const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
     if (row0 >= N) return;
-    const int e = ids[blockIdx.y];
     const uint8_t* W = tab[e];
     if (!W) return;   // computed on the CPU (--cpu-threads)
     const uint8_t* S = W + (size_t) N * K;
@@ -2256,35 +2258,69 @@ struct CacheArgs {
     uint8_t** fdst;
     int* nfetch;
     unsigned long long* fbytes;
+    float* cnt = nullptr;
+    int* hit_ids = nullptr;
+    int* miss_ids = nullptr;
+    int lfu = 0;
 };
 constexpr int FETCH_MAX = 64, FETCH_BLOCKS = 96;
 __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArgs c) {
-    __shared__ int miss[FETCH_MAX], nm;
+    __shared__ int miss[FETCH_MAX], pin[FETCH_MAX], nm, npin;
     __shared__ unsigned clk;
     __shared__ unsigned long long wmin[32];
     if (threadIdx.x == 0) {
         unsigned t = *c.clock;
-        int m = 0;
+        int m = 0, np = 0;
         for (int i = 0; i < n; ++i) {
             const int e = ids[i];
-            bool dup = false;
-            for (int j = 0; j < i; ++j) dup |= ids[j] == e;
-            if (dup) continue;
-            const int sl = c.slot_of[l * NE + e];
-            if (sl >= 0) { c.stamp[sl] = ++t; if (c.fetch_stats) atomicAdd(&c.fetch_stats[1], 1); }
-            else if (!c.fetch_ok || c.fetch_ok[l * NE + e]) miss[m++] = e;
-            else if (c.fetch_stats) atomicAdd(&c.fetch_stats[3], 1);
+            if (c.hit_ids) c.hit_ids[i] = -1;
+            if (c.miss_ids) c.miss_ids[i] = -1;
+            int dup_hit = -1;
+            for (int j = 0; j < i; ++j) {
+                if (ids[j] == e) { dup_hit = (c.hit_ids && c.hit_ids[j] >= 0) ? 1 : 0; break; }
+            }
+            if (dup_hit >= 0) {
+                if (dup_hit > 0 && c.hit_ids) c.hit_ids[i] = e;
+                else if (c.miss_ids) c.miss_ids[i] = e;
+                continue;
+            }
+            const int key = l * NE + e;
+            const int sl = c.slot_of[key];
+            if (c.cnt) c.cnt[key] += 1.0f;
+            if (sl >= 0) {
+                c.stamp[sl] = ++t;
+                pin[np++] = sl;
+                if (c.hit_ids) c.hit_ids[i] = e;
+                if (c.fetch_stats) atomicAdd(&c.fetch_stats[1], 1);
+            } else if (!c.fetch_ok || c.fetch_ok[key]) {
+                miss[m++] = e;
+                if (c.miss_ids) c.miss_ids[i] = e;
+            } else if (c.fetch_stats) {
+                atomicAdd(&c.fetch_stats[3], 1);
+            }
         }
         nm = m;
+        npin = np;
         clk = t;
     }
     __syncthreads();
+    const bool use_lfu = c.lfu && c.cnt;
     for (int m = 0; m < nm; ++m) {
         unsigned long long best = ~0ull;
         for (int i = threadIdx.x; i < c.nslot; i += blockDim.x) {
             const int o = c.owner[i];
             if (o >= LOOP_BEGIN * NE && o < LOOP_END * NE) continue;   // loop core stays resident
-            best = min(best, ((unsigned long long) c.stamp[i] << 32) | (unsigned) i);
+            bool busy = false;
+            for (int k = 0; k < npin; ++k) busy |= (i == pin[k]);
+            if (busy) continue;
+            unsigned long long score;
+            if (use_lfu) {
+                const unsigned qcnt = o < 0 ? 0u : (unsigned) min(65535.0f, c.cnt[o] * 256.0f);
+                score = ((unsigned long long) qcnt << 48) | ((unsigned long long) c.stamp[i] << 16) | (unsigned) i;
+            } else {
+                score = ((unsigned long long) c.stamp[i] << 32) | (unsigned) i;
+            }
+            best = min(best, score);
         }
 #pragma unroll
         for (int o = 16; o; o >>= 1) best = min(best, __shfl_xor_sync(0xffffffffu, best, o));
@@ -2292,13 +2328,14 @@ __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArg
         __syncthreads();
         if (threadIdx.x == 0) {
             for (int w = 1; w < (int) (blockDim.x / 32); ++w) best = min(best, wmin[w]);
-            const int v = (int) (best & 0xffffffffu), e = miss[m], key = l * NE + e, old = c.owner[v];
+            const int v = (int) (best & (use_lfu ? 0xffffu : 0xffffffffu)), e = miss[m], key = l * NE + e, old = c.owner[v];
             if (c.fetch_stats) { atomicAdd(&c.fetch_stats[0], 1); if (old >= 0) atomicAdd(&c.fetch_stats[2], 1); }
             if (old >= 0) { c.slot_of[old] = -1; c.tabA[old] = nullptr; c.tabB[old] = nullptr; }
             uint8_t* d = c.pool + (size_t) v * c.eb;
             c.owner[v] = key;
             c.slot_of[key] = v;
             c.stamp[v] = ++clk;
+            pin[npin++] = v;
             c.tabA[key] = d;
             c.tabB[key] = d + c.partA;
             c.fsrc[m] = c.host[e];
@@ -2690,10 +2727,13 @@ struct Engine {
     uint8_t **pdst_nv = nullptr, **pdst_mx = nullptr;
     int *pnf_nv = nullptr, *pnf_mx = nullptr;
     std::vector<float> hf13, hf2;        // [NL * NE] host copies of the NVFP4 factors (1 for MXFP8)
-    cudaStream_t side = nullptr;
-    cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
+    cudaStream_t side = nullptr, fetch_stream = nullptr;
+    cudaEvent_t ev_fork = nullptr, ev_join = nullptr, ev_fetch_start = nullptr, ev_fetch_done = nullptr;
     VRange vpool_nv, vpool_mx;   // --kv-grow: the pools as growable ranges (owner / stamp sized for every expert)
     int *slot_of = nullptr, *owner_nv = nullptr, *owner_mx = nullptr, *nfetch = nullptr;
+    int *hit_ids = nullptr, *miss_ids = nullptr, *d_argmax = nullptr;
+    float* am_v = nullptr;
+    int* am_i = nullptr;
     unsigned *stamp_nv = nullptr, *stamp_mx = nullptr, *clock = nullptr;
     const uint8_t** fsrc = nullptr;
     uint8_t** fdst = nullptr;
@@ -3316,7 +3356,7 @@ void load_gguf() {
 // CPU-expert staging).  Measured on the 3090 at 8 GiB (reserve 15946, nvidia-smi peak): 17-31 MiB used after the pools
 // with --tc 0 / 1, --cpu-threads 22, --spec 1, a 6000-token prompt at chunk 1024; 128 leaves ~100 MiB to spare.
 int g_off_margin_mib = 128;
-float g_off_mx_fraction = 0.20f;
+float g_off_mx_fraction = 0.15f;
 std::vector<int> expert_placement_order() {
     std::vector<int> order;
     order.reserve((size_t) NL * NE);
@@ -3367,6 +3407,7 @@ void setup_offload() {
     }
     std::vector<int> slot_of((size_t) NL * NE, -1), own_nv(E.grow ? cap_nv : E.nslot_nv, -1),
                      own_mx(E.grow ? cap_mx : E.nslot_mx, -1);
+    std::vector<unsigned> st_nv(own_nv.size(), 0), st_mx(own_mx.size(), 0);
     const std::vector<int> order = expert_placement_order();
     int used_nv = 0, used_mx = 0;
     std::vector<uint8_t> packed(E.lazy_experts ? MX_BYTES : 0);
@@ -3374,7 +3415,8 @@ void setup_offload() {
         const int l = key / NE, e = key % NE;
         const bool nv = ex_nv(l);
         int& used = nv ? used_nv : used_mx;
-        if (used >= (nv ? E.nslot_nv : E.nslot_mx)) continue;
+        const int nslot = nv ? E.nslot_nv : E.nslot_mx;
+        if (used >= nslot) continue;
         const size_t eb = ex_bytes(l);
         uint8_t* d = (nv ? E.pool_nv : E.pool_mx) + (size_t) used * eb;
         if (E.lazy_experts) {
@@ -3393,6 +3435,8 @@ void setup_offload() {
         }
         slot_of[l * NE + e] = used;
         (nv ? own_nv : own_mx)[used] = l * NE + e;
+        // preserve descending placement priority in initial LRU tiebreak
+        (nv ? st_nv : st_mx)[used] = (unsigned) (nslot - used);
         E.htabA[l * NE + e] = d;
         E.htabB[l * NE + e] = d + ex_partA(l);
         ++used;
@@ -3403,10 +3447,17 @@ void setup_offload() {
     E.slot_of = ints(slot_of);
     E.owner_nv = ints(own_nv);
     E.owner_mx = ints(own_mx);
-    E.stamp_nv = (unsigned*) dalloc(own_nv.size() * 4);
-    E.stamp_mx = (unsigned*) dalloc(own_mx.size() * 4);
-    E.clock = (unsigned*) dalloc(4);
+    E.stamp_nv = (unsigned*) upload(st_nv.data(), st_nv.size() * 4);
+    E.stamp_mx = (unsigned*) upload(st_mx.data(), st_mx.size() * 4);
+    const unsigned init_clk = (unsigned) std::max(E.nslot_nv, E.nslot_mx) + 1u;
+    E.clock = (unsigned*) upload(&init_clk, 4);
     E.nfetch = (int*) dalloc(4);
+    E.hit_ids = (int*) dalloc(TOPK * 4);
+    E.miss_ids = (int*) dalloc(TOPK * 4);
+    if (!E.cnt) E.cnt = dfloats((size_t) NL * NE);
+    CK(cudaStreamCreateWithFlags(&E.fetch_stream, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&E.ev_fetch_start, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&E.ev_fetch_done, cudaEventDisableTiming));
     E.fsrc = (const uint8_t**) dalloc(FETCH_MAX * sizeof(void*));
     E.fdst = (uint8_t**) dalloc(FETCH_MAX * sizeof(void*));
     E.fbytes = (unsigned long long*) dalloc(8);
@@ -3882,6 +3933,9 @@ void alloc_state() {
     E.gg = dfloats(H); E.rl = dfloats(NE); E.wts = dfloats(TOPK); E.ids = (int*) dalloc(TOPK * 4);
     E.gu = dfloats((size_t) TOPK * 2 * FF); E.act = dfloats((size_t) TOPK * FF); E.ey = dfloats((size_t) TOPK * H);
     E.moe = dfloats(H); E.y2 = dfloats(H); E.logits = dfloats(VOCAB_ROWS); E.emb_in = dfloats(H); E.pout = dfloats(OFF_K + 2 * (KVD + NKV * KC)); E.gfg = dfloats(3 * 2 * H);
+    E.d_argmax = (int*) dalloc(4);
+    E.am_v = dfloats(256);
+    E.am_i = (int*) dalloc(256 * 4);
     const int nc = std::max(E.nchunk_full, E.nchunk_slide);
     E.pm = dfloats((size_t) NQ * nc); E.pl = dfloats((size_t) NQ * nc); E.po = dfloats((size_t) NQ * nc * HD);
 }
@@ -4004,8 +4058,11 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
     gemv(Y.wo, E.att, E.attn_out);
 }
 
+bool g_split_fetch = true;
+int g_fetch_blocks = 2;
+extern bool g_place_freq;
 // offload: make layer l's experts ids[0..n) resident (plan + fetch, device side, graph-capturable)
-void expert_cache(int l, const int* ids, int n) {
+void expert_cache(int l, const int* ids, int n, bool overlap = false) {
     const bool nv = ex_nv(l);
     const bool fetch = E.gpu_fetch_active && E.fetch_layer[l] && E.xsrc_d != nullptr;
     CacheArgs c{};
@@ -4021,8 +4078,20 @@ void expert_cache(int l, const int* ids, int n) {
     c.fetch_stats = fetch ? E.fetch_stats : nullptr;
     c.host = E.xsrc_d + (size_t) l * NE;
     c.fsrc = E.fsrc; c.fdst = E.fdst; c.nfetch = E.nfetch; c.fbytes = E.fbytes;
+    c.cnt = E.cnt;
+    c.hit_ids = overlap ? E.hit_ids : nullptr;
+    c.miss_ids = overlap ? E.miss_ids : nullptr;
+    c.lfu = g_place_freq ? 1 : 0;
     k_cache_plan<<<1, 1024>>>(l, ids, n, c);
-    k_fetch<<<dim3(FETCH_BLOCKS, std::min(n, FETCH_MAX)), 256>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+    if (overlap && E.fetch_stream) {
+        CK(cudaEventRecord(E.ev_fetch_start, cudaStreamPerThread));
+        CK(cudaStreamWaitEvent(E.fetch_stream, E.ev_fetch_start, 0));
+        k_fetch<<<dim3(g_fetch_blocks, std::min(n, FETCH_MAX)), 256, 0, E.fetch_stream>>>(
+            E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+        CK(cudaEventRecord(E.ev_fetch_done, E.fetch_stream));
+    } else {
+        k_fetch<<<dim3(FETCH_BLOCKS, std::min(n, FETCH_MAX)), 256>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+    }
 }
 
 // ---- CPU experts (--cpu-threads).  A decode visit: k_cache_cpu stamps the resident experts, hands the others to the
@@ -4303,7 +4372,7 @@ __global__ void k_promote_plan(PromoteArgs c) {
             for (int w = 1; w < (int) (blockDim.x / 32); ++w) best = min(best, wmin[w]);
             const int v = (int) (best & 0xffffffffu), key = c.want[m], old = c.owner[v];
             const bool admit = !c.freq || old < 0 || c.cnt[key] >= c.cnt[old] + c.gain;
-            if (c.slot_of[key] < 0 && c.stamp[v] != 0xffffffffu && admit) {   // (resident meanwhile: a prefill's cache)
+            if (c.xsrc && c.xsrc[key] && c.slot_of[key] < 0 && c.stamp[v] != 0xffffffffu && admit) {   // (resident meanwhile: a prefill's cache)
                 if (old >= 0) { c.slot_of[old] = -1; c.tabA[old] = nullptr; c.tabB[old] = nullptr; }
                 c.owner[v] = -1;
                 c.stamp[v] = 0xffffffffu;   // in flight: never a victim before its commit
@@ -4335,7 +4404,7 @@ PromoteArgs promote_args(bool nv) {
             E.tabA, E.tabB, nv ? E.pool_nv : E.pool_mx, nv ? NV_BYTES : MX_BYTES, nv ? NV_A : MX_A, E.xsrc_d,
             nv ? E.want_nv : E.want_mx, nv ? E.nwant_nv : E.nwant_mx, nv ? E.pend_nv : E.pend_mx, nv ? E.npend_nv : E.npend_mx,
             nv ? E.psrc_nv : E.psrc_mx, nv ? E.pdst_nv : E.pdst_mx, nv ? E.pnf_nv : E.pnf_mx, E.fbytes,
-            nv ? g_promote_nv : g_promote_mx, E.cnt, g_place_freq ? 1 : 0, g_gain};
+            E.xsrc_d ? (nv ? g_promote_nv : g_promote_mx) : 0, E.cnt, g_place_freq ? 1 : 0, g_gain};
 }
 // start of a decode token: the copies planned at the end of the previous one, on a side stream (few blocks: the
 // token's own kernels keep the SMs)
@@ -4377,7 +4446,6 @@ void promote_cancel() {
 // end of a decode token: join the copies, commit them, plan the next ones
 void promote_join() {
     CK(cudaStreamWaitEvent(cudaStreamPerThread, E.ev_join, 0));
-    if (g_place_freq) k_decay<<<(NL * NE + 255) / 256, 256>>>(E.cnt, NL * NE, g_decay);
     for (int nv = 1; nv >= 0; --nv) {
         k_promote_commit<<<1, 32>>>(promote_args(nv));
         k_promote_plan<<<1, 1024>>>(promote_args(nv));
@@ -4630,7 +4698,7 @@ void setup_cpu() {
         E.decode_misses = (unsigned long long*) dalloc(NL * sizeof(unsigned long long));
         CK(cudaMemset(E.decode_misses, 0, NL * sizeof(unsigned long long)));
     }
-    E.cnt = (float*) dalloc((size_t) NL * NE * 4);
+    if (!E.cnt) E.cnt = dfloats((size_t) NL * NE);
     CK(cudaMemset(E.cnt, 0, (size_t) NL * NE * 4));
     if (E.lazy_experts) {
         E.prefill_routes = (unsigned long long*) dalloc((size_t) NL * NE * sizeof(unsigned long long));
@@ -4738,6 +4806,26 @@ void gg_sel(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs,
     }
 }
 
+void launch_moe_gemvs(const Experts& X, const int* ids, const float* x) {
+    if (X.gg13) {
+        gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
+        gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+    } else if (X.nvfp4) {
+#define SEL(R) \
+        k_gemv_nvfp4_sel<((R) < 2 ? 2 : (R)), true><<<dim3(2 * FF / (8 * ((R) < 2 ? 2 : (R))), TOPK), 256>>>( \
+            X.tA, X.f13, ids, x, 0, E.gu, 2 * FF, H, E.act); \
+        k_gemv_nvfp4_sel<R><<<dim3(H / (8 * R), TOPK), 256>>>(X.tB, X.f2, ids, E.act, FF, E.ey, H, FF);
+        switch (g_sel_rpw) { case 1: SEL(1) break; case 2: SEL(2) break; case 8: SEL(8) break; default: SEL(4) }
+#undef SEL
+    } else {
+#define SEL(R) \
+        k_gemv_mxfp8_sel<R><<<dim3(2 * FF / (8 * R), TOPK), 256, H * 4>>>(X.tA, ids, x, 0, E.gu, 2 * FF, H); \
+        k_gemv_mxfp8_sel<R, true><<<dim3(H / (8 * R), TOPK), 256, FF * 4>>>(X.tB, ids, E.gu, 2 * FF, E.ey, H, FF);
+        switch (g_sel_rpw) { case 1: SEL(1) break; case 2: SEL(2) break; case 8: SEL(8) break; default: SEL(4) }
+#undef SEL
+    }
+}
+
 void moe(const Layer& Y, const float* x, const float* r, float* mhist, const float* mlp_conv, float* out) {
     k_gemv_bf16_rowblock<<<NE, 256>>>(Y.router.d, x, E.rl, H);
     if (E.rec_mode == 2)
@@ -4747,28 +4835,19 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     if (E.rec_mode == 1) k_rec_ids<<<1, TOPK>>>(E.ids, E.rec + (size_t) g_slot * E.ctx * TOPK, E.d_pos);
     const int ml = int(&Y - E.L);
     const bool gf = E.gpu_fetch_active && E.fetch_layer[ml] && E.xsrc_d != nullptr;
-    if (E.cpu) expert_cpu_ring(ml, x);                 // CPU handles every non-eligible miss
-    if (gf || (!E.cpu && E.offload)) expert_cache(ml, E.ids, TOPK);
-    const Experts& X = Y.ex;
-    if (X.gg13) {
-        gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
-        gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
-    } else if (X.nvfp4) {
-#define SEL(R) \
-        k_gemv_nvfp4_sel<((R) < 2 ? 2 : (R)), true><<<dim3(2 * FF / (8 * ((R) < 2 ? 2 : (R))), TOPK), 256>>>( \
-            X.tA, X.f13, E.ids, x, 0, E.gu, 2 * FF, H, E.act); \
-        k_gemv_nvfp4_sel<R><<<dim3(H / (8 * R), TOPK), 256>>>(X.tB, X.f2, E.ids, E.act, FF, E.ey, H, FF);
-        switch (g_sel_rpw) { case 1: SEL(1) break; case 2: SEL(2) break; case 8: SEL(8) break; default: SEL(4) }
-#undef SEL
+    if (E.cpu && !gf) expert_cpu_ring(ml, x);
+    const bool use_cache = gf || (!E.cpu && E.offload);
+    const bool split_fetch = use_cache && g_split_fetch && !Y.ex.gg13 && E.fetch_stream != nullptr;
+    if (use_cache) expert_cache(ml, E.ids, TOPK, split_fetch);
+    if (split_fetch) {
+        launch_moe_gemvs(Y.ex, E.hit_ids, x);
+        CK(cudaStreamWaitEvent(cudaStreamPerThread, E.ev_fetch_done, 0));
+        launch_moe_gemvs(Y.ex, E.miss_ids, x);
     } else {
-#define SEL(R) \
-        k_gemv_mxfp8_sel<R><<<dim3(2 * FF / (8 * R), TOPK), 256, H * 4>>>(X.tA, E.ids, x, 0, E.gu, 2 * FF, H); \
-        k_gemv_mxfp8_sel<R, true><<<dim3(H / (8 * R), TOPK), 256, FF * 4>>>(X.tB, E.ids, E.gu, 2 * FF, E.ey, H, FF);
-        switch (g_sel_rpw) { case 1: SEL(1) break; case 2: SEL(2) break; case 8: SEL(8) break; default: SEL(4) }
-#undef SEL
+        launch_moe_gemvs(Y.ex, E.ids, x);
     }
-    if (E.cpu) k_cpu_wait<<<TOPK, 256>>>(E.bell_d, E.home_d, E.d_cur, E.cpu_nodes, E.ey, E.sync,
-                                        E.wait_ticks, E.d_pos, g_slot, E.ctx);
+    if (E.cpu && !gf) k_cpu_wait<<<TOPK, 256>>>(E.bell_d, E.home_d, E.d_cur, E.cpu_nodes, E.ey, E.sync,
+                                                E.wait_ticks, E.d_pos, g_slot, E.ctx);
     k_moe_tail<<<(H + 255) / 256, 256>>>(E.ey, E.wts, mhist, mlp_conv, r, out, E.d_pos);
 }
 
@@ -4870,8 +4949,18 @@ __global__ void k_feat_store(const float* __restrict__ x, float* __restrict__ ri
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < H) ring[((size_t) (*d_pos % FRING) * 4 + tap) * H + i] = x[i];
 }
+bool cpu_active_for_decode() {
+    if (!E.cpu) return false;
+    if (!E.gpu_fetch_active || E.nslot_nv < LOOP_NV_SLOTS) return true;
+    for (int l = 0; l < NL; ++l)
+        if ((l < LOOP_BEGIN || l >= LOOP_END) && !E.fetch_layer[l]) return true;
+    return false;
+}
+__global__ void k_logits_argmax_partial(const float* __restrict__ lg, int n, float* pv, int* pi);
+__global__ void kd_argmax_final(const float* __restrict__ pv, const int* __restrict__ pi, int nb, int* out);
 void forward_device() {
-    if (E.cpu) promote_fork();
+    const bool run_promote = cpu_active_for_decode();
+    if (run_promote) promote_fork();
     rms(E.emb_in, E.embed_norm, E.h);
     int nB = 0, visit = 0;
     auto run = [&](int l, int slot, const float* msgs) {
@@ -4906,7 +4995,12 @@ void forward_device() {
     if (g_fring) k_feat_store<<<H / 256, 256>>>(E.mn, g_fring, E.d_pos, 3);
     gemv(E.unembed, E.mn, E.logits, VOCAB);
     k_softcap<<<(VOCAB + 255) / 256, 256>>>(E.logits, VOCAB, LOGIT_CAP);
-    if (E.cpu) promote_join();
+    if (E.d_argmax) {
+        k_logits_argmax_partial<<<160, 256>>>(E.logits, VOCAB, E.am_v, E.am_i);
+        kd_argmax_final<<<1, 256>>>(E.am_v, E.am_i, 160, E.d_argmax);
+    }
+    if (E.offload && E.cnt && g_place_freq) k_decay<<<(NL * NE + 255) / 256, 256>>>(E.cnt, NL * NE, g_decay);
+    if (run_promote) promote_join();
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -5859,6 +5953,16 @@ __global__ void kd_argmax_final(const float* __restrict__ pv, const int* __restr
     am_block(v, idx);
     if (threadIdx.x == 0) *out = idx;
 }
+__global__ void k_logits_argmax_partial(const float* __restrict__ lg, int n, float* pv, int* pi) {
+    float v = -INFINITY;
+    int idx = 0x7fffffff;
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) {
+        const float x = lg[k];
+        am_better(v, idx, x != x ? -INFINITY : x, k);
+    }
+    am_block(v, idx);
+    if (threadIdx.x == 0) { pv[blockIdx.x] = v; pi[blockIdx.x] = idx; }
+}
 // per-row argmax of the target's logits [T][VOCAB] (one block per row)
 __global__ void k_rows_argmax(const float* __restrict__ lg, int n, int* out) {
     const float* x = lg + (size_t) blockIdx.x * n;
@@ -6306,9 +6410,17 @@ int ink2_engine_main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_DQ_MIN")) g_dq_min = std::atoi(r);
     if (const char* r = std::getenv("INK2_MX_POOL_FRACTION")) g_off_mx_fraction = std::clamp((float) std::atof(r), 0.05f, 0.95f);
     if (const char* r = std::getenv("INK2_GPU_FETCH")) E.gpu_fetch = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_PLACE")) g_place_freq = std::string(r) != "lru";
+    if (const char* r = std::getenv("INK2_DECAY")) g_decay = (float) std::atof(r);
+    if (const char* r = std::getenv("INK2_GAIN")) g_gain = (float) std::atof(r);
+    if (const char* r = std::getenv("INK2_SPLIT_FETCH")) g_split_fetch = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_FETCH_BLOCKS")) g_fetch_blocks = std::clamp(std::atoi(r), 1, FETCH_BLOCKS);
     {
-        int major = 0;   // default on before Ampere only: Turing gains, 3090 decode 91.7 -> 90.5 tok/s with it
+        int major = 0, sm_count = 0;   // default Q8 wide before Ampere only; tune GEMV min blocks / RPW per SM count
         CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
+        CK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
+        if (!std::getenv("INK2_GEMV_MINB") && sm_count > 0) g_gemv_min_blocks = 2 * sm_count;
+        if (!std::getenv("INK2_RPW") && sm_count > 0 && sm_count <= 32) g_rpw = 8;
         const int w = std::getenv("INK2_Q8_WIDE") ? std::atoi(std::getenv("INK2_Q8_WIDE")) : (major < 8);
         CK(cudaMemcpyToSymbol(c_q8w, &w, sizeof(int)));
     }
@@ -6563,6 +6675,13 @@ int ink2_engine_main(int argc, char** argv) {
                 std::fflush(debug_step_logits);
             }
         }
+    };
+    auto step_greedy = [&](int tok, int pos) {
+        step(tok, pos, false);
+        int next = 0;
+        CK(cudaMemcpyAsync(&next, E.d_argmax, 4, cudaMemcpyDeviceToHost));
+        CK(cudaStreamSynchronize(cudaStreamPerThread));
+        return next;
     };
     // warm-up at position 0 (builds the decode graph outside any timing; position 0 is rewritten by the first prompt)
     step(0, 0, false);
@@ -6889,16 +7008,26 @@ int ink2_engine_main(int argc, char** argv) {
                 }, &stop);
                 if (stop.load() && std::strcmp(finish, "stop") != 0) finish = "cancel";
             }
+            const bool fast_greedy = !spec && s.temp <= 0.0f && !s.ignore_eos && !debug_step_logits && E.d_argmax;
+            int next_tok = (!spec && max_new > 0 && !stop.load()) ? sample(logits, s) : 0;
             for (int k = 0; k < (spec ? 0 : max_new); ++k) {
                 if (stop.load()) { finish = "cancel"; break; }
-                const int next = sample(logits, s);
+                const int next = next_tok;
                 gen.push_back(next);
                 ink2_emit("T %d", next);
                 if (next == EOS_ID) { finish = "stop"; break; }
                 if (k + 1 < max_new) {
                     if (!kv_room(pos + 1)) { std::fprintf(stderr, "kv-grow: the answer ends at %d tokens: the K/V cannot grow\n", pos); break; }
-                    step(next, pos++, true);
+                    if (fast_greedy) {
+                        next_tok = step_greedy(next, pos++);
+                    } else {
+                        step(next, pos++, true);
+                        next_tok = sample(logits, s);
+                    }
                 }
+            }
+            if (fast_greedy && cache_prompt && gen.size() >= 2) {
+                CK(cudaMemcpy(logits.data(), E.logits, (size_t) VOCAB * 4, cudaMemcpyDeviceToHost));
             }
             if (spec_diag && spec) {
                 const long verifies = D.verifies - ver0;
@@ -7048,10 +7177,15 @@ int ink2_engine_main(int argc, char** argv) {
             step(next, pos++, false);
         }
     } else {
+        int next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
         for (int k = 0; k < n_gen; ++k) {
-            const int next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
             std::printf(" %d", next);
-            step(next, pos++, true);
+            if (!debug_step_logits && E.d_argmax) {
+                next = step_greedy(next, pos++);
+            } else {
+                step(next, pos++, true);
+                next = (int) (std::max_element(logits.begin(), logits.end()) - logits.begin());
+            }
         }
     }
     CK(cudaDeviceSynchronize());

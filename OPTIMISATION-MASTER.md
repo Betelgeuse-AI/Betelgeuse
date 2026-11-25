@@ -413,3 +413,61 @@ Natural generation, 512 tokens, identical prompts and settings.
 Median: Strata 47.7 tok/s, Bel 36.6 tok/s. The 48-50 tok/s general target is still not met by
 Bel. The remaining difference is the residency side effect from allocation order, which changes
 natural generated tokens and routing. No further architecture change was introduced.
+
+## Independent root-cause verification and Bel optimisation (2026-11-26)
+
+### Root cause of Strata's apparent 47.7 tok/s result
+
+Inspection of both generated token logs and `feat-latest/engine/src/inkling2/ink2_engine.cu` shows
+that the three-slot pool difference (1882 vs 1885 NVFP4 slots) was not the cause of Strata's speed
+or prefill logit divergence:
+
+- All five Strata `final3-*-strata.log` decode outputs are degenerate loops (`"Sample "` x510 on
+  `lru_ttl`, `"1_ 1_ ..."` on `directed_cycle`, `"3. 3. ..."` on `race_condition`, verbatim prompt
+  echo on `rate_limiter`, `"# 1\n# 2\n# 3..."` on `serializability`).
+- In Strata `feat-latest`, `load()` calls `expert_memory()` before the layer loop populates
+  `E.expert_parts`, leaving the 8.19 GiB pinned arena zero-initialized. Warmup then loads zeroed
+  experts into VRAM and decode misses fetch all-zero weights.
+- Under controlled parity (`task-lru_ttl.ids`, 128 tokens, `INK2_GPU_FETCH=0` on Strata vs
+  `INK2_GPU_FETCH=0/1` on Bel at matched pool reserve), all three produced `max_diff = 0.0` across
+  all 83 prompt logit positions and `128/128` identical decode tokens.
+
+### Hardware ceiling and Bel optimisations implemented
+
+Measured limits on this hardware (RTX 3060 12 GB, ~366 GB/s VRAM, i5-12400, 16 GB single-channel
+DDR4, ~23.0-23.5 GB/s H2D PCIe bandwidth):
+
+- Zero-miss GPU decode floor on `bel-inkling2` (diagnostic `zero_miss2.routes.bin`): `49.5 tok/s`
+  (`20.20 ms/tok`), `50.0 tok/s` (`20.02 ms/tok`) with `INK2_RPW=8 INK2_GEMV_MINB=56`.
+- H2D transfer cost: `~23.0 GB/s` via `k_fetch` (`195 us` per 4.48 MB NVFP4 expert, `356 us` per
+  8.21 MB MXFP8 expert); Belady OPT lower bound on `lru_ttl` routes is `~70-71 MB/tok`.
+
+Changes committed to [tools/inkling2/ink2_engine.cu](tools/inkling2/ink2_engine.cu) and
+[tools/server/server-context.cpp](tools/server/server-context.cpp):
+
+- SM-aware GEMV tuning (`g_gemv_min_blocks = 2 * sm_count`, `g_rpw = 8` for `sm_count <= 32` unless
+  overridden by `INK2_GEMV_MINB` / `INK2_RPW`).
+- Two-stage GPU greedy argmax (`k_logits_argmax_partial` + `kd_argmax_final`) to transfer 4 bytes
+  instead of `VOCAB * 4` bytes (~800 KB) per greedy decode token.
+- Decayed-LFU victim selection (`0.97` per-token decay via `k_decay`, `INK2_PLACE=freq` default) in
+  `k_cache_plan`, with active-call slot pinning and descending initial slot stamp tiebreak.
+- Null-source guard in `k_promote_plan` / `promote_args` before post-prefill `gpu_fetch_enable()`,
+  and skipping empty CPU promotion/ring kernels on GPU-fetch layers when loop core fits in VRAM.
+- Overlapped `k_fetch` (`E.fetch_stream`, default `INK2_FETCH_BLOCKS=2` CTAs per copy to limit SM
+  contention) running concurrently with Pass-1 resident-hit `k_gemv_*_sel`, followed by Pass-2 misses.
+- Updated default `INK2_MX_POOL_FRACTION` from `0.20`/`0.08` to `0.15`.
+
+Verified results (`bel-inkling2`, `--kv i8r --kv-grow 1 --kv-grow-step 4096 --chunk 4096 --tc 1 --graph 1 --cpu-threads 5 --spec 0`, `INK2_GPU_FETCH=1`, default tuning, 512 tokens, all coherent outputs and `128/128` CPU parity verified on `task-lru_ttl.ids`):
+
+| Task | Baseline Bel decode | Updated Bel decode | Updated Bel H2D/token |
+| --- | ---: | ---: | ---: |
+| LRU + TTL | 35.9 tok/s | 40.7 tok/s | 133.4 MB |
+| Directed cycle | 36.6 tok/s | 40.6 tok/s | 135.4 MB |
+| Race condition | 39.1 tok/s | 42.2 tok/s | 110.0 MB |
+| Rate limiter | 36.1 tok/s | 40.8 tok/s | 132.0 MB |
+| Serializability | 37.0 tok/s | 41.7 tok/s | 118.7 MB |
+
+Median decode improved from `36.6 tok/s` to `40.8 tok/s` (peak `42.2 tok/s`), and coherent 16K
+`context-16384.ids` (`--kv-grow 1 --ctx 32768`) completed at `522.8 pp/s` prefill / `38.8 tok/s` decode.
+The remaining gap to `48-50 tok/s` is set by the single-channel DDR4 PCIe bandwidth (`23.0 GB/s`)
+at the online cache miss rate (`~110-135 MB/tok`).

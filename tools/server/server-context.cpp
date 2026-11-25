@@ -1513,7 +1513,7 @@ private:
             set_engine_env("INK2_CPU_ACT", "int8");
             set_engine_env("INK2_CPU_OPT", "29");
             set_engine_env("INK2_OFF_MARGIN_MIB", "64");
-            set_engine_env("INK2_MX_POOL_FRACTION", "0.08");
+            set_engine_env("INK2_MX_POOL_FRACTION", "0.15");
             set_engine_env("INK2_PIN_HOST_MIB", "512");
             set_engine_env("INK2_RING_EXTRA", "0");
             unsetenv("INK2_NUMA_POOL");
