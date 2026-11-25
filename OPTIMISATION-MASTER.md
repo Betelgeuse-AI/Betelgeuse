@@ -363,3 +363,53 @@ Identical natural generation, 512 tokens, i8r, chunk 4096, 1 CPU thread, 256K ro
 
 Median: Strata 47.7 tok/s, Bel 36.7 tok/s. The generalisable 48-50 tok/s target is not met.
 The remaining work is the prefill numerical discrepancy, not cache policy or fused GQA.
+
+## Exact source of the first-token logit difference (2026-11-25)
+
+The four-way check was repeated with current binaries: Strata CPU 114489, Bel CPU 114489,
+Strata GPU-fetch 115467, Bel GPU-fetch 114489.
+
+The difference is **not** an expert kernel, router, accumulation order or residual bug. It is pool
+sizing. Strata allocates its pinned expert arena inside `expert_memory()` before the offload pool
+sizes are computed. That allocation reserves CUDA device-address mapping resources and reduces free
+VRAM from 8.61 GiB to 8.59 GiB. The expert pools change from **1885 NVFP4 + 89 MXFP8** slots to
+**1882 NVFP4 + 89 MXFP8**. Three fewer NVFP4 slots change which experts are resident at the start
+of prefill, so router logits and the first generated token change. Bel pins after pool setup, so its
+pool stays at 1885 + 89 and its logits match the CPU-only path.
+
+This was confirmed by the `offload:` lines in the two dump-logit runs. No expert is skipped and no
+weight is modified. Strata's behaviour is internally consistent but is a residency side effect of
+allocation order, not a different numerical implementation.
+
+A native reference comparison could not be completed: `ink2ref` needs all 24 layers resident in
+VRAM, about 14.6 GiB, and exits with CUDA OOM on this 12 GB card. CPU-only Strata and Bel are
+bit-identical on all 83 prompt positions.
+
+## Proper KV-shrink fix
+
+Replaced the graph-off/suspend workaround with `gpu_fetch_rebuild()`:
+
+- after `k_pool_evict` and unmap, copy the device pointer tables back into `E.htabA`/`E.htabB`;
+- destroy and recapture the decode graphs;
+- keep `E.gpu_fetch_active`, the pinned arena, the source pointer table and the eligibility mask
+  intact.
+
+GPU fetching remains operational after KV growth. Verified with graph capture enabled on the
+coherent 16,338-token source-review prompt: it completed with 143 fetches, 241 slot hits, 143
+evictions and no illegal access. CPU fallback remains available but is no longer forced by a shrink.
+
+## Final five-workload rerun
+
+Natural generation, 512 tokens, identical prompts and settings.
+
+| Task | Strata decode | Strata H2D/token | Bel decode | Bel H2D/token | Bel fetches/token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| LRU + TTL | 49.3 | 2.4 MB | 35.9 | 172.5 MB | 26.4 |
+| Directed cycle | 47.8 | 17.2 MB | 36.6 | 160.0 MB | 24.4 |
+| Race condition | 47.7 | 17.3 MB | 39.1 | 121.2 MB | 18.5 |
+| Rate limiter | 36.7 | 158.4 MB | 36.1 | 171.7 MB | 26.1 |
+| Serializability | 42.8 | 72.5 MB | 37.0 | 155.4 MB | 23.2 |
+
+Median: Strata 47.7 tok/s, Bel 36.6 tok/s. The 48-50 tok/s general target is still not met by
+Bel. The remaining difference is the residency side effect from allocation order, which changes
+natural generated tokens and routing. No further architecture change was introduced.

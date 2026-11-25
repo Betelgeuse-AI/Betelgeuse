@@ -3449,7 +3449,7 @@ size_t vram_free() {
 size_t vram_keep() { return ((size_t) std::max(E.reserve_mib, 0) << 20) + ((size_t) g_off_margin_mib << 20); }   // as setup_offload
 void promote_cancel();                   // (CPU experts)
 void gpu_fetch_release();                // (phase-aware registered-source fetch)
-void gpu_fetch_suspend();                // (drop fetch state but keep the arena until next prefill)
+void gpu_fetch_rebuild();                // (refresh host mirrors after a pool shrink)
 cudaGraphExec_t g_vexec[9][2] = {};      // verify graphs indexed by rows and argmax/sampling output
 int g_spec_draft_n_max = 0;
 extern bool g_pf_route_active;
@@ -3502,10 +3502,7 @@ void pool_resize(bool nv, int n) {
     }
     ns = n;
     invalidate_engine_graphs();
-    if (shrank && E.gpu_fetch_active) {
-        gpu_fetch_suspend();
-        E.graph = false;   // a captured graph holds the old pool-slot arguments; use the uncaptured path after a shrink
-    }
+    if (shrank && E.gpu_fetch_active) gpu_fetch_rebuild();
 }
 void refill_lazy_pool() {
     if (!E.lazy_experts) return;
@@ -4540,13 +4537,15 @@ void gpu_fetch_release() {
     E.gpu_fetch_active = false;
     invalidate_engine_graphs();
 }
-void gpu_fetch_suspend() {
+void gpu_fetch_rebuild() {
     if (!E.gpu_fetch_active) return;
     CK(cudaDeviceSynchronize());
-    if (E.fetch_ok_d) CK(cudaMemset(E.fetch_ok_d, 0, (size_t) NL * NE));
-    if (E.xsrc_d) CK(cudaMemset(E.xsrc_d, 0, (size_t) NL * NE * sizeof(void*)));
-    std::memset(E.fetch_layer, 0, sizeof(E.fetch_layer));
-    E.gpu_fetch_active = false;
+    // k_pool_evict cleared the evicted slots in the device pointer tables.  Refresh the host
+    // mirrors so placement/refill sees the same state, then recapture the decode graph safely.
+    E.htabA.assign((size_t) NL * NE, nullptr);
+    E.htabB.assign((size_t) NL * NE, nullptr);
+    CK(cudaMemcpy(E.htabA.data(), E.tabA, E.htabA.size() * sizeof(void*), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(E.htabB.data(), E.tabB, E.htabB.size() * sizeof(void*), cudaMemcpyDeviceToHost));
     invalidate_engine_graphs();
 }
 void gpu_fetch_enable() {
