@@ -314,3 +314,52 @@ No permanent disable was added.
 
 - forced routing;
 - archived word-salad prompt.
+
+## Fused GQA history (2026-11-25)
+
+`git log -S'k_attn_partial_gqa'` shows it entered in `970dae908`, bundled with the loop-core
+placement work. The isolated same-binary check recorded in
+`benchmarks/gqa-decode-2026-11-23/RESULTS.md` measured +19.9% decode at 262K, +2.6% at 16K K8/V4,
+and +0.6% at 16K i8r, with no demonstrated correctness regression. It was a diagnostic mistake to
+replace it with Strata's per-head kernel during the numerical investigation; it has been restored.
+
+## Four-configuration prefill check
+
+Identical input tokens, `--dump-logits`, same flags.
+
+| Configuration | Last-position argmax |
+| --- | ---: |
+| Strata CPU-only | 114489 |
+| Bel CPU-only | 114489 |
+| Strata GPU-fetch | 115467 |
+| Bel GPU-fetch | 114489 |
+
+CPU-only logits are bit-identical across all 83 prompt positions. The first divergence appears only
+when GPU fetch is enabled in Strata: its packed pinned expert source changes prefill logits, while
+Bel's post-prefill pinned arena does not. `INK2_GPU_FETCH_EARLY=1` made Bel pin before prefill but
+did not reproduce Strata's first-token logits. This is the exact remaining discrepancy; it is in
+prefill, not decode attention. No expert is skipped and no weight is requantised in either engine.
+
+## KV-growth crash mitigation
+
+A captured decode graph keeps the old pool-slot launch arguments. When `--kv-grow` shrinks a pool,
+Bel now invalidates the graphs and switches that process to the uncaptured decode path. GPU fetch
+state is suspended (masks cleared, graphs invalidated, arena retained until the next prefill) rather
+than freed mid-resize. The coherent 16K source-review prompt now completes with GPU fetch enabled
+after the MX pool shrinks from 90 to 84 slots. This is a runtime fallback for the shrink event, not
+a permanent GPU-fetch disable.
+
+## Rerun of five natural workloads (after restoring GQA)
+
+Identical natural generation, 512 tokens, i8r, chunk 4096, 1 CPU thread, 256K route profile.
+
+| Task | Strata decode | Strata H2D/token | Bel decode | Bel H2D/token | Bel fetches/token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| LRU + TTL | 49.2 | 2.4 MB | 35.9 | 172.5 MB | 26.4 |
+| Directed cycle | 47.8 | 17.2 MB | 36.7 | 160.0 MB | 24.4 |
+| Race condition | 47.7 | 17.3 MB | 39.2 | 121.2 MB | 18.5 |
+| Rate limiter | 36.9 | 158.4 MB | 36.0 | 171.7 MB | 26.1 |
+| Serializability | 42.8 | 72.5 MB | 37.0 | 155.4 MB | 23.2 |
+
+Median: Strata 47.7 tok/s, Bel 36.7 tok/s. The generalisable 48-50 tok/s target is not met.
+The remaining work is the prefill numerical discrepancy, not cache policy or fused GQA.
