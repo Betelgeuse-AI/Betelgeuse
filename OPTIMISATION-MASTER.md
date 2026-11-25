@@ -99,3 +99,93 @@ therefore fetched from a much larger registered set.
 - Test 32K, 64K, 128K and 262K contexts with generation headroom.
 - Compare against the best HT CPU baseline (10 workers) at every context.
 - Add TTFT breakdown for registration and phase transition.
+
+## Multi-layer and selective fetch correction (2026-11-25)
+
+### Root cause of the illegal access
+
+The multi-layer crash was not a slot-index or tensor-offset bug. `k_cache_plan` was filling the
+shared four-part fetch lists from a source table that only contained registered experts. Layers
+whose experts were not registered produced null source pointers, and `k_fetch_parts` dereferenced
+them during graph replay. Under graph capture the error surfaced at `cudaGraphLaunch`; with
+`--graph 0` and `CUDA_LAUNCH_BLOCKING=1` it surfaced at the following D2D copy.
+
+Fixes:
+
+- Added a device eligibility mask (`INK2_GPU_FETCH` only marks registered experts).
+- `k_cache_cpu` skips eligible experts, so they are no longer computed twice.
+- `k_cache_plan` fetches only eligible misses, so no null source pointer reaches `k_fetch_parts`.
+- `k_fetch_parts` also guards null sources defensively.
+- Added a guard for an empty `expert_freq` vector (a crash when no route profile was given).
+- On KV-growth pool shrinkage, registrations are released and execution falls back to mmap CPU;
+  this keeps 16K with `--kv-grow` stable.
+- `compute-sanitizer --tool memcheck` could not run the host-registered file mappings on this
+  driver (it exited before model load), so the diagnosis used `--graph 0`,
+  `CUDA_LAUNCH_BLOCKING=1`, gdb backtraces, and staged instrumentation.
+
+### Selective registration
+
+Registration is now per expert, not per layer. Candidates are ranked by actual current-prompt
+routes plus decode counts, with the route profile as a weak tie-breaker. Only nonresident experts
+that fit the budget are registered. Their page-aligned tensor parts are coalesced into a small set
+of `cudaHostRegisterMapped | cudaHostRegisterPortable` ranges. All other experts stay on the
+mmap-backed CPU path. Permanently resident experts are excluded from registration.
+
+### MXFP8 support
+
+MXFP8 layers 20-23 are now eligible. Their four packed parts use the same fetch path with their
+own byte sizes and the MXFP8 GPU pool. `INK2_GPU_FETCH_NV=0` and `INK2_GPU_FETCH_MX=0` select
+NVFP4-only or MXFP8-only experiments.
+
+### Instrumentation
+
+`expert fetch:` now also reports a four-counter line:
+`fetches`, `slot hits`, `evictions`, `cpu-eligible misses`.
+
+### Corrected results
+
+Standalone, 16,896 context, i8r, chunk 4096, graph 1, spec 0, 5 CPU workers, 256K route profile:
+
+| Configuration | Prefill | Decode / 512 | Decode / 2048 |
+| --- | ---: | ---: | ---: |
+| CPU baseline, Python 83-token prompt | 21.3 tok/s | 25.7 tok/s | ~26.5 tok/s |
+| GPU fetch, 512 MiB, Python prompt | 24.2 tok/s | 31.4 tok/s | - |
+| GPU fetch, 1024 MiB, Python prompt | 15.8 tok/s | 28.9 tok/s | - |
+| GPU fetch, 2048 MiB mixed, Python prompt | 19.3 tok/s | - | 30.0 tok/s |
+| GPU fetch, 640 MiB, archived 16K prompt | 747.1 pp/s | 37.1 tok/s | - |
+| CPU baseline, archived 16K prompt | ~800 pp/s | ~40 tok/s | - |
+
+`bel-server`, GPU fetch 640 MiB, 16K source-review prompt: cold 702.15 pp/s / 39.36 tok/s,
+warm 867.11 pp/s / 40.54 tok/s. Repeated requests exercised release at the next prefill and
+re-registration at decode.
+
+### Format comparison on the Python prompt, 512 generated
+
+| Mode | Registered experts | Decode | Fetch stats (fetch/hit/evict/cpu-miss) |
+| --- | ---: | ---: | --- |
+| NVFP4 only, 2048 MiB | 479 | 21.5 tok/s | 359 / 31556 / 359 / 853 |
+| MXFP8 only, 2048 MiB | 261 | 25.1 tok/s | 1343 / 6712 / 1343 / 8329 |
+| Mixed, 2048 MiB | 341 | 22.3 tok/s | 310 / 28543 / 310 / 20299 |
+
+At this budget the route-ranked 512 MiB mixed setting was the best short-prompt decode (31.4
+tok/s). Larger budgets increased registration latency without improving decode.
+
+### Budget and TTFT observations
+
+| Budget | Registered | Registration / phase transition | Decode / 512 |
+| ---: | ---: | ---: | ---: |
+| 256 MiB | 33 | 481.9 ms | 26.1 tok/s |
+| 512 MiB | 67 | 617.3 ms | 29.4 tok/s |
+| 640 MiB | 85 | 523.4 ms | 23.3 tok/s |
+| 1024 MiB | 156 | 859.7 ms | 30.9 tok/s |
+| 2048 MiB | 341 | 1601.6 ms | 22.3 tok/s |
+
+Registration latency is charged inside the prefill-to-decode transition, not prompt processing.
+For short prompts a large budget does not pay back its transition cost.
+
+### Open items
+
+- Long-context 32K/64K/128K/262K still need a full sweep.
+- Fetch stats show most misses still use CPU; registration selection needs decode-history feedback
+  across multiple turns in a persistent server.
+- Reuse distance and exposed CPU/GPU dependency timing are not yet logged separately.
