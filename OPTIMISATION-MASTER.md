@@ -242,3 +242,36 @@ fallback preserves correctness and the existing prefill rate.
 - Archived synthetic word-salad numbers are invalid and must not be used as a baseline.
 - No quantisation, expert skipping, speculative decoding or scheduler was added.
 - All routed experts are still executed; the CPU fallback remains intact.
+
+## Routing-replay isolation (2026-11-25)
+
+Recorded Strata's decode routing for the Python prompt and replayed it through Bel with
+`--force-routing`, keeping every other setting identical.
+
+| Engine | Decode | H2D/token | Fetches/token |
+| --- | ---: | ---: | ---: |
+| Strata GPU fetch, ordinary decode | 47.6 tok/s | 17.3 MB | ~2 |
+| Bel GPU fetch, forced identical routing | **47.8 tok/s** | 15.2 MB | 1121/512 = 2.2 |
+
+This proves the Bel cache, pinned arena, fetch counters and slot reuse are equivalent to Strata.
+The 36.2 tok/s ordinary Bel result is caused by a different generated token sequence and therefore
+different expert routing, not by cache thrashing or a different H2D mechanism. The counter semantics
+match within workload differences.
+
+Strata's refill implementation was ported into Bel directly; it did not change the ordinary decode
+result, confirming refill policy is not the discrepancy.
+
+## KV-growth illegal access
+
+Changed pool shrinkage to suspend GPU-fetch state (clear masks, invalidate graphs, keep the pinned
+arena) instead of freeing the arena mid-resize. The 16,338-token source-review prompt still hits an
+illegal memory access after `--kv-grow` shrinks the MX pool from 90 to 84 slots. This remains an
+open correctness issue; the CPU fallback is the stable path for that workload. No permanent
+disable was added.
+
+## Current state
+
+- 48 tok/s class decode is reproduced in Bel when expert routing is identical (47.8 tok/s).
+- Ordinary Bel decode remains 36.2 tok/s because generated tokens diverge from Strata at near-ties.
+- Do not add further scheduling or kernel work to chase this; the next step is numeric/logit parity
+  of the attention/GEMV path that decides those tokens.

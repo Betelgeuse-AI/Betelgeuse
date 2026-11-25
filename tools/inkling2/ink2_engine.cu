@@ -3445,6 +3445,7 @@ size_t vram_free() {
 size_t vram_keep() { return ((size_t) std::max(E.reserve_mib, 0) << 20) + ((size_t) g_off_margin_mib << 20); }   // as setup_offload
 void promote_cancel();                   // (CPU experts)
 void gpu_fetch_release();                // (phase-aware registered-source fetch)
+void gpu_fetch_suspend();                // (drop fetch state but keep the arena until next prefill)
 cudaGraphExec_t g_vexec[9][2] = {};      // verify graphs indexed by rows and argmax/sampling output
 int g_spec_draft_n_max = 0;
 extern bool g_pf_route_active;
@@ -3497,7 +3498,7 @@ void pool_resize(bool nv, int n) {
     }
     ns = n;
     invalidate_engine_graphs();
-    if (shrank && E.gpu_fetch_active) gpu_fetch_release();   // KV growth takes pool slots: drop registrations
+    if (shrank && E.gpu_fetch_active) gpu_fetch_suspend();   // KV growth takes pool slots: drop fetch state, keep arena
 }
 void refill_lazy_pool() {
     if (!E.lazy_experts) return;
@@ -3506,110 +3507,42 @@ void refill_lazy_pool() {
     CK(cudaMemcpy(slot_of.data(), E.slot_of, slot_of.size() * sizeof(int), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(owner_nv.data(), E.owner_nv, owner_nv.size() * sizeof(int), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(owner_mx.data(), E.owner_mx, owner_mx.size() * sizeof(int), cudaMemcpyDeviceToHost));
-    const size_t count = (size_t) NL * NE;
-    std::vector<unsigned long long> prompt(count, 0);
-    std::vector<float> decode(count, 0.0f);
-    if (g_pf_route_active && E.prefill_routes)
-        CK(cudaMemcpy(prompt.data(), E.prefill_routes, count * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-    if (E.cnt) CK(cudaMemcpy(decode.data(), E.cnt, count * sizeof(float), cudaMemcpyDeviceToHost));
-    std::vector<double> profile_sum(NL, 0.0), prompt_sum(NL, 0.0), decode_sum(NL, 0.0);
-    for (int l = 0; l < NL; ++l) {
-        for (int e = 0; e < NE; ++e) {
-            const size_t key = (size_t) l * NE + e;
-            if (E.expert_freq.size() == count) profile_sum[l] += E.expert_freq[key];
-            prompt_sum[l] += prompt[key];
-            decode_sum[l] += decode[key];
-        }
-    }
-    float cpu_us_nv = 0.0f, cpu_us_mx = 0.0f;
-    std::vector<float> cpu_us_layer(NL, 0.0f);
-    for (int n = 0; n < E.cpu_nodes; ++n) {
-        if (!E.bell[n]) continue;
-        cpu_us_nv += E.bell[n]->us_job_nv;
-        cpu_us_mx += E.bell[n]->us_job_mx;
-        for (int l = 0; l < std::min(NL, ink2cpu::BELL_LAYERS); ++l) cpu_us_layer[l] += E.bell[n]->us_job_layer[l];
-    }
-    cpu_us_nv = cpu_us_nv > 0.0f ? cpu_us_nv / E.cpu_nodes : 1.0f;
-    cpu_us_mx = cpu_us_mx > 0.0f ? cpu_us_mx / E.cpu_nodes : 1.0f;
-    for (float& us : cpu_us_layer) us = us > 0.0f ? us / E.cpu_nodes : 0.0f;
     const std::vector<int> order = expert_placement_order();
-    std::vector<int> rank(count, (int) count);
-    for (int i = 0; i < (int) order.size(); ++i) rank[order[i]] = i;
-    struct Candidate { int key; double score; bool loop_core; };
-    std::vector<Candidate> candidates_nv, candidates_mx;
-    candidates_nv.reserve(count);
-    candidates_mx.reserve(count);
-    for (int key = 0; key < NL * NE; ++key) {
-        if (slot_of[key] >= 0) continue;
-        const int l = key / NE;
-        const double profile = profile_sum[l] > 0.0 && E.expert_freq.size() == count
-            ? E.expert_freq[key] / profile_sum[l] : 0.0;
-        const double recent = prompt_sum[l] > 0.0 ? prompt[key] / prompt_sum[l] : 0.0;
-        const double decoded = decode_sum[l] > 0.0 ? decode[key] / decode_sum[l] : 0.0;
-        double demand = g_pf_route_active && prompt_sum[l] > 0.0
-            ? 0.70 * recent + 0.20 * profile + 0.10 * decoded
-            : 0.75 * profile + 0.25 * decoded;
-        if (demand == 0.0) demand = 1.0 / (double) (rank[key] + 1);
-        const bool nv = ex_nv(l);
-        const double bytes_mib = (nv ? NV_BYTES : MX_BYTES) / 1048576.0;
-        const double cpu_us = cpu_us_layer[l] > 0.0f ? cpu_us_layer[l] : nv ? cpu_us_nv : cpu_us_mx;
-        const bool loop_core = l >= LOOP_BEGIN && l < LOOP_END;
-        Candidate candidate{key, demand * cpu_us / bytes_mib, loop_core};
-        (nv ? candidates_nv : candidates_mx).push_back(candidate);
-    }
-    auto order_candidates = [](std::vector<Candidate>& candidates) {
-        std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
-            if (a.loop_core != b.loop_core) return a.loop_core;
-            return a.score != b.score ? a.score > b.score : a.key < b.key;
-        });
-    };
-    order_candidates(candidates_nv);
-    order_candidates(candidates_mx);
-    constexpr int REFILL_BATCH_SLOTS = 8;
-    std::vector<uint8_t> packed(MX_BYTES * REFILL_BATCH_SLOTS);
+    std::vector<uint8_t> packed(MX_BYTES);
     size_t bytes = 0;
     int filled_nv = 0, filled_mx = 0;
-    auto fill = [&](bool nv, std::vector<int>& owners, std::vector<Candidate>& candidates, int& filled) {
+    auto fill = [&](bool nv, std::vector<int>& owners, int& filled) {
         size_t next = 0;
-        const size_t eb = nv ? ex_bytes(0) : MX_BYTES;
-        uint8_t* pool = nv ? E.pool_nv : E.pool_mx;
-        for (int s = 0; s < (int) owners.size();) {
-            if (owners[s] >= 0) { ++s; continue; }
-            const int run_start = s;
-            int run_count = 0;
-            bool exhausted = false;
-            while (s < (int) owners.size() && owners[s] < 0 && run_count < REFILL_BATCH_SLOTS) {
-                int key = -1;
-                while (next < candidates.size()) {
-                    const int candidate = candidates[next++].key;
-                    if (slot_of[candidate] < 0) { key = candidate; break; }
-                }
-                if (key < 0) { exhausted = true; break; }
-                const int l = key / NE;
-                const ink2cpu::ExpertParts& p = E.expert_parts[key];
-                if (ex_bytes(l) != eb || p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes != eb) {
-                    std::fprintf(stderr, "layer %d expert %d: source size mismatch during pool refill\n", l, key % NE);
-                    std::exit(1);
-                }
-                uint8_t* dst = packed.data() + (size_t) run_count * eb;
-                std::memcpy(dst, p.w13, p.w13_bytes);
-                std::memcpy(dst + p.w13_bytes, p.s13, p.s13_bytes);
-                std::memcpy(dst + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
-                std::memcpy(dst + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
-                slot_of[key] = s;
-                owners[s] = key;
-                bytes += eb;
-                ++filled;
-                ++run_count;
-                ++s;
+        for (int s = 0; s < (int) owners.size(); ++s) {
+            if (owners[s] >= 0) continue;
+            int key = -1;
+            while (next < order.size()) {
+                const int candidate = order[next++], l = candidate / NE;
+                if (ex_nv(l) == nv && slot_of[candidate] < 0) { key = candidate; break; }
             }
-            if (run_count) CK(cudaMemcpy(pool + (size_t) run_start * eb, packed.data(), (size_t) run_count * eb,
-                                         cudaMemcpyHostToDevice));
-            if (exhausted) break;
+            if (key < 0) break;
+            const int l = key / NE;
+            const ink2cpu::ExpertParts& p = E.expert_parts[key];
+            const size_t eb = ex_bytes(l);
+            if (p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes != eb) {
+                std::fprintf(stderr, "layer %d expert %d: source size mismatch during pool refill\n", l, key % NE);
+                std::exit(1);
+            }
+            std::memcpy(packed.data(), p.w13, p.w13_bytes);
+            std::memcpy(packed.data() + p.w13_bytes, p.s13, p.s13_bytes);
+            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
+            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
+            uint8_t* pool = nv ? E.pool_nv : E.pool_mx;
+            uint8_t* dst = pool + (size_t) s * eb;
+            CK(cudaMemcpy(dst, packed.data(), eb, cudaMemcpyHostToDevice));
+            slot_of[key] = s;
+            owners[s] = key;
+            bytes += eb;
+            ++filled;
         }
     };
-    fill(true, owner_nv, candidates_nv, filled_nv);
-    fill(false, owner_mx, candidates_mx, filled_mx);
+    fill(true, owner_nv, filled_nv);
+    fill(false, owner_mx, filled_mx);
     if (!bytes) return;
     std::fill(E.htabA.begin(), E.htabA.end(), nullptr);
     std::fill(E.htabB.begin(), E.htabB.end(), nullptr);
@@ -3633,20 +3566,10 @@ void refill_lazy_pool() {
     CK(cudaMemcpy(&fetched, E.fbytes, sizeof(fetched), cudaMemcpyDeviceToHost));
     fetched += bytes;
     CK(cudaMemcpy(E.fbytes, &fetched, sizeof(fetched), cudaMemcpyHostToDevice));
-    std::fprintf(stderr, "pool refill: added %d NVFP4 + %d MXFP8 experts (%.2f GiB); existing residents kept\n", filled_nv,
-                 filled_mx, bytes / 1073741824.0);
-    double min_layer_cost = std::numeric_limits<double>::infinity(), max_layer_cost = 0.0;
-    for (int l = 0; l < NL; ++l) {
-        const double us = cpu_us_layer[l] > 0.0f ? cpu_us_layer[l] : (ex_nv(l) ? cpu_us_nv : cpu_us_mx);
-        const double cost = us / ((ex_nv(l) ? NV_BYTES : MX_BYTES) / 1048576.0);
-        min_layer_cost = std::min(min_layer_cost, cost);
-        max_layer_cost = std::max(max_layer_cost, cost);
-    }
-    std::fprintf(stderr, "pool admission: layer CPU cost %.2f-%.2f us/MiB; format means %.2f NVFP4, %.2f MXFP8; routes %s\n",
-                 min_layer_cost, max_layer_cost, cpu_us_nv / (NV_BYTES / 1048576.0), cpu_us_mx / (MX_BYTES / 1048576.0),
-                 g_pf_route_active ? "current prompt + profile + decode" : "profile + decode");
+    std::fprintf(stderr, "pool refill: restored %d NVFP4 + %d MXFP8 experts (%.2f GiB)\n", filled_nv, filled_mx,
+                 bytes / 1073741824.0);
 }
-
+// the pools give up `bytes`, in proportion to their sizes
 std::vector<int> read_placement_file(const std::string& path) {
     std::ifstream f(path);
     if (!f) { std::fprintf(stderr, "cannot open expert placement %s\n", path.c_str()); std::exit(1); }
@@ -4598,13 +4521,22 @@ void pin_host_experts(size_t requested) {
 // substantial prompt.  The recurrent core (6-17) stays in VRAM and the CPU path remains the
 // fallback whenever this allocation cannot be made.
 void gpu_fetch_release() {
-    if (!E.gpu_fetch_active) return;
+    if (!E.gpu_fetch_active && !E.pinned_host_experts) return;
     CK(cudaDeviceSynchronize());
     if (E.fetch_ok_d) CK(cudaMemset(E.fetch_ok_d, 0, (size_t) NL * NE));
     if (E.fetch_stats) CK(cudaMemset(E.fetch_stats, 0, 4 * sizeof(int)));
     if (E.xsrc_d) CK(cudaMemset(E.xsrc_d, 0, (size_t) NL * NE * sizeof(void*)));
     if (E.pinned_host_experts) { cudaFreeHost(E.pinned_host_experts); E.pinned_host_experts = nullptr; }
     E.pinned_host_expert_bytes = 0;
+    std::memset(E.fetch_layer, 0, sizeof(E.fetch_layer));
+    E.gpu_fetch_active = false;
+    invalidate_engine_graphs();
+}
+void gpu_fetch_suspend() {
+    if (!E.gpu_fetch_active) return;
+    CK(cudaDeviceSynchronize());
+    if (E.fetch_ok_d) CK(cudaMemset(E.fetch_ok_d, 0, (size_t) NL * NE));
+    if (E.xsrc_d) CK(cudaMemset(E.xsrc_d, 0, (size_t) NL * NE * sizeof(void*)));
     std::memset(E.fetch_layer, 0, sizeof(E.fetch_layer));
     E.gpu_fetch_active = false;
     invalidate_engine_graphs();
