@@ -20,6 +20,8 @@
 // folded into the scale).  The element values are the GPU's exactly; only the order of the fp32 sums differs.
 #include "ink2_cpu.hpp"
 
+#include <algorithm>
+
 #if !defined(__linux__) || !(defined(__x86_64__) || defined(__i386__))
 // CBA: Linux x86 only (thread pinning, NUMA placement through sysfs, GCC target attributes); elsewhere --cpu-threads
 // is refused (isa() == nullptr) and the experts' host memory is plain memory
@@ -95,11 +97,13 @@ std::vector<int> node_cores(int node) {
         const int n = (int) std::thread::hardware_concurrency();
         for (int i = 0; i < n; ++i) cpus.push_back(i);
     }
+    const char* ht_env = std::getenv("INK2_CPU_HT");
+    const bool ht = ht_env != nullptr && std::atoi(ht_env) != 0;
     std::vector<int> cores;
     for (int c : cpus) {
         const std::vector<int> sib = parse_list(read_line("/sys/devices/system/cpu/cpu" + std::to_string(c) +
                                                           "/topology/thread_siblings_list"));
-        if (sib.empty() || sib[0] == c) cores.push_back(c);
+        if (ht || sib.empty() || sib[0] == c) cores.push_back(c);
     }
     return cores;
 }
@@ -129,6 +133,7 @@ float e4m3_decode(unsigned v) {   // as the GPU's (NaN for 0x7F / 0xFF)
 
 // ------------------------------------------------------------------------------------------------ fp32 kernels
 #define T2 __attribute__((target("avx2,fma,f16c")))
+#define T2V __attribute__((target("avx2,avxvnni,fma,f16c")))
 #define T5 __attribute__((target("avx512f,avx512bw,avx512vl,avx2,fma,f16c")))
 #define T5V __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")))
 
@@ -362,6 +367,37 @@ T2 void q8_rows_avx2(const uint8_t* W, const uint8_t* S, int, int K, QAct X, flo
         for (int i = 0; i < nr; ++i) y[r + i] = factor * hsum256(acc[i]);
     }
 }
+T2V void q8_rows_vnni256(const uint8_t* W, const uint8_t* S, int, int K, QAct X, float factor, float* y, int r0, int r1) {
+    const __m256i lut = _mm256_broadcastsi128_si256(_mm_load_si128((const __m128i*) E2M1X2U));
+    const size_t pf = g_opt & 2 ? (size_t) R * (K / 2) : 0;
+    const __m128i m4 = _mm_set1_epi8(0x0F), sm = _mm_set1_epi16(0x7F00);
+    const __m128i sctl = _mm_setr_epi8(-1, 0, -1, 0, -1, 1, -1, 1, -1, 0, -1, 0, -1, 1, -1, 1);
+    for (int r = r0; r < r1; r += R) {
+        const int nr = r1 - r < R ? r1 - r : R;
+        __m256 acc[R];
+        for (int i = 0; i < R; ++i) acc[i] = _mm256_setzero_ps();
+        for (int b = 0; b < K / 32; ++b) {
+            const __m256i xq = _mm256_loadu_si256((const __m256i*) (X.q + 32 * b));
+            const __m256i in = _mm256_loadu_si256((const __m256i*) (X.init + 8 * b));
+            const __m256 xs = _mm256_loadu_ps(X.xs + 8 * b);
+            for (int i = 0; i < nr; ++i) {
+                const uint8_t* w = W + (size_t) (r + i) * (K / 2) + 16 * b;
+                const uint8_t* s = S + (size_t) (r + i) * (K / 16) + 2 * b;
+                PF_ROWS(w, s, 8, 4)
+                uint16_t s2;
+                std::memcpy(&s2, s, 2);
+                const __m128i q = _mm_loadu_si128((const __m128i*) w);
+                const __m128i lo = _mm_and_si128(q, m4), hi = _mm_and_si128(_mm_srli_epi16(q, 4), m4);
+                const __m256i wq = _mm256_shuffle_epi8(lut, _mm256_set_m128i(hi, lo));
+                const __m256i isum = _mm256_dpbusd_avx_epi32(in, wq, xq);
+                const __m128i sh = _mm_srli_epi16(_mm_and_si128(_mm_shuffle_epi8(_mm_set1_epi16((short) s2), sctl), sm), 1);
+                const __m256 sc = _mm256_mul_ps(_mm256_cvtph_ps(sh), xs);
+                acc[i] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(isum), sc, acc[i]);
+            }
+        }
+        for (int i = 0; i < nr; ++i) y[r + i] = factor * hsum256(acc[i]);
+    }
+}
 T5V void q8_rows_vnni(const uint8_t* W, const uint8_t* S, int, int K, QAct X, float factor, float* y, int r0, int r1) {
     const __m512i lut = _mm512_broadcast_i32x4(_mm_load_si128((const __m128i*) E2M1X2U));
     const size_t pf = g_opt & 2 ? (size_t) R * (K / 2) : 0;
@@ -397,7 +433,8 @@ T5V void q8_rows_vnni(const uint8_t* W, const uint8_t* S, int, int K, QAct X, fl
 }
 
 int g_isa = 0;          // fp32 kernels: 2 avx2, 5 avx512
-bool g_vnni = false;    // q8 kernels: AVX-512 VNNI (chunks of 64), else AVX2 (chunks of 32)
+bool g_vnni = false;    // AVX-512 VNNI: chunks of 64
+bool g_vnni256 = false;
 bool g_q8 = false;      // NVFP4 layers with int8 activations (INK2_CPU_ACT=int8)
 int g_C = 32;
 void rows(bool nv, const uint8_t* W, const uint8_t* S, int N, int K, const float* x, float factor, float* y, int r0, int r1) {
@@ -406,7 +443,10 @@ void rows(bool nv, const uint8_t* W, const uint8_t* S, int N, int K, const float
     else (g_isa == 5 ? mx_rows_512 : mx_rows_avx2)(W, S, N, K, x, y, r0, r1);
 }
 void q8_rows(const uint8_t* W, const uint8_t* S, int N, int K, QAct X, float factor, float* y, int r0, int r1) {
-    if (r0 < r1) (g_vnni ? q8_rows_vnni : q8_rows_avx2)(W, S, N, K, X, factor, y, r0, r1);
+    if (r0 >= r1) return;
+    if (g_vnni) q8_rows_vnni(W, S, N, K, X, factor, y, r0, r1);
+    else if (g_vnni256) q8_rows_vnni256(W, S, N, K, X, factor, y, r0, r1);
+    else q8_rows_avx2(W, S, N, K, X, factor, y, r0, r1);
 }
 
 // ------------------------------------------------------------------------------------------------ pools
@@ -781,11 +821,15 @@ void start(const Setup& s) {
     const bool avx2_only = std::getenv("INK2_CPU_AVX2") != nullptr;
     g_isa = k && std::string(k) == "avx512" && !avx2_only ? 5 : 2;
     g_vnni = g_isa == 5 && __builtin_cpu_supports("avx512vnni");
+    const char* vnni256 = std::getenv("INK2_CPU_VNNI256");
+    g_vnni256 = !g_vnni && __builtin_cpu_supports("avxvnni") && (!vnni256 || std::strcmp(vnni256, "0") != 0);
     g_C = g_vnni ? 64 : 32;
     const char* act = std::getenv("INK2_CPU_ACT");
     g_q8 = act && std::string(act) == "int8" && S.h % 64 == 0 && S.ff % 64 == 0 && S.h <= BELL_H && S.ff <= FFX;
     g_trace = std::getenv("INK2_CPU_TRACE") != nullptr;
     if (const char* e = std::getenv("INK2_CPU_OPT")) g_opt = std::atoi(e);
+    const char* ht_env = std::getenv("INK2_CPU_HT");
+    const bool ht = ht_env != nullptr && std::atoi(ht_env) != 0;
     const int nn = nodes();
     g_stop = false;
     for (int n = 0; n < nn; ++n) {
@@ -796,17 +840,22 @@ void start(const Setup& s) {
         std::vector<int> cores = node_cores(n);
         // node 0 keeps its first core for the engine's own thread (graph launches, the serve loop)
         if (n == 0 && cores.size() > 1) {
+            const std::vector<int> sib = parse_list(read_line("/sys/devices/system/cpu/cpu" + std::to_string(cores[0]) +
+                                                              "/topology/thread_siblings_list"));
             if (g_opt & 16) {
                 // ... and the caller is put there (both hyperthreads): left to the scheduler it sat on the second
                 // hyperthread of a pool core (seen: cpu 78, pool thread 6 of node 1), whose thread then ran at half
                 // speed and held every barrier of its node ~30 us
                 cpu_set_t set;
                 CPU_ZERO(&set);
-                for (int c : parse_list(read_line("/sys/devices/system/cpu/cpu" + std::to_string(cores[0]) + "/topology/thread_siblings_list")))
-                    CPU_SET(c, &set);
+                for (int c : sib) CPU_SET(c, &set);
                 sched_setaffinity(0, sizeof set, &set);   // CBA: for good: threads the caller starts later inherit it
             }
-            cores.erase(cores.begin());
+            if (ht) {
+                for (int c : sib) cores.erase(std::remove(cores.begin(), cores.end(), c), cores.end());
+            } else {
+                cores.erase(cores.begin());
+            }
         }
         if ((int) cores.size() > S.threads) cores.resize(S.threads);
         N->cpus = cores;
@@ -829,8 +878,9 @@ void start(const Setup& s) {
         total += (int) N->cpus.size();
     }
     while (g_ready.load() < total) std::this_thread::yield();
-    std::fprintf(stderr, "cpu experts: %s, NVFP4 activations %s, %d node(s)%s, threads per node:",
-                 g_isa == 5 ? "avx512" : "avx2", g_q8 ? (g_vnni ? "int8 (VNNI)" : "int8") : "fp32", nn,
+    std::fprintf(stderr, "cpu experts: %s%s, NVFP4 activations %s, %d node(s)%s, threads per node:",
+                 g_isa == 5 ? "avx512" : "avx2", g_vnni256 ? "-VNNI256" : "",
+                 g_q8 ? (g_vnni || g_vnni256 ? "int8 (VNNI)" : "int8") : "fp32", nn,
                  numa_off() ? " (NUMA placement off: INK2_NUMA_POOL=0)" : "");
     for (Node* N : g_nodes) std::fprintf(stderr, " %zu", N->cpus.size());
     std::fprintf(stderr, "\n");

@@ -66,3 +66,34 @@ Earlier Betelgeuse results used i8r and chunk 4096. The coherent Mission 5 run e
 `--cache-type-k q8_0 --cache-type-v q4_0 -fa on`, which the direct server maps to K8/V4 and tiled
 CUDA attention. Prompt caching stayed enabled; its reported cache count was zero because the repeated
 standalone prompt was shorter than the previous prompt-plus-generation history.
+
+## Follow-up experiments (2026-11-25)
+
+- `RLIMIT_MEMLOCK` was raised to unlimited for the user with
+  `/etc/security/limits.d/99-memlock.conf`. This is now active in the current shell.
+- Added opt-in `INK2_CPU_HT=1` in `ink2_cpu.cpp` so `node_cores()` uses logical CPUs instead of
+  only physical cores. With `-t 12`, the engine reports 10 effective workers (12 logical threads
+  minus the two siblings of the reserved core for the server/main thread).
+  - archived 16K + 512: 748.61/39.9 then 872.05/40.07 pp/s/tok/s (no decode change);
+  - Python-cache prompt, 2048 generated: 29.18 and 30.91 tok/s, up from 26.24 tok/s with 5 workers.
+- Tried the literal GPU-copy path: removed `--cpu-threads` so nonresident experts are copied over
+  PCIe and executed on the GPU. Even with memlock unlimited and cgroup limits up to 15.5 GB, the
+  process is killed (exit 137): the original path wants to pin the whole ~14.6 GB expert arena,
+  which does not fit in 15 GB RAM. This is a RAM-size limit, not the memlock limit.
+- A viable GPU-fetch path on this host would need to pin only a curated subset (~6-8 GB) and rewire
+  lazy mode to use the GPU expert cache instead of the CPU ring. Not implemented; it is a medium
+  engine change that needs a design decision and a measured A/B.
+- llama.cpp's mlock is different: it is an optional `mlock()` on an mmap'd GGUF and fails quietly
+  under an 8 MiB limit; CUDA pinned allocations use the driver and now work with the raised limit.
+  Strata's original offload wants `cudaHostRegister` on a 14.6 GB arena, which still cannot fit.
+- O_DIRECT / direct I/O is not wired into Strata's file-backed expert path. It would require aligned
+  reads into pinned staging buffers. The prefill path already uses pinned staging and GPU expert
+  math; decode does not.
+
+## GPU fetch result update
+
+`INK2_GPU_FETCH=1` in the Strata `feat-latest` worktree pins only evictable experts (8.19 GiB)
+and routes non-loop decode misses through the GPU cache. On the Python-cache prompt, decode rose
+from 26.5 to 48.3 tok/s. On archived 16K, decode stayed near 39 tok/s but prefill fell from about
+781 to 259 pp/s because the pinned arena reduces the page cache available to the mmap'd source.
+A smaller pinned staging pool is needed before this can replace the CPU path generally.

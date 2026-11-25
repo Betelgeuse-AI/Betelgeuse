@@ -109,6 +109,29 @@ void sess_init(int mib, int min_tokens) {
                          "conversations of %d+ tokens parked\n", mib, g_sess.tail_bytes / 1048576.0, g_sess.row_bytes / 1024.0, min_tokens);
 }
 
+void sess_rebind() {
+    if (!g_sess.on) return;
+    g_sess.full.clear();
+    g_sess.ring.clear();
+    for (int s = 0; s < NCALLS; ++s) {
+        Slot& S = E.S[s];
+        void* arr[4] = {S.K, S.V, S.ksc, S.vsc};
+        for (int a = 0; a < 4; ++a) {
+            const size_t b = kv_cell_bytes(a);
+            if (!b) continue;
+            (S.full ? g_sess.full : g_sess.ring).push_back({(uint8_t*) arr[a], b, S.cap});
+        }
+    }
+    if (D.on)
+        for (int i = 0; i < DL; ++i)
+            for (__half* x : {D.L[i].K, D.L[i].V}) (D.L[i].local ? g_sess.ring : g_sess.full).push_back({(uint8_t*) x, (size_t) KVD * 2, D.L[i].cap});
+    g_sess.tail_bytes = 0;
+    g_sess.row_bytes = 0;
+    for (auto& a : g_sess.ring) g_sess.tail_bytes += (size_t) WINDOW * a.b;
+    for (auto& c : g_sess.conv) g_sess.tail_bytes += c.second;
+    for (auto& a : g_sess.full) g_sess.row_bytes += a.b;
+}
+
 size_t sess_lcp(const std::vector<int>& a, const std::vector<int>& b) {
     size_t l = 0;
     while (l < a.size() && l < b.size() && a[l] == b[l]) ++l;
