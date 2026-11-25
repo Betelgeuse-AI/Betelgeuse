@@ -39,6 +39,7 @@
 #include <map>
 #include <memory>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -1350,12 +1351,16 @@ constexpr int FM = 64, FN = 64, FKK = 32;
 // (one block of 1024 threads; the order of the rows within an expert is not deterministic and does not matter: each
 // output row depends only on its own input row)
 __global__ void kb_moe_plan(const int* __restrict__ ids, int T, int* rows, int* slot, int* tile_e, int* tile_r0,
-                            int* ntiles, int* eoff, int* ecnt) {
+                            int* ntiles, int* eoff, int* ecnt, unsigned long long* route_counts, int layer) {
     __shared__ int cnt[NE], off[NE], cur[NE];
     const int n = T * TOPK;
     for (int e = threadIdx.x; e < NE; e += blockDim.x) { cnt[e] = 0; cur[e] = 0; }
     __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) atomicAdd(&cnt[ids[i]], 1);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int e = ids[i];
+        atomicAdd(&cnt[e], 1);
+        if (route_counts) atomicAdd(route_counts + (size_t) layer * NE + e, 1ull);
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
         int o = 0, nt = 0;
@@ -2392,9 +2397,11 @@ struct Ckpt {
 };
 
 size_t g_vram = 0;
+void vmm_drain_cached();
 
 void* dalloc(size_t bytes) {
     if (!bytes) return nullptr;   // an empty pool (GGUF: no MXFP8 slots)
+    vmm_drain_cached();
     void* d = nullptr;
     CK(cudaMalloc(&d, bytes));
     CK(cudaMemset(d, 0, bytes));
@@ -2425,6 +2432,21 @@ struct Vmm {
     decltype(&cuMemSetAccess) access = nullptr;
 };
 Vmm g_vmm;
+std::vector<CUmemGenericAllocationHandle> g_vmm_cached;
+size_t g_vmm_cached_bytes = 0;
+size_t g_vmm_reused_bytes = 0;
+void vmm_drain_cached() {
+    if (!g_vmm.ok || g_vmm_cached.empty()) return;
+    for (CUmemGenericAllocationHandle h : g_vmm_cached) {
+        if (g_vmm.release(h) != CUDA_SUCCESS) {
+            std::fprintf(stderr, "cuMemRelease of cached allocation failed\n");
+            std::exit(1);
+        }
+    }
+    g_vram -= g_vmm_cached_bytes;
+    g_vmm_cached.clear();
+    g_vmm_cached_bytes = 0;
+}
 template <class F> bool vmm_resolve(const char* name, F& f) {
     cudaDriverEntryPointQueryResult q{};
     void* p = nullptr;
@@ -2482,7 +2504,15 @@ struct VRange {
         acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         while (mapped < want) {
             CUmemGenericAllocationHandle hd = 0;
-            if (g_vmm.create(&hd, g_vmm.gran, &prop, 0) != CUDA_SUCCESS) return false;
+            if (!g_vmm_cached.empty()) {
+                hd = g_vmm_cached.back();
+                g_vmm_cached.pop_back();
+                g_vmm_cached_bytes -= g_vmm.gran;
+                g_vmm_reused_bytes += g_vmm.gran;
+            } else {
+                if (g_vmm.create(&hd, g_vmm.gran, &prop, 0) != CUDA_SUCCESS) return false;
+                g_vram += g_vmm.gran;
+            }
             if (g_vmm.map(base + mapped, g_vmm.gran, 0, hd, 0) != CUDA_SUCCESS ||
                 g_vmm.access(base + mapped, g_vmm.gran, &acc, 1) != CUDA_SUCCESS) {
                 std::fprintf(stderr, "cuMemMap failed\n");
@@ -2490,7 +2520,6 @@ struct VRange {
             }
             h.push_back(hd);
             mapped += g_vmm.gran;
-            g_vram += g_vmm.gran;
         }
         return true;
     }
@@ -2499,9 +2528,9 @@ struct VRange {
         while (mapped > want) {
             mapped -= g_vmm.gran;
             g_vmm.unmap(base + mapped, g_vmm.gran);
-            g_vmm.release(h.back());
+            g_vmm_cached.push_back(h.back());
+            g_vmm_cached_bytes += g_vmm.gran;
             h.pop_back();
-            g_vram -= g_vmm.gran;
         }
     }
 };
@@ -2627,6 +2656,7 @@ struct Engine {
     const uint8_t* home_d = nullptr;   // [NL * NE] the node holding expert (l, e) (E.home)
     unsigned *d_seq = nullptr, *d_cur = nullptr;
     float* cnt = nullptr;   // [NL * NE] decayed use counts (placement)
+    unsigned long long* prefill_routes = nullptr; // [NL * NE] routes observed in the current prompt
     SyncArgs sync = {};     // the PCIe share
     int *want_nv = nullptr, *want_mx = nullptr, *nwant_nv = nullptr, *nwant_mx = nullptr;
     int *pend_nv = nullptr, *pend_mx = nullptr, *npend_nv = nullptr, *npend_mx = nullptr;   // [i] = key, [PMAX + i] = slot
@@ -3384,11 +3414,17 @@ size_t kv_mapped_for(int cells) {
 
 // --kv-grow with offload: a pool's slot count changes.  Nothing may be running on the device; the decode graph (the
 // slot count is one of its launch arguments) is rebuilt at the next token.
-size_t vram_free() { size_t fr = 0, tot = 0; CK(cudaMemGetInfo(&fr, &tot)); return fr; }
+size_t vram_free() {
+    size_t fr = 0, tot = 0;
+    CK(cudaMemGetInfo(&fr, &tot));
+    return std::min(tot, fr + g_vmm_cached_bytes);
+}
 size_t vram_keep() { return ((size_t) std::max(E.reserve_mib, 0) << 20) + ((size_t) g_off_margin_mib << 20); }   // as setup_offload
 void promote_cancel();                   // (CPU experts)
 cudaGraphExec_t g_vexec[9][2] = {};      // verify graphs indexed by rows and argmax/sampling output
 int g_spec_draft_n_max = 0;
+extern bool g_pf_route_active;
+double now_ms();
 void pool_resize(bool nv, int n) {
     int& ns = nv ? E.nslot_nv : E.nslot_mx;
     VRange& r = nv ? E.vpool_nv : E.vpool_mx;
@@ -3419,38 +3455,76 @@ void refill_lazy_pool() {
     CK(cudaMemcpy(slot_of.data(), E.slot_of, slot_of.size() * sizeof(int), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(owner_nv.data(), E.owner_nv, owner_nv.size() * sizeof(int), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(owner_mx.data(), E.owner_mx, owner_mx.size() * sizeof(int), cudaMemcpyDeviceToHost));
-    const std::vector<int> order = expert_placement_order();
-    // desired set: the placement order's first nslot experts of each format; evict the rest
-    std::vector<uint8_t> desired((size_t) NL * NE, 0);
-    int left_nv = E.nslot_nv, left_mx = E.nslot_mx;
-    for (int key : order) {
-        int& left = ex_nv(key / NE) ? left_nv : left_mx;
-        if (left <= 0) continue;
-        desired[key] = 1;
-        --left;
-    }
-    int evicted = 0;
-    auto evict = [&](std::vector<int>& owners) {
-        for (int& key : owners) {
-            if (key < 0 || desired[key]) continue;
-            slot_of[key] = -1;
-            key = -1;
-            ++evicted;
+    const size_t count = (size_t) NL * NE;
+    std::vector<unsigned long long> prompt(count, 0);
+    std::vector<float> decode(count, 0.0f);
+    if (g_pf_route_active && E.prefill_routes)
+        CK(cudaMemcpy(prompt.data(), E.prefill_routes, count * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    if (E.cnt) CK(cudaMemcpy(decode.data(), E.cnt, count * sizeof(float), cudaMemcpyDeviceToHost));
+    std::vector<double> profile_sum(NL, 0.0), prompt_sum(NL, 0.0), decode_sum(NL, 0.0);
+    for (int l = 0; l < NL; ++l) {
+        for (int e = 0; e < NE; ++e) {
+            const size_t key = (size_t) l * NE + e;
+            if (E.expert_freq.size() == count) profile_sum[l] += E.expert_freq[key];
+            prompt_sum[l] += prompt[key];
+            decode_sum[l] += decode[key];
         }
+    }
+    float cpu_us_nv = 0.0f, cpu_us_mx = 0.0f;
+    std::vector<float> cpu_us_layer(NL, 0.0f);
+    for (int n = 0; n < E.cpu_nodes; ++n) {
+        if (!E.bell[n]) continue;
+        cpu_us_nv += E.bell[n]->us_job_nv;
+        cpu_us_mx += E.bell[n]->us_job_mx;
+        for (int l = 0; l < std::min(NL, ink2cpu::BELL_LAYERS); ++l) cpu_us_layer[l] += E.bell[n]->us_job_layer[l];
+    }
+    cpu_us_nv = cpu_us_nv > 0.0f ? cpu_us_nv / E.cpu_nodes : 1.0f;
+    cpu_us_mx = cpu_us_mx > 0.0f ? cpu_us_mx / E.cpu_nodes : 1.0f;
+    for (float& us : cpu_us_layer) us = us > 0.0f ? us / E.cpu_nodes : 0.0f;
+    const std::vector<int> order = expert_placement_order();
+    std::vector<int> rank(count, (int) count);
+    for (int i = 0; i < (int) order.size(); ++i) rank[order[i]] = i;
+    struct Candidate { int key; double score; bool loop_core; };
+    std::vector<Candidate> candidates_nv, candidates_mx;
+    candidates_nv.reserve(count);
+    candidates_mx.reserve(count);
+    for (int key = 0; key < NL * NE; ++key) {
+        if (slot_of[key] >= 0) continue;
+        const int l = key / NE;
+        const double profile = profile_sum[l] > 0.0 && E.expert_freq.size() == count
+            ? E.expert_freq[key] / profile_sum[l] : 0.0;
+        const double recent = prompt_sum[l] > 0.0 ? prompt[key] / prompt_sum[l] : 0.0;
+        const double decoded = decode_sum[l] > 0.0 ? decode[key] / decode_sum[l] : 0.0;
+        double demand = g_pf_route_active && prompt_sum[l] > 0.0
+            ? 0.70 * recent + 0.20 * profile + 0.10 * decoded
+            : 0.75 * profile + 0.25 * decoded;
+        if (demand == 0.0) demand = 1.0 / (double) (rank[key] + 1);
+        const bool nv = ex_nv(l);
+        const double bytes_mib = (nv ? NV_BYTES : MX_BYTES) / 1048576.0;
+        const double cpu_us = cpu_us_layer[l] > 0.0f ? cpu_us_layer[l] : nv ? cpu_us_nv : cpu_us_mx;
+        const bool loop_core = l >= LOOP_BEGIN && l < LOOP_END;
+        Candidate candidate{key, demand * cpu_us / bytes_mib, loop_core};
+        (nv ? candidates_nv : candidates_mx).push_back(candidate);
+    }
+    auto order_candidates = [](std::vector<Candidate>& candidates) {
+        std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+            if (a.loop_core != b.loop_core) return a.loop_core;
+            return a.score != b.score ? a.score > b.score : a.key < b.key;
+        });
     };
-    evict(owner_nv);
-    evict(owner_mx);
+    order_candidates(candidates_nv);
+    order_candidates(candidates_mx);
     std::vector<uint8_t> packed(MX_BYTES);
     size_t bytes = 0;
     int filled_nv = 0, filled_mx = 0;
-    auto fill = [&](bool nv, std::vector<int>& owners, int& filled) {
+    auto fill = [&](bool nv, std::vector<int>& owners, std::vector<Candidate>& candidates, int& filled) {
         size_t next = 0;
         for (int s = 0; s < (int) owners.size(); ++s) {
             if (owners[s] >= 0) continue;
             int key = -1;
-            while (next < order.size()) {
-                const int candidate = order[next++], l = candidate / NE;
-                if (ex_nv(l) == nv && desired[candidate] && slot_of[candidate] < 0) { key = candidate; break; }
+            while (next < candidates.size()) {
+                const int candidate = candidates[next++].key;
+                if (slot_of[candidate] < 0) { key = candidate; break; }
             }
             if (key < 0) break;
             const int l = key / NE;
@@ -3473,9 +3547,9 @@ void refill_lazy_pool() {
             ++filled;
         }
     };
-    fill(true, owner_nv, filled_nv);
-    fill(false, owner_mx, filled_mx);
-    if (!bytes && !evicted) return;
+    fill(true, owner_nv, candidates_nv, filled_nv);
+    fill(false, owner_mx, candidates_mx, filled_mx);
+    if (!bytes) return;
     std::fill(E.htabA.begin(), E.htabA.end(), nullptr);
     std::fill(E.htabB.begin(), E.htabB.end(), nullptr);
     for (int key = 0; key < NL * NE; ++key) {
@@ -3498,8 +3572,18 @@ void refill_lazy_pool() {
     CK(cudaMemcpy(&fetched, E.fbytes, sizeof(fetched), cudaMemcpyDeviceToHost));
     fetched += bytes;
     CK(cudaMemcpy(E.fbytes, &fetched, sizeof(fetched), cudaMemcpyHostToDevice));
-    std::fprintf(stderr, "pool refill: restored %d NVFP4 + %d MXFP8 experts (%.2f GiB), evicted %d\n", filled_nv, filled_mx,
-                 bytes / 1073741824.0, evicted);
+    std::fprintf(stderr, "pool refill: added %d NVFP4 + %d MXFP8 experts (%.2f GiB); existing residents kept\n", filled_nv,
+                 filled_mx, bytes / 1073741824.0);
+    double min_layer_cost = std::numeric_limits<double>::infinity(), max_layer_cost = 0.0;
+    for (int l = 0; l < NL; ++l) {
+        const double us = cpu_us_layer[l] > 0.0f ? cpu_us_layer[l] : (ex_nv(l) ? cpu_us_nv : cpu_us_mx);
+        const double cost = us / ((ex_nv(l) ? NV_BYTES : MX_BYTES) / 1048576.0);
+        min_layer_cost = std::min(min_layer_cost, cost);
+        max_layer_cost = std::max(max_layer_cost, cost);
+    }
+    std::fprintf(stderr, "pool admission: layer CPU cost %.2f-%.2f us/MiB; format means %.2f NVFP4, %.2f MXFP8; routes %s\n",
+                 min_layer_cost, max_layer_cost, cpu_us_nv / (NV_BYTES / 1048576.0), cpu_us_mx / (MX_BYTES / 1048576.0),
+                 g_pf_route_active ? "current prompt + profile + decode" : "profile + decode");
 }
 
 struct PoolShrinkPlan {
@@ -4208,6 +4292,10 @@ void setup_cpu() {
     }
     E.cnt = (float*) dalloc((size_t) NL * NE * 4);
     CK(cudaMemset(E.cnt, 0, (size_t) NL * NE * 4));
+    if (E.lazy_experts) {
+        E.prefill_routes = (unsigned long long*) dalloc((size_t) NL * NE * sizeof(unsigned long long));
+        CK(cudaMemset(E.prefill_routes, 0, (size_t) NL * NE * sizeof(unsigned long long)));
+    }
     g_promote_nv = std::min(g_promote_nv, PMAX);
     g_promote_mx = std::min(g_promote_mx, PMAX);
     const size_t bell_bytes = (sizeof(ink2cpu::InkBell) + 4095) & ~(size_t) 4095;
@@ -4529,6 +4617,8 @@ int g_dq_min = 4096;                  // INK2_DQ_MIN: prompt chunks from this si
 bool g_pf_routed = false;   // this chunk runs through the decode cache (short chunks): no streaming
 int g_pf_routed_max = 64;   // INK2_ROUTED_MAX: chunks of up to this many tokens fetch only the experts they route to
 bool g_pf_elastic = false;
+bool g_pf_route_active = false;
+size_t g_pf_peak_mapped = 0;
 std::vector<VRange> g_pfr;
 std::vector<int> g_pfr_whole;    // 1: parts at offsets of the full --chunk (the region, the fp16 input thirds), mapped
                                  // whole; 2: the staging halves (whole, and not at all for a routed short prompt)
@@ -4662,6 +4752,11 @@ void pf_map(int T) {
     for (size_t i = 0; i < g_pfr.size(); ++i)
         if (!g_pfr[i].map_to(want[i])) { std::fprintf(stderr, "prompt buffers: out of VRAM\n"); std::exit(1); }
     g_pf_mapped_T = T;
+    size_t mapped = 0;
+    for (const VRange& r : g_pfr) mapped += r.mapped;
+    g_pf_peak_mapped = std::max(g_pf_peak_mapped, mapped);
+    std::fprintf(stderr, "prefill workspace: chunk %d, mapped %zu MiB, peak %zu MiB\n", T, mapped >> 20,
+                 g_pf_peak_mapped >> 20);
 }
 #include "ink2_grow_guard.cuh"
 // the largest chunk (<= T, halving down to 256) whose prompt buffers and K/V growth leave each pool its FETCH_MAX
@@ -4686,10 +4781,23 @@ int pf_fit(int T, int pos0) {
 // after a prompt: the buffers' memory back to the pools
 void pf_unmap(bool refill) {
     if (g_pfr.empty() || !g_pf_mapped_T) return;
+    const double t0 = now_ms();
+    size_t unmapped = 0;
+    for (const VRange& r : g_pfr) unmapped += r.mapped;
+    const size_t reused0 = g_vmm_reused_bytes;
+    const int nv0 = E.nslot_nv, mx0 = E.nslot_mx;
     CK(cudaDeviceSynchronize());
     for (auto& r : g_pfr) r.unmap_to(0);
     g_pf_mapped_T = 0;
     pools_fill(refill);
+    if (refill) {
+        const double elapsed = now_ms() - t0;
+        g_pf_route_active = false;
+        std::fprintf(stderr,
+                     "prefill->decode: released %zu MiB, reused %zu MiB, transition %.1f ms, experts %d + %d (%+d + %+d), cached VMM %zu MiB\n",
+                     unmapped >> 20, (g_vmm_reused_bytes - reused0) >> 20, elapsed, E.nslot_nv, E.nslot_mx,
+                     E.nslot_nv - nv0, E.nslot_mx - mx0, g_vmm_cached_bytes >> 20);
+    }
 }
 void pf_unmap() { pf_unmap(true); }
 
@@ -4946,7 +5054,8 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
             PF.verify_nonres.push_back(e);
         }
     }
-    kb_moe_plan<<<1, 1024>>>(PF.ids, T, PF.rows, PF.slot, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt);
+    kb_moe_plan<<<1, 1024>>>(PF.ids, T, PF.rows, PF.slot, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt,
+                             g_pf_route_active && !PF.rows_argmax ? E.prefill_routes : nullptr, l);
     if (cpu_verify) k_cache_cpu_batch<<<1, 256>>>(l, T, PF.ids, PF.slot, x, X.tA, E.bell_d, E.cpu_nodes, E.d_seq,
                                                   E.d_cur, PF.verify_cpu_unique, PF.verify_cpu_rows);
     const int nr = T * TOPK, maxt = nr / FM + NE;
@@ -5630,6 +5739,10 @@ void draft_device(int p) {
 
 void forward_prefill_device(int T, int pos0, float* all);
 void forward_prefill(const int* toks, int T, int pos0, float* all) {
+    if (E.prefill_routes && !PF.rows_argmax && !g_pf_route_active) {
+        CK(cudaMemset(E.prefill_routes, 0, (size_t) NL * NE * sizeof(unsigned long long)));
+        g_pf_route_active = true;
+    }
     kv_fit(pos0 + T);
     pf_layout(T);   // (before the pools are read below: a growth can take slots)
     const bool cpu_verify = PF.rows_argmax && E.cpu && E.lazy_experts;
@@ -5970,7 +6083,19 @@ int ink2_engine_main(int argc, char** argv) {
     const double t_load = now_ms();
     if (g_is_gguf) load_gguf();
     else load();
-    if (PF.TP > 0) PF_RING_EXTRA = PF.TP;
+    if (PF.TP > 0) {
+        PF_RING_EXTRA = PF.TP;
+        if (const char* p = std::getenv("INK2_RING_EXTRA")) {
+            const int extra = std::atoi(p);
+            if (extra > 0) {
+                if (extra < PF.TP || extra > E.ctx) {
+                    std::fprintf(stderr, "INK2_RING_EXTRA must be between --chunk and --max-context\n");
+                    return 2;
+                }
+                PF_RING_EXTRA = extra;
+            }
+        }
+    }
     alloc_state();
     // Small-batch DSpark uses a compact verify workspace after the prompt buffers are released.
     g_pf_elastic = E.grow && E.offload && (!spec || g_spec_draft_n_max > 0);

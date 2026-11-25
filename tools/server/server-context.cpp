@@ -1515,6 +1515,7 @@ private:
             set_engine_env("INK2_OFF_MARGIN_MIB", "64");
             set_engine_env("INK2_MX_POOL_FRACTION", "0.08");
             set_engine_env("INK2_PIN_HOST_MIB", "512");
+            set_engine_env("INK2_RING_EXTRA", "0");
             unsetenv("INK2_NUMA_POOL");
             unsetenv("INK2_SPEC_DRAFT_N_MAX");
             unsetenv("INK2_SPEC_FORCE");
@@ -1552,8 +1553,18 @@ private:
                 throw std::runtime_error("direct checkpoint KV supports -ctk q8_0 -ctv q4_0 or the default KV mode");
             }
 
-            // 4K chunks keep decode throughput; 8K hurts the post-prefill pool refill.
-            const int chunk = 4096;
+            // 4K chunks keep decode throughput; test overrides require INK2_ALLOW_TUNING_OVERRIDE.
+            int chunk = 4096;
+            if (allow_tuning_override) {
+                if (const char * env = std::getenv("INK2_CHUNK"); env != nullptr && env[0] != '\0') {
+                    char * end = nullptr;
+                    const long value = std::strtol(env, &end, 10);
+                    if (end == env || *end != '\0' || value < 256 || value > n_ctx) {
+                        throw std::runtime_error("INK2_CHUNK must be between 256 and the context size");
+                    }
+                    chunk = (int) value;
+                }
+            }
             std::vector<std::string> args = {
                 "bel-inkling2", "--model", dir.string(), "--serve", "--max-context", std::to_string(n_ctx),
                 "--chunk", std::to_string(chunk), "--graph", "1", "--tc", "1", "--kv", direct_kv,

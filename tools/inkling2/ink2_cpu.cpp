@@ -682,6 +682,12 @@ void master(Node* N) {
         if (nj) {   // the node's time per job for the GPU's PCIe share (the ring seen -> the ack, over 16 visits)
             const float us = (float) (1e3 * (last - t_ring) / nj);
             B->us_job = B->us_job > 0.0f ? B->us_job + (us - B->us_job) / 16.0f : us;
+            volatile float& format_us = l < S.mx_first ? B->us_job_nv : B->us_job_mx;
+            format_us = format_us > 0.0f ? format_us + (us - format_us) / 16.0f : us;
+            if (l < BELL_LAYERS) {
+                volatile float& layer_us = B->us_job_layer[l];
+                layer_us = layer_us > 0.0f ? layer_us + (us - layer_us) / 16.0f : us;
+            }
         }
         if (g_trace) {   // per node, every 2000 rings: busy visits, us from the ring seen to the ack by jobs per visit,
                          // and the master's phases per busy visit

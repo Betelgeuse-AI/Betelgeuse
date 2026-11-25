@@ -18,11 +18,15 @@
 namespace ink2cpu {
 
 constexpr int BELL_H = 2304, BELL_T = 8, BELL_K = 8 * BELL_T;
+constexpr int BELL_LAYERS = 24;
 struct InkBell {   // one per node in its memory, registered mapped; GPU writes ring/job/x, the node's pool y/ack
     volatile unsigned ring;            // sequence number of the last visit with CPU jobs
     unsigned pad0[15];
     volatile unsigned ack[2];          // [node]: the last sequence number done (written in that node's bell)
     volatile float us_job;             // the pool's time per job, us (moving average; the GPU's PCIe share reads it)
+    volatile float us_job_nv;
+    volatile float us_job_mx;
+    volatile float us_job_layer[BELL_LAYERS];
     unsigned pad1[13];
     int layer, n, t;                   // the visit's layer, number of jobs and input rows
     int k[BELL_K], e[BELL_K], count[BELL_K];
