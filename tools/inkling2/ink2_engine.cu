@@ -99,6 +99,8 @@ constexpr int LOOP_NV_SLOTS = NLOOP * NE;
 constexpr int NCALLS = NL + (PASSES - 1) * NLOOP;
 constexpr int MXFP8_FIRST = 20;
 constexpr float EPS = 1e-6f, QK_CLIP = 22.627416997969522f, REL_CLIP = 8.0f, LOG_ALPHA = 0.1f, LOG_FLOOR = 8192.0f;
+void invalidate_engine_graphs();
+void gpu_fetch_enable();
 constexpr float GATE_CAP = 4.0f, UP_CAP = 25.0f, ROUTE_SCALE = 8.0f, LOGIT_CAP = 30.0f;
 constexpr int CHUNK = 256;   // attention positions per block
 int PF_RING_EXTRA = 512;     // = the prefill chunk: a chunk's keys must not evict the window of its first query
@@ -919,33 +921,22 @@ __global__ void k_attn_prep(float* q, const float* q_scale, float* rs, const flo
 }
 
 // partial attention over the NREP q heads of one KV head: the K / V rows are loaded once per block
-__global__ void k_attn_partial_gqa(const float* __restrict__ q, const void* __restrict__ K, const void* __restrict__ V,
-                                   const __half* __restrict__ ksc, const __half* __restrict__ vsc, const float* __restrict__ rel,
-                                   int cap, int window, const int* d_pos, float* __restrict__ pm, float* __restrict__ pl,
-                                   float* __restrict__ po) {
-    __shared__ __align__(16) float qs[NREP][HD];
-    __shared__ float lg[NREP][CHUNK];
-    __shared__ float4 red[NREP][4][HD / 4];
-    const int g = blockIdx.x, c = blockIdx.y, tid = threadIdx.x, lane = tid & 31, wp = tid / 32;
-    const int h0 = g * NREP;
+__global__ void k_attn_partial(const float* __restrict__ q, const void* __restrict__ K, const void* __restrict__ V,
+                               const __half* __restrict__ ksc, const __half* __restrict__ vsc, const float* __restrict__ rel, int cap, int window, const int* d_pos,
+                               float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ po) {
+    __shared__ __align__(16) float qs[HD];
+    __shared__ float lg[CHUNK];
+    const int h = blockIdx.x, c = blockIdx.y, g = h / NREP, tid = threadIdx.x, lane = tid & 31, wp = tid / 32;
     const int pos = *d_pos;
-    const int span = window > 0 ? min(pos + 1, window) : pos + 1;
+    const int span = window > 0 ? min(pos + 1, window) : pos + 1;   // distances 0 .. span-1
     const int d0 = c * CHUNK, n = min(CHUNK, span - d0);
-    const size_t nch = gridDim.y;
+    const size_t part = (size_t) h * gridDim.y + c;
     if (n <= 0) {
-        if (!tid)
-#pragma unroll
-            for (int ri = 0; ri < NREP; ++ri) {
-                const size_t part = (size_t) (h0 + ri) * nch + c;
-                pm[part] = -INFINITY;
-                pl[part] = 0.0f;
-            }
-#pragma unroll
-        for (int ri = 0; ri < NREP; ++ri) po[((size_t) (h0 + ri) * nch + c) * HD + tid] = 0.0f;
+        if (!tid) { pm[part] = -INFINITY; pl[part] = 0.0f; }
+        po[part * HD + tid] = 0.0f;
         return;
     }
-#pragma unroll
-    for (int ri = 0; ri < NREP; ++ri) qs[ri][tid] = q[(h0 + ri) * HD + tid];
+    qs[tid] = q[h * HD + tid];
     __syncthreads();
     const float scale = rsqrtf((float) HD);
     // ring slot of distance d0 + k: r0 - k, wrapped once (k < CHUNK <= cap)
@@ -953,94 +944,65 @@ __global__ void k_attn_partial_gqa(const float* __restrict__ q, const void* __re
     // q.k: 8 lanes per position (4 positions per warp, 16 per block step), each lane 4 float4 of the row
     {
         const int sub = lane & 7;
+        const float4* q4 = reinterpret_cast<const float4*>(qs);
         for (int k0 = wp * 4; k0 < n; k0 += 16) {
             const int k = k0 + (lane >> 3);
-            float a[NREP] = {};
+            float a = 0.0f;
             if (k < n) {
-                const int row = r0 - k < 0 ? r0 - k + cap : r0 - k;
+                const int r = r0 - k < 0 ? r0 - k + cap : r0 - k;
                 float4 kv[4];
 #pragma unroll
-                for (int u = 0; u < 4; ++u) kv[u] = kv_ld4<false>(K, ksc, (size_t) row, g * HD + 4 * (sub + 8 * u));
+                for (int u = 0; u < 4; ++u) kv[u] = kv_ld4<false>(K, ksc, (size_t) r, g * HD + 4 * (sub + 8 * u));
 #pragma unroll
-                for (int ri = 0; ri < NREP; ++ri) {
-                    const float4* q4 = reinterpret_cast<const float4*>(qs[ri]);
-#pragma unroll
-                    for (int u = 0; u < 4; ++u) {
-                        const float4 qv = q4[sub + 8 * u];
-                        a[ri] += qv.x * kv[u].x + qv.y * kv[u].y + qv.z * kv[u].z + qv.w * kv[u].w;
-                    }
+                for (int u = 0; u < 4; ++u) {
+                    const float4 qv = q4[sub + 8 * u];
+                    a += qv.x * kv[u].x + qv.y * kv[u].y + qv.z * kv[u].z + qv.w * kv[u].w;
                 }
             }
-#pragma unroll
-            for (int ri = 0; ri < NREP; ++ri) {
-                a[ri] += __shfl_xor_sync(0xffffffffu, a[ri], 4);
-                a[ri] += __shfl_xor_sync(0xffffffffu, a[ri], 2);
-                a[ri] += __shfl_xor_sync(0xffffffffu, a[ri], 1);
-            }
+            a += __shfl_xor_sync(0xffffffffu, a, 4);
+            a += __shfl_xor_sync(0xffffffffu, a, 2);
+            a += __shfl_xor_sync(0xffffffffu, a, 1);
             const int dist = d0 + k;
-            if (!sub && k < n) {
-#pragma unroll
-                for (int ri = 0; ri < NREP; ++ri)
-                    lg[ri][k] = a[ri] * scale + (dist < EXTENT ? rel[(h0 + ri) * EXTENT + dist] : 0.0f);
-            }
+            if (!sub && k < n) lg[k] = a * scale + (dist < EXTENT ? rel[h * EXTENT + dist] : 0.0f);
         }
     }
     __syncthreads();
-    float mx[NREP], s[NREP];
-#pragma unroll
-    for (int ri = 0; ri < NREP; ++ri) {
-        mx[ri] = -INFINITY;
-        for (int k = tid; k < n; k += blockDim.x) mx[ri] = fmaxf(mx[ri], lg[ri][k]);
-        mx[ri] = block_max(mx[ri]);
-        s[ri] = 0.0f;
-        for (int k = tid; k < n; k += blockDim.x) {
-            lg[ri][k] = expf(lg[ri][k] - mx[ri]);
-            s[ri] += lg[ri][k];
-        }
-        s[ri] = block_sum(s[ri]);
-    }
+    float mx = -INFINITY;
+    for (int k = tid; k < n; k += blockDim.x) mx = fmaxf(mx, lg[k]);
+    mx = block_max(mx);
+    float s = 0.0f;
+    for (int k = tid; k < n; k += blockDim.x) { lg[k] = expf(lg[k] - mx); s += lg[k]; }
+    s = block_sum(s);   // block_sum syncs, lg visible after
     __syncthreads();
-    // p.V: warp wp takes positions wp, wp + 4, ...; lane holds dims 4 lane .. 4 lane + 3; the 4 partial rows summed through smem
-    float4 o4[NREP];
-#pragma unroll
-    for (int ri = 0; ri < NREP; ++ri) o4[ri] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // p.V: warp wp takes positions wp, wp + 4, ...; lane holds dims 4 lane .. 4 lane + 3; the 4 partial rows summed
+    // through smem (positions spread over the warps: 4x more loads in flight than one position per block step)
+    __shared__ float4 red[4][HD / 4];
+    float4 o4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     const int ve = g * HD + 4 * lane;
-    // k8v4's V loads in a loop of their own: the format test inside the loop is slower
+    // k8v4's V loads in a loop of their own: its format test inside the loop slowed this kernel 13.6 -> 23.8 us (f16)
     if (c_kvm == 4) {
 #pragma unroll 4
         for (int k = wp; k < n; k += 4) {
-            const int row = r0 - k < 0 ? r0 - k + cap : r0 - k;
-            const float4 v = kv_ld4<true>(V, vsc, (size_t) row, ve);
-#pragma unroll
-            for (int ri = 0; ri < NREP; ++ri) {
-                const float pk = lg[ri][k];
-                o4[ri].x += pk * v.x; o4[ri].y += pk * v.y; o4[ri].z += pk * v.z; o4[ri].w += pk * v.w;
-            }
+            const int r = r0 - k < 0 ? r0 - k + cap : r0 - k;
+            const float4 v = kv_ld4<true>(V, vsc, (size_t) r, ve);
+            const float pk = lg[k];
+            o4.x += pk * v.x; o4.y += pk * v.y; o4.z += pk * v.z; o4.w += pk * v.w;
         }
-    } else {
+    } else {   // V as K in the other formats
 #pragma unroll 4
         for (int k = wp; k < n; k += 4) {
-            const int row = r0 - k < 0 ? r0 - k + cap : r0 - k;
-            const float4 v = kv_ld4<false>(V, vsc, (size_t) row, ve);
-#pragma unroll
-            for (int ri = 0; ri < NREP; ++ri) {
-                const float pk = lg[ri][k];
-                o4[ri].x += pk * v.x; o4[ri].y += pk * v.y; o4[ri].z += pk * v.z; o4[ri].w += pk * v.w;
-            }
+            const int r = r0 - k < 0 ? r0 - k + cap : r0 - k;
+            const float4 v = kv_ld4<false>(V, vsc, (size_t) r, ve);
+            const float pk = lg[k];
+            o4.x += pk * v.x; o4.y += pk * v.y; o4.z += pk * v.z; o4.w += pk * v.w;
         }
     }
-#pragma unroll
-    for (int ri = 0; ri < NREP; ++ri) red[ri][wp][lane] = o4[ri];
+    red[wp][lane] = o4;
     __syncthreads();
     const float* rf = reinterpret_cast<const float*>(red);
-#pragma unroll
-    for (int ri = 0; ri < NREP; ++ri) {
-        const size_t part = (size_t) (h0 + ri) * nch + c;
-        const int base = ri * 4 * HD;
-        const float o = rf[base + tid] + rf[base + HD + tid] + rf[base + 2 * HD + tid] + rf[base + 3 * HD + tid];
-        if (!tid) { pm[part] = mx[ri]; pl[part] = s[ri]; }
-        po[part * HD + tid] = o;
-    }
+    const float o = rf[tid] + rf[HD + tid] + rf[2 * HD + tid] + rf[3 * HD + tid];
+    if (!tid) { pm[part] = mx; pl[part] = s; }
+    po[part * HD + tid] = o;
 }
 
 // merge the chunks of each head with its sink logit (zero value); out[h][HD]
@@ -2660,6 +2622,7 @@ struct Engine {
     int* fetch_stats = nullptr;          // [fetches, hits, evictions, cpu-eligible misses]
     std::vector<uint8_t*> xh;            // [NL * NE] host address of expert (l, e) (regions placed per NUMA node)
     std::vector<ink2cpu::ExpertParts> expert_parts; // [NL * NE] source tensor views for lazy offload
+    std::vector<ink2cpu::ExpertParts> orig_expert_parts; // mmap views saved before early pin
     uint8_t* pinned_host_experts = nullptr;
     size_t pinned_host_expert_bytes = 0;
     std::vector<uint32_t> expert_freq;   // optional route counts for initial expert placement
@@ -2982,6 +2945,7 @@ void load() {
         CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
         CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
     }
+    if (E.gpu_fetch && std::getenv("INK2_GPU_FETCH_EARLY")) gpu_fetch_enable();
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -3995,7 +3959,7 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
         k_attn_prep<false><<<2 * NQ + NKV, 128>>>(q, Y.q_scale, rs, Y.rel_scale, Y.rel_proj, E.rel, 0, k, v, S.khist,
                                                  S.vhist, Y.k_conv, Y.v_conv, S.K, S.V, S.ksc, S.vsc, S.cap, E.d_pos);
     const int nch = S.full ? E.nchunk_full : E.nchunk_slide;
-    k_attn_partial_gqa<<<dim3(NKV, nch), 128>>>(q, S.K, S.V, S.ksc, S.vsc, E.rel, S.cap, S.full ? 0 : WINDOW, E.d_pos, E.pm, E.pl, E.po);
+    k_attn_partial<<<dim3(NQ, nch), 128>>>(q, S.K, S.V, S.ksc, S.vsc, E.rel, S.cap, S.full ? 0 : WINDOW, E.d_pos, E.pm, E.pl, E.po);
     k_attn_merge<<<NQ, HD>>>(E.pm, E.pl, E.po, nch, sink, gate, E.att);
     gemv(Y.wo, E.att, E.attn_out);
 }
@@ -4527,6 +4491,7 @@ void gpu_fetch_release() {
     if (E.fetch_stats) CK(cudaMemset(E.fetch_stats, 0, 4 * sizeof(int)));
     if (E.xsrc_d) CK(cudaMemset(E.xsrc_d, 0, (size_t) NL * NE * sizeof(void*)));
     if (E.pinned_host_experts) { cudaFreeHost(E.pinned_host_experts); E.pinned_host_experts = nullptr; }
+    if (!E.orig_expert_parts.empty()) { E.expert_parts = E.orig_expert_parts; E.orig_expert_parts.clear(); }
     E.pinned_host_expert_bytes = 0;
     std::memset(E.fetch_layer, 0, sizeof(E.fetch_layer));
     E.gpu_fetch_active = false;
@@ -4565,6 +4530,7 @@ void gpu_fetch_enable() {
     CK(cudaMemset(E.xsrc_d, 0, count * sizeof(void*)));
     CK(cudaMemset(E.fetch_ok_d, 0, count));
     CK(cudaMemset(E.fetch_stats, 0, 4 * sizeof(int)));
+    E.orig_expert_parts = E.expert_parts;
     std::vector<const uint8_t*> dev(count, nullptr);
     std::vector<uint8_t> ok(count, 0);
     size_t off = 0;
@@ -4583,6 +4549,9 @@ void gpu_fetch_enable() {
         dev[k] = (const uint8_t*) dv;
         ok[k] = 1;
         E.fetch_layer[l] = 1;
+        E.expert_parts[k] = {d, d + p.w13_bytes, d + p.w13_bytes + p.s13_bytes,
+                             d + p.w13_bytes + p.s13_bytes + p.w2_bytes,
+                             p.w13_bytes, p.s13_bytes, p.w2_bytes, p.s2_bytes};
         off += (eb + 255) & ~(size_t) 255;
     }
     CK(cudaMemcpy(E.xsrc_d, dev.data(), count * sizeof(void*), cudaMemcpyHostToDevice));

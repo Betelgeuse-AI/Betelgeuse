@@ -1,0 +1,1 @@
+Implement a token-bucket rate limiter in Python with thread-safe refill, configurable capacity and rate, and blocking and non-blocking acquire modes. Include type hints, docstrings, edge cases, and pytest tests that check burst behaviour and refill timing.

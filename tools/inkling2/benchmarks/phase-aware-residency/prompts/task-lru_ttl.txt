@@ -1,0 +1,1 @@
+Write a complete Python implementation of a thread-safe LRU cache with TTL expiration. Use OrderedDict and threading.RLock. Support get, put, delete, clear, automatic eviction, cache hit and miss statistics, and per-key expiration. Include type hints, docstrings, edge case handling and comprehensive unit tests. Write the complete implementation without skipping any methods.

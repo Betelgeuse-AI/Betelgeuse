@@ -1,0 +1,1 @@
+Reason step by step about diagnosing a race condition in a multithreaded Python service that uses a shared counter and a background thread pool. Explain what evidence to collect, how to reproduce it, and write a minimal corrected implementation with locks and tests.

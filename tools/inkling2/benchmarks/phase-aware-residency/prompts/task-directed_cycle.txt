@@ -1,0 +1,1 @@
+Write a Python function that detects a cycle in a directed graph and returns the cycle path. Include type hints, handle disconnected components, explain the algorithm, and provide pytest unit tests covering self-loops and multiple cycles.

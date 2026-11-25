@@ -1,0 +1,1 @@
+Given a set of database transactions with read and write sets, reason about whether the schedule is conflict-serializable. Build the precedence graph, detect cycles, and write Python code that returns a valid serial order or reports a cycle. Include tests.

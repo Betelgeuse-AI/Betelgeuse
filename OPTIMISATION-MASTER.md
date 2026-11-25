@@ -275,3 +275,42 @@ disable was added.
 - Ordinary Bel decode remains 36.2 tok/s because generated tokens diverge from Strata at near-ties.
 - Do not add further scheduling or kernel work to chase this; the next step is numeric/logit parity
   of the attention/GEMV path that decides those tokens.
+
+## Natural-routing multi-task benchmark (2026-11-25)
+
+Five distinct real programming/reasoning tasks, 512 generated tokens each, natural generation,
+identical prompts and settings for both engines (i8r, chunk 4096, graph 1, spec 0, 1 CPU thread,
+KV growth, 256K route profile, cgroup 14 GB). No forced routing and no archived word-salad prompt.
+
+| Task | Strata decode | Strata H2D/token | Bel decode | Bel H2D/token | Bel fetches/token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| LRU + TTL implementation | 49.2 tok/s | 2.4 MB | 36.3 tok/s | 172.5 MB | 26.4 |
+| Directed cycle detection | 47.8 tok/s | 17.2 MB | 37.1 tok/s | 160.0 MB | 24.4 |
+| Race-condition reasoning | 47.8 tok/s | 17.3 MB | 39.5 tok/s | 121.2 MB | 18.5 |
+| Token-bucket rate limiter | 36.8 tok/s | 158.4 MB | 36.3 tok/s | 171.7 MB | 26.1 |
+| Serializability reasoning | 42.8 tok/s | 72.5 MB | 37.4 tok/s | 155.4 MB | 23.2 |
+
+Medians: Strata 47.8 tok/s, Bel 37.1 tok/s. Strata itself ranges from 36.8 to 49.2 tok/s
+depending on natural routing, so 48-50 tok/s is not universal even on Strata. Bel does not reach
+the 48 tok/s class on any natural prompt in this set.
+
+`INK2_GPU_FETCH_EARLY=1` was added to pin the packed arena before prefill, matching Strata's
+startup placement. It did not change Bel's natural first token or decode rate. Porting Strata's
+per-query-head `k_attn_partial` into Bel also made no difference. The first divergence is not in
+those two paths.
+
+Forced routing remains a diagnostic only: with identical expert routes Bel reached 47.8 tok/s and
+about 2.2 fetches/token, proving the cache implementation is equivalent. The natural gap is driven
+by generated-token divergence and consequent cold routing. This is not yet resolved.
+
+## KV-growth status
+
+Fetch state is suspended (masks cleared, graphs invalidated, arena retained) when a pool shrinks,
+but the coherent 16K source-review prompt still hits an illegal memory access after the MX pool
+shrinks from 90 to 84 slots. It has not been fixed. CPU fallback remains stable for that workload.
+No permanent disable was added.
+
+## Do not use for accepted measurements
+
+- forced routing;
+- archived word-salad prompt.
