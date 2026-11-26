@@ -2278,7 +2278,7 @@ __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArg
             }
             const int key = l * NE + e;
             const int sl = c.slot_of[key];
-            if (c.cnt) c.cnt[key] += 1.0f;
+            if (c.cnt) c.cnt[key] = fminf(4.0f, c.cnt[key] + 1.0f);
             if (sl >= 0) {
                 c.stamp[sl] = ++t;
                 pin[np++] = sl;
@@ -2320,18 +2320,22 @@ __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArg
         __syncthreads();
         if (threadIdx.x == 0) {
             for (int w = 1; w < (int) (blockDim.x / 32); ++w) best = min(best, wmin[w]);
-            const int v = (int) (best & (use_lfu ? 0xffffu : 0xffffffffu)), e = miss[m], key = l * NE + e, old = c.owner[v];
-            if (c.fetch_stats) { atomicAdd(&c.fetch_stats[0], 1); if (old >= 0) atomicAdd(&c.fetch_stats[2], 1); }
-            if (old >= 0) { c.slot_of[old] = -1; c.tabA[old] = nullptr; c.tabB[old] = nullptr; }
-            uint8_t* d = c.pool + (size_t) v * c.eb;
-            c.owner[v] = key;
-            c.slot_of[key] = v;
-            c.stamp[v] = ++clk;
-            pin[npin++] = v;
-            c.tabA[key] = d;
-            c.tabB[key] = d + c.partA;
-            c.fsrc[m] = c.host[e];
-            c.fdst[m] = d;
+            if (best == ~0ull) {
+                nm = m;
+            } else {
+                const int v = (int) (best & (use_lfu ? 0xffffu : 0xffffffffu)), e = miss[m], key = l * NE + e, old = c.owner[v];
+                if (c.fetch_stats) { atomicAdd(&c.fetch_stats[0], 1); if (old >= 0) atomicAdd(&c.fetch_stats[2], 1); }
+                if (old >= 0) { c.slot_of[old] = -1; c.tabA[old] = nullptr; c.tabB[old] = nullptr; }
+                uint8_t* d = c.pool + (size_t) v * c.eb;
+                c.owner[v] = key;
+                c.slot_of[key] = v;
+                c.stamp[v] = ++clk;
+                pin[npin++] = v;
+                c.tabA[key] = d;
+                c.tabB[key] = d + c.partA;
+                c.fsrc[m] = c.host[e];
+                c.fdst[m] = d;
+            }
         }
         __syncthreads();
     }
@@ -2351,9 +2355,9 @@ __global__ void k_fetch(const uint8_t* const* __restrict__ fsrc, uint8_t* const*
     size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     for (; i + 3 * st < n; i += 4 * st) {
         const uint4 a = src[i], b = src[i + st], cc = src[i + 2 * st], d = src[i + 3 * st];
-        dst[i] = a; dst[i + st] = b; dst[i + 2 * st] = cc; dst[i + 3 * st] = d;
+        __stwt(dst + i, a); __stwt(dst + i + st, b); __stwt(dst + i + 2 * st, cc); __stwt(dst + i + 3 * st, d);
     }
-    for (; i < n; i += st) dst[i] = src[i];
+    for (; i < n; i += st) __stwt(dst + i, src[i]);
 }
 
 // --kv-grow: slots [from, to) leave a pool: their experts out of the tables (the next use fetches them again)
@@ -3350,7 +3354,18 @@ void load_gguf() {
 // CPU-expert staging).  Measured on the 3090 at 8 GiB (reserve 15946, nvidia-smi peak): 17-31 MiB used after the pools
 // with --tc 0 / 1, --cpu-threads 22, --spec 1, a 6000-token prompt at chunk 1024; 128 leaves ~100 MiB to spare.
 int g_off_margin_mib = 128;
-float g_off_mx_fraction = 0.15f;
+float g_off_mx_fraction = -1.0f;
+float g_off_mx_evict_frac = 0.48f;
+int mx_slots_for_budget(size_t budget) {
+    if (g_is_gguf) return 0;
+    const size_t mx_cap = (size_t) (NL - MXFP8_FIRST) * NE;
+    if (g_off_mx_fraction > 0.0f) {
+        return (int) std::min<size_t>((size_t) (budget * g_off_mx_fraction) / MX_BYTES, mx_cap);
+    }
+    const size_t core = (size_t) LOOP_NV_SLOTS * NV_BYTES;
+    const size_t evict = budget > core ? budget - core : 0;
+    return (int) std::clamp<size_t>((size_t) (evict * g_off_mx_evict_frac) / MX_BYTES, FETCH_MAX, mx_cap);
+}
 std::vector<int> expert_placement_order() {
     std::vector<int> order;
     order.reserve((size_t) NL * NE);
@@ -3376,7 +3391,7 @@ void setup_offload() {
         E.nslot_mx = 0;
         E.nslot_nv = (int) std::min<size_t>(budget / ex_bytes(0), (size_t) NL * NE);
     } else {
-        E.nslot_mx = (int) std::min<size_t>((size_t) (budget * g_off_mx_fraction) / MX_BYTES, (size_t) (NL - MXFP8_FIRST) * NE);
+        E.nslot_mx = mx_slots_for_budget(budget);
         E.nslot_nv = (int) std::min<size_t>((budget - (size_t) E.nslot_mx * MX_BYTES) / NV_BYTES, (size_t) MXFP8_FIRST * NE);
     }
     if (E.nslot_nv < FETCH_MAX || (!g_is_gguf && E.nslot_mx < FETCH_MAX)) {
@@ -3449,7 +3464,11 @@ void setup_offload() {
     E.hit_ids = (int*) dalloc(TOPK * 4);
     E.miss_ids = (int*) dalloc(TOPK * 4);
     if (!E.cnt) E.cnt = dfloats((size_t) NL * NE);
-    CK(cudaStreamCreateWithFlags(&E.fetch_stream, cudaStreamNonBlocking));
+    {
+        int low_p = 0, high_p = 0;
+        CK(cudaDeviceGetStreamPriorityRange(&low_p, &high_p));
+        CK(cudaStreamCreateWithPriority(&E.fetch_stream, cudaStreamNonBlocking, high_p));
+    }
     CK(cudaEventCreateWithFlags(&E.ev_fetch_start, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&E.ev_fetch_done, cudaEventDisableTiming));
     E.fsrc = (const uint8_t**) dalloc(FETCH_MAX * sizeof(void*));
@@ -3775,6 +3794,11 @@ void pools_fill(bool refill = true) {
     if (!E.offload || !E.grow) return;
     const int old_nv = E.nslot_nv, old_mx = E.nslot_mx;
     const size_t keep = vram_keep() + 4 * g_vmm.gran;
+    const size_t fr0 = vram_free();
+    if (!g_is_gguf && fr0 > keep) {
+        const size_t cur_budget = (size_t) E.nslot_nv * ex_bytes(0) + (size_t) E.nslot_mx * MX_BYTES + (fr0 - keep);
+        E.mx_target = mx_slots_for_budget(cur_budget);
+    }
     if (E.nslot_mx < E.mx_target && E.vpool_mx.reserved) {
         const size_t fr = vram_free();
         if (fr > keep) {
@@ -4111,7 +4135,7 @@ void expert_cache(int l, const int* ids, int n, bool overlap = false) {
 // tok/s, 8 threads 52.4 -> 52.8; the 2 x 22-thread box 66.4 -> 65-66 (it rarely fires there).
 constexpr int WANT_MAX = 64, PMAX = 32;
 bool g_place_freq = true;
-float g_decay = 0.97f, g_gain = 1.0f;
+float g_decay = 0.96f, g_gain = 1.0f;
 int g_bg_blocks = 4;   // INK2_BG_BLOCKS (12 GiB, q1 chat: 4 and 8 blocks 69.8 / 68.9 tok/s, 16: 65.8)
 int g_promote_nv = 12, g_promote_mx = 3;   // per token (INK2_PROMOTE=nv,mx): ~54 + 25 MB of PCIe in the background
 __global__ void k_cache_cpu(int l, const int* __restrict__ ids, const float* __restrict__ x, int* slot_of, unsigned* stamp,
@@ -4125,7 +4149,7 @@ __global__ void k_cache_cpu(int l, const int* __restrict__ ids, const float* __r
         for (int k = 0; k < TOPK; ++k) {
             const int e = ids[k], key = l * NE + e, sl = slot_of[key];
             if (fetch_ok && fetch_ok[key]) continue;   // GPU fetch owns this expert
-            cnt[key] += 1.0f;
+            cnt[key] = fminf(4.0f, cnt[key] + 1.0f);
             if (sl >= 0) { stamp[sl] = ++t; continue; }
             jk[n] = k;
             je[n] = e;
@@ -4369,20 +4393,24 @@ __global__ void k_promote_plan(PromoteArgs c) {
         __syncthreads();
         if (threadIdx.x == 0) {
             for (int w = 1; w < (int) (blockDim.x / 32); ++w) best = min(best, wmin[w]);
-            const int v = (int) (best & 0xffffffffu), key = c.want[m], old = c.owner[v];
-            const bool admit = !c.freq || old < 0 || c.cnt[key] >= c.cnt[old] + c.gain;
-            if (c.xsrc && c.xsrc[key] && c.slot_of[key] < 0 && c.stamp[v] != 0xffffffffu && admit) {   // (resident meanwhile: a prefill's cache)
-                if (old >= 0) { c.slot_of[old] = -1; c.tabA[old] = nullptr; c.tabB[old] = nullptr; }
-                c.owner[v] = -1;
-                c.stamp[v] = 0xffffffffu;   // in flight: never a victim before its commit
-                c.pend[np] = key;
-                c.pend[PMAX + np] = v;
-                c.fsrc[np] = c.xsrc[key];
-                c.fdst[np] = c.pool + (size_t) v * c.eb;
-                ++np;
-                stop = np >= c.maxn;
-            } else if (!admit) {
-                stop = 1;   // the next candidates are counted less: none beats this victim either
+            if (best == ~0ull) {
+                stop = 1;
+            } else {
+                const int v = (int) (best & 0xffffffffu), key = c.want[m], old = c.owner[v];
+                const bool admit = !c.freq || old < 0 || c.cnt[key] >= c.cnt[old] + c.gain;
+                if (c.xsrc && c.xsrc[key] && c.slot_of[key] < 0 && c.stamp[v] != 0xffffffffu && admit) {   // (resident meanwhile: a prefill's cache)
+                    if (old >= 0) { c.slot_of[old] = -1; c.tabA[old] = nullptr; c.tabB[old] = nullptr; }
+                    c.owner[v] = -1;
+                    c.stamp[v] = 0xffffffffu;   // in flight: never a victim before its commit
+                    c.pend[np] = key;
+                    c.pend[PMAX + np] = v;
+                    c.fsrc[np] = c.xsrc[key];
+                    c.fdst[np] = c.pool + (size_t) v * c.eb;
+                    ++np;
+                    stop = np >= c.maxn;
+                } else if (!admit) {
+                    stop = 1;   // the next candidates are counted less: none beats this victim either
+                }
             }
         }
         __syncthreads();
@@ -4403,7 +4431,8 @@ PromoteArgs promote_args(bool nv) {
             E.tabA, E.tabB, nv ? E.pool_nv : E.pool_mx, nv ? NV_BYTES : MX_BYTES, nv ? NV_A : MX_A, E.xsrc_d,
             nv ? E.want_nv : E.want_mx, nv ? E.nwant_nv : E.nwant_mx, nv ? E.pend_nv : E.pend_mx, nv ? E.npend_nv : E.npend_mx,
             nv ? E.psrc_nv : E.psrc_mx, nv ? E.pdst_nv : E.pdst_mx, nv ? E.pnf_nv : E.pnf_mx, E.fbytes,
-            E.xsrc_d ? (nv ? g_promote_nv : g_promote_mx) : 0, E.cnt, g_place_freq ? 1 : 0, g_gain};
+            E.xsrc_d ? (nv ? (E.nslot_nv >= LOOP_NV_SLOTS + FETCH_MAX ? g_promote_nv : 0) : g_promote_mx) : 0,
+            E.cnt, g_place_freq ? 1 : 0, g_gain};
 }
 // start of a decode token: the copies planned at the end of the previous one, on a side stream (few blocks: the
 // token's own kernels keep the SMs)
@@ -4613,6 +4642,15 @@ void gpu_fetch_rebuild() {
     E.htabB.assign((size_t) NL * NE, nullptr);
     CK(cudaMemcpy(E.htabA.data(), E.tabA, E.htabA.size() * sizeof(void*), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(E.htabB.data(), E.tabB, E.htabB.size() * sizeof(void*), cudaMemcpyDeviceToHost));
+    if (E.nslot_nv < LOOP_NV_SLOTS + FETCH_MAX && E.fetch_ok_d) {
+        std::vector<uint8_t> ok((size_t) NL * NE, 0);
+        for (int l = 0; l < NL; ++l) {
+            const bool en = !(l >= LOOP_BEGIN && l < LOOP_END) && !ex_nv(l);
+            E.fetch_layer[l] = en ? 1 : 0;
+            if (en) std::fill(ok.begin() + (size_t) l * NE, ok.begin() + (size_t) (l + 1) * NE, 1);
+        }
+        CK(cudaMemcpy(E.fetch_ok_d, ok.data(), ok.size(), cudaMemcpyHostToDevice));
+    }
     invalidate_engine_graphs();
 }
 void gpu_fetch_enable() {
@@ -4642,6 +4680,7 @@ void gpu_fetch_enable() {
     E.orig_expert_parts = E.expert_parts;
     std::vector<const uint8_t*> dev(count, nullptr);
     std::vector<uint8_t> ok(count, 0);
+    const bool allow_nv_fetch = E.nslot_nv >= LOOP_NV_SLOTS + FETCH_MAX;
     size_t off = 0;
     for (size_t k = 0; k < count; ++k) {
         const int l = (int) (k / NE);
@@ -4656,8 +4695,9 @@ void gpu_fetch_enable() {
         void* dv = nullptr;
         CK(cudaHostGetDevicePointer(&dv, d, 0));
         dev[k] = (const uint8_t*) dv;
-        ok[k] = 1;
-        E.fetch_layer[l] = 1;
+        const bool en = !ex_nv(l) || allow_nv_fetch;
+        ok[k] = en ? 1 : 0;
+        E.fetch_layer[l] = en ? 1 : 0;
         E.expert_parts[k] = {d, d + p.w13_bytes, d + p.w13_bytes + p.s13_bytes,
                              d + p.w13_bytes + p.s13_bytes + p.w2_bytes,
                              p.w13_bytes, p.s13_bytes, p.w2_bytes, p.s2_bytes};
@@ -6416,6 +6456,7 @@ int ink2_engine_main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_ROUTED_MAX")) g_pf_routed_max = std::atoi(r);
     if (const char* r = std::getenv("INK2_DQ_MIN")) g_dq_min = std::atoi(r);
     if (const char* r = std::getenv("INK2_MX_POOL_FRACTION")) g_off_mx_fraction = std::clamp((float) std::atof(r), 0.05f, 0.95f);
+    if (const char* r = std::getenv("INK2_MX_EVICT_FRACTION")) g_off_mx_evict_frac = std::clamp((float) std::atof(r), 0.05f, 0.95f);
     if (const char* r = std::getenv("INK2_GPU_FETCH")) E.gpu_fetch = std::atoi(r) != 0;
     if (const char* r = std::getenv("INK2_PLACE")) g_place_freq = std::string(r) != "lru";
     if (const char* r = std::getenv("INK2_DECAY")) g_decay = (float) std::atof(r);

@@ -537,3 +537,59 @@ All generated outputs remain coherent; `task-lru_ttl.ids` matches CPU reference 
   peak DRAM (`19.03 ms` compute union) and `23.0 GB/s` single-channel DDR4 PCIe H2D (`~5.2 ms` exposed),
   reaching `45-50 tok/s` under natural routing on this hardware requires either dual-channel system RAM
   (~`2x` PCIe H2D bandwidth) or a major reduction in outer-layer miss bytes beyond standard decayed-LFU.
+
+## Phase 4: Cache Balance, Priority Overlap, and 32K-262K Scaling (after `5218f01ae`)
+
+### Diagnosis of Transfer Traffic & Overlap Ceilings
+
+1. **Belady OPT vs online decayed-LFU (`route_*_512.bin`, 5 real workloads)**:
+   At 0K evictable slots (`319 NV + 169 MX`), Belady OPT transfers `63.3 MB/tok` mean (`58.5-68.4 MB/tok`)
+   vs `127.7 MB/tok` for un-capped `dLFU(0.97)` on the extracted 512-token traces. Time-shuffling tests
+   confirmed ~85% of the OPT gap comes from clairvoyance over high-entropy tail picks rather than missed
+   local temporal patterns. Capping `cnt <= 4.0` with `decay = 0.96` (`125.2 MB/tok` on trace sim) clears
+   stale phase-hot experts faster than uncapped decay (`~34` vs `~117` tokens).
+2. **Pool split at long contexts**: Sizing `MXFP8` slots as a fixed `0.15` fraction of total VRAM
+   (including the `6.88 GB` pinned loop core) starved the evictable NVFP4 pool as KV grew (`319 -> 202` at
+   32K, `-> 95` at 64K, `-> <1536` total NV crash at 128K). Sizing `MX` to `0.48` of *evictable* headroom
+   (`evict_budget = budget - 1536 * NV_BYTES`) improves 32K/64K transfer bytes and keeps `128K k8v4` in
+   full GPU-fetch (`1677 NV + 70 MX`).
+3. **Transfer overlap ceiling (`pcie_bench` / `overlap_bench3` / `ddr4_honest` / CUPTI)**:
+   Hardware `cudaMemcpyAsync` H2D ceiling is `23.45 GB/s`; `k_fetch` hits `23.23 GB/s` and `split_fetch`
+   already hides `1.35 ms/tok` (~100% of outer-layer hit GEMVs), leaving `~4.87 ms/tok` exposed inside `moe()`.
+   Cold 512 MB DDR4 CPU+GPU contention tests confirmed single-channel DDR4 saturates under combined CPU
+   read + PCIe H2D (`586.4 us` for 2 GPU + 1 CPU vs `601.6 us` for 3 GPU, before CPU compute/bell sync).
+
+### Changes implemented (`tools/inkling2/ink2_engine.cu`, `tools/server/server-context.cpp`)
+
+1. **Cache & evictable-headroom pool allocation**: Capped `c.cnt[key]` at `4.0f` (`k_cache_plan`,
+   `k_cache_cpu`), lowered default `g_decay` from `0.97f -> 0.96f`, and sized `E.nslot_mx` / `E.mx_target`
+   using shared `mx_slots_for_budget()` (`0.48` of evictable budget unless `INK2_MX_POOL_FRACTION` is set;
+   dropped hardcoded `0.15` override in `server-context.cpp`).
+2. **High-priority fetch stream & streaming stores**: Created `E.fetch_stream` with highest stream priority
+   (`cudaDeviceGetStreamPriorityRange`) and used `__stwt` in `k_fetch` to avoid L2 cache thrashing.
+3. **128K/262K `< 1536` NV pool crash fix**: Guarded `best == ~0ull` out-of-bounds slot indexing in both
+   `k_cache_plan` and `k_promote_plan`, disabled NV `gpu_fetch` / `g_promote_nv` cleanly when
+   `E.nslot_nv < LOOP_NV_SLOTS + FETCH_MAX` (falling back to CPU for NV/loop misses while keeping MX on
+   GPU-fetch), and updated `gpu_fetch_rebuild()`.
+
+### Final benchmark results (`bel-inkling2`, default settings, `INK2_GPU_FETCH=1`, `--spec 0`)
+
+All generated responses decoded cleanly and remained coherent; `task-lru_ttl.ids` matches CPU `128/128`.
+
+| Workload | `5218f01ae` | Updated decode | H2D/token | Pools (`NV + MX`) |
+| --- | ---: | ---: | ---: | --- |
+| LRU + TTL (`512` tok) | 41.8 tok/s | **41.6 tok/s** | 135.5 MB | `1864 + 164` |
+| Directed cycle (`512` tok) | 41.9 tok/s | **42.2 tok/s** | 127.9 MB | `1864 + 164` |
+| Race condition (`512` tok) | 43.9 tok/s | **44.4 tok/s** | 97.6 MB | `1864 + 164` |
+| Rate limiter (`512` tok) | 41.6 tok/s | **41.6 tok/s** | 136.8 MB | `1864 + 164` |
+| Serializability (`512` tok) | 42.9 tok/s | **43.1 tok/s** | 116.0 MB | `1864 + 164` |
+| 16K `i8r` (`16338` prompt, `128` dec) | 40.3 tok/s | **41.1 tok/s** | 113.4 MB | `1840 + 152` |
+| 32K `i8r` (`32750` prompt, `128` dec) | 36.2 tok/s | **37.8 tok/s** | 143.5 MB | `1808 + 137` |
+| 64K `i8r` (`65443` prompt, `128` dec) | 30.8 tok/s | **32.8 tok/s** | 194.6 MB | `1747 + 105` |
+| 128K `i8r` (`129510` prompt, `128` dec) | crashed (token 1) | **23.8 tok/s** | 105.0 MB | `1574 + 64` |
+| 128K `k8v4` (`129510` prompt, `128` dec) | crashed (token 1) | **28.6 tok/s** | 233.5 MB | `1677 + 70` |
+| 262K `k8v4` (`251550` prompt, `128` dec) | not run (`<1536` bug) | **15.8 tok/s** | 90.1 MB | `1328 + 64` |
+
+- **5-task summary**: median `41.9 -> 42.2 tok/s`, mean `42.42 -> 42.58 tok/s`, mean transfer `124.7 -> 122.8 MB/tok`.
+- **Prefill speeds (`--kv-grow 1 --chunk 4096 --tc 1`)**: 16K `522.2`, 32K `649.1`, 64K `677.0`, 128K `i8r` `587.3`, 128K `k8v4` `596.2`, 262K `k8v4` `467.5 tok/s`.
+

@@ -1513,7 +1513,13 @@ private:
             set_engine_env("INK2_CPU_ACT", "int8");
             set_engine_env("INK2_CPU_OPT", "29");
             set_engine_env("INK2_OFF_MARGIN_MIB", "64");
-            set_engine_env("INK2_MX_POOL_FRACTION", "0.15");
+            if (allow_tuning_override) {
+                if (const char * env = std::getenv("INK2_MX_POOL_FRACTION"); env != nullptr && env[0] != '\0') {
+                    setenv("INK2_MX_POOL_FRACTION", env, 1);
+                }
+            } else {
+                unsetenv("INK2_MX_POOL_FRACTION");
+            }
             set_engine_env("INK2_PIN_HOST_MIB", "512");
             set_engine_env("INK2_RING_EXTRA", "0");
             unsetenv("INK2_NUMA_POOL");
