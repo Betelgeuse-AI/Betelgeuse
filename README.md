@@ -42,6 +42,7 @@ Developed on an RTX 3060 12 GB, Intel Core i5-12400 and 16 GB of single-channel 
 - [Architecture](#architecture)
 - [Legacy models](#legacy-models)
 - [Current limitations](#current-limitations)
+- [Star history](#star-history)
 - [Licensing and acknowledgements](#licensing-and-acknowledgements)
 
 ## Model support
@@ -224,6 +225,10 @@ The [Alpha-Orionis-XS model card](https://huggingface.co/Betelgeuse-AI/Alpha-Ori
 - Legacy model compatibility is not guaranteed. This release does not establish general compatibility with arbitrary MoE architectures.
 
 See [OPTIMISATION-MASTER.md](OPTIMISATION-MASTER.md) and [RELEASE_NOTES.md](RELEASE_NOTES.md) for development history and release details.
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Betelgeuse-AI/Betelgeuse&type=Date)](https://star-history.com/#Betelgeuse-AI/Betelgeuse&Date)
 
 ## Licensing and acknowledgements
 
