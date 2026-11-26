@@ -63,6 +63,9 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -330,11 +333,12 @@ __global__ void k_gemv_nvfp4_sel(const uint8_t* const* __restrict__ tab,
             if (row0 + r + 1 < N) act[(size_t) blockIdx.y * (N / 2) + (row0 + r) / 2] = swiglu1(t[r], t[r + 1]);
 }
 
-// Zero-smem NVFP4 GEMV reading 16-col scale blocks (uint2) with ALU scale decode
+// Zero-smem NVFP4 GEMV reading 16-col scale blocks (uint2) with packed low-bit decode
 template <int R, bool ACT, int WL>
-__global__ void k_gemv_nvfp4_u2(const uint8_t* const* __restrict__ tab, const float* __restrict__ factors,
-                                const int* __restrict__ ids, const float* __restrict__ x, int x_stride,
-                                float* __restrict__ y, int N, int K, float* __restrict__ act) {
+__global__ void __launch_bounds__(128, 8) k_gemv_nvfp4_u2(
+    const uint8_t* const* __restrict__ tab, const float* __restrict__ factors,
+    const int* __restrict__ ids, const float* __restrict__ x, int x_stride,
+    float* __restrict__ y, int N, int K, float* __restrict__ act) {
     const int e = ids[blockIdx.y];
     if (e < 0) return;
     const int row0 = (blockIdx.x * (blockDim.x / WL) + threadIdx.x / WL) * R, lane = threadIdx.x & (WL - 1);
@@ -348,7 +352,8 @@ __global__ void k_gemv_nvfp4_u2(const uint8_t* const* __restrict__ tab, const fl
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-    for (int i = lane; i < K / 16; i += WL) {
+#pragma unroll 1
+    for (int i = lane; i < (int) ks; i += WL) {
         uint2 v[R];
         uint8_t sc[R];
 #pragma unroll
@@ -361,10 +366,12 @@ __global__ void k_gemv_nvfp4_u2(const uint8_t* const* __restrict__ tab, const fl
         const float4 x2 = __ldg(x4 + 4 * i + 2), x3 = __ldg(x4 + 4 * i + 3);
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            const float2 p0 = e2m1x2(v[r].x & 0xff), p1 = e2m1x2((v[r].x >> 8) & 0xff), p2 = e2m1x2((v[r].x >> 16) & 0xff),
-                         p3 = e2m1x2(v[r].x >> 24);
-            const float2 q0 = e2m1x2(v[r].y & 0xff), q1 = e2m1x2((v[r].y >> 8) & 0xff), q2 = e2m1x2((v[r].y >> 16) & 0xff),
-                         q3 = e2m1x2(v[r].y >> 24);
+            const uint2 lo = e2m1_half_bytes(v[r].x);
+            const float2 p0 = __half22float2(e2m1_half2<0>(lo)), p1 = __half22float2(e2m1_half2<1>(lo));
+            const float2 p2 = __half22float2(e2m1_half2<2>(lo)), p3 = __half22float2(e2m1_half2<3>(lo));
+            const uint2 hi = e2m1_half_bytes(v[r].y);
+            const float2 q0 = __half22float2(e2m1_half2<0>(hi)), q1 = __half22float2(e2m1_half2<1>(hi));
+            const float2 q2 = __half22float2(e2m1_half2<2>(hi)), q3 = __half22float2(e2m1_half2<3>(hi));
             const float part = p0.x * x0.x + p0.y * x0.y + p1.x * x0.z + p1.y * x0.w +
                                p2.x * x1.x + p2.y * x1.y + p3.x * x1.z + p3.y * x1.w +
                                q0.x * x2.x + q0.y * x2.y + q1.x * x2.z + q1.y * x2.w +
@@ -2467,6 +2474,7 @@ struct CacheArgs {
     int* hit_ids = nullptr;
     int* miss_ids = nullptr;
     int lfu = 0;
+    int slot_min = 0;
 };
 constexpr int FETCH_MAX = 64, FETCH_BLOCKS = 96;
 __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArgs c) {
@@ -2510,9 +2518,10 @@ __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArg
     }
     __syncthreads();
     const bool use_lfu = c.lfu && c.cnt;
+    const int s0 = (c.slot_min > 0 && c.slot_min < c.nslot) ? c.slot_min : 0;
     for (int m = 0; m < nm; ++m) {
         unsigned long long best = ~0ull;
-        for (int i = threadIdx.x; i < c.nslot; i += blockDim.x) {
+        for (int i = s0 + threadIdx.x; i < c.nslot; i += blockDim.x) {
             const int o = c.owner[i];
             if (o >= LOOP_BEGIN * NE && o < LOOP_END * NE) continue;   // loop core stays resident
             bool busy = false;
@@ -2903,6 +2912,7 @@ struct Engine {
     bool lazy_experts = false;          // safetensors experts stay file-backed; CPU reads only routed misses
     bool gpu_fetch = false;             // INK2_GPU_FETCH=1: post-prefill pinned arena GPU fetch
     bool gpu_fetch_active = false;      // arena lives only in the decode phase
+    bool nv_core_prefix = false;        // slots [0, LOOP_NV_SLOTS) hold only loop-core experts
     uint8_t fetch_layer[NL] = {};        // layers whose sources are pinned for GPU fetch
     uint8_t* fetch_ok_d = nullptr;       // device [NL * NE]: eligible for GPU fetch
     int* fetch_stats = nullptr;          // [fetches, hits, evictions, cpu-eligible misses]
@@ -3595,6 +3605,11 @@ std::vector<int> expert_placement_order() {
     order.insert(order.end(), outside.begin(), outside.end());
     return order;
 }
+void update_nv_core_prefix(const std::vector<int>& owner) {
+    E.nv_core_prefix = !g_is_gguf && E.nslot_nv >= LOOP_NV_SLOTS && (int) owner.size() >= LOOP_NV_SLOTS;
+    for (int s = 0; E.nv_core_prefix && s < LOOP_NV_SLOTS; ++s)
+        if (owner[s] < LOOP_BEGIN * NE || owner[s] >= LOOP_END * NE) E.nv_core_prefix = false;
+}
 void setup_offload() {
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
@@ -3665,6 +3680,7 @@ void setup_offload() {
     }
     CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
+    update_nv_core_prefix(own_nv);
     auto ints = [](const std::vector<int>& v) { return (int*) upload(v.data(), v.size() * 4); };
     E.slot_of = ints(slot_of);
     E.owner_nv = ints(own_nv);
@@ -3779,6 +3795,7 @@ void pool_resize(bool nv, int n) {
         if (!r.map_to((size_t) n * eb)) n = std::max(ns, (int) (r.mapped / eb));
     }
     ns = n;
+    if (nv && n < LOOP_NV_SLOTS) E.nv_core_prefix = false;
     invalidate_engine_graphs();
     if (shrank && E.gpu_fetch_active) gpu_fetch_rebuild();
 }
@@ -3860,6 +3877,7 @@ void refill_lazy_pool() {
     CK(cudaMemcpy(E.owner_mx, owner_mx.data(), owner_mx.size() * sizeof(int), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
+    update_nv_core_prefix(owner_nv);
     unsigned long long fetched = 0;
     CK(cudaMemcpy(&fetched, E.fbytes, sizeof(fetched), cudaMemcpyDeviceToHost));
     fetched += bytes;
@@ -3982,6 +4000,7 @@ void apply_placement_file(const std::string& path) {
     CK(cudaMemcpy(E.tabA, E.htabA.data(), E.htabA.size() * sizeof(void*), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(E.tabB, E.htabB.data(), E.htabB.size() * sizeof(void*), cudaMemcpyHostToDevice));
     E.mx_target = target_mx;
+    E.nv_core_prefix = false;
     std::fprintf(stderr, "INK2_PLACEMENT_APPLIED bytes=%zu nv_slots=%d mx_slots=%d file=%s\n", target_bytes,
                  E.nslot_nv, E.nslot_mx, path.c_str());
 }
@@ -4354,7 +4373,7 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
 }
 
 int g_split_fetch = 2;   // 0 off, 1 whole-expert overlap, 2 partA/partB staged overlap
-int g_fetch_blocks = 2;
+int g_fetch_blocks = 8;
 extern bool g_place_freq;
 // offload: make layer l's experts ids[0..n) resident (plan + fetch, device side, graph-capturable)
 void expert_cache(int l, const int* ids, int n, int split_mode = 0) {
@@ -4377,6 +4396,7 @@ void expert_cache(int l, const int* ids, int n, int split_mode = 0) {
     c.hit_ids = split_mode ? E.hit_ids : nullptr;
     c.miss_ids = split_mode ? E.miss_ids : nullptr;
     c.lfu = g_place_freq ? 1 : 0;
+    c.slot_min = (nv && E.nv_core_prefix && c.nslot > LOOP_NV_SLOTS) ? LOOP_NV_SLOTS : 0;
     k_cache_plan<<<1, 1024>>>(l, ids, n, c);
     if (split_mode && E.fetch_stream) {
         CK(cudaEventRecord(E.ev_fetch_start, cudaStreamPerThread));
@@ -5152,7 +5172,7 @@ void launch_moe_up(const Experts& X, const int* ids, const float* x) {
         gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
     } else if (X.nvfp4) {
         if (g_nv_h16 && g_sel_rpw == 2 && FF == 1152 && H == 2304) {
-            k_gemv_nvfp4_u2<4, true, 16><<<dim3(2 * FF / 32, TOPK), 128>>>(X.tA, X.f13, ids, x, 0, E.gu, 2 * FF, H, E.act);
+            k_gemv_nvfp4_u2<2, true, 16><<<dim3(2 * FF / 16, TOPK), 128>>>(X.tA, X.f13, ids, x, 0, E.gu, 2 * FF, H, E.act);
             return;
         }
 #define SEL_UP(R) \
@@ -5302,7 +5322,17 @@ void embed_row(int tok, float* out) {
         }
         return;
     }
-    for (int i = 0; i < H; ++i) {
+    int i = 0;
+#if defined(__AVX2__)
+    const uint16_t* src = E.embed.data() + (size_t) tok * H;
+    const __m256i zero = _mm256_setzero_si256();
+    for (; i + 16 <= H; i += 16) {
+        const __m256i bf = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+        _mm256_storeu_ps(out + i, _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero, bf)));
+        _mm256_storeu_ps(out + i + 8, _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero, bf)));
+    }
+#endif
+    for (; i < H; ++i) {
         uint32_t u = (uint32_t) E.embed[(size_t) tok * H + i] << 16;
         std::memcpy(&out[i], &u, 4);
     }
@@ -7210,11 +7240,17 @@ int ink2_engine_main(int argc, char** argv) {
             }
         }
     };
-    auto step_greedy = [&](int tok, int pos, int skip_tok = -1) {
+    auto step_greedy_launch = [&](int tok, int pos, int skip_tok = -1) {
         step(tok, pos, false, skip_tok);
         CK(cudaMemcpyAsync(E.h_argmax, E.d_argmax, 4, cudaMemcpyDeviceToHost));
+    };
+    auto step_greedy_wait = [&]() {
         CK(cudaStreamSynchronize(cudaStreamPerThread));
         return *E.h_argmax;
+    };
+    auto step_greedy = [&](int tok, int pos, int skip_tok = -1) {
+        step_greedy_launch(tok, pos, skip_tok);
+        return step_greedy_wait();
     };
     // warm-up at position 0 (builds the decode graph outside any timing; position 0 is rewritten by the first prompt)
     step(0, 0, false);
@@ -7562,16 +7598,33 @@ int ink2_engine_main(int argc, char** argv) {
                 if (stop.load()) { finish = "cancel"; break; }
                 const int next = next_tok;
                 gen.push_back(next);
-                emit_tok(next);
-                if (!s.ignore_eos && next == EOS_ID) { finish = "stop"; break; }
+                if (!s.ignore_eos && next == EOS_ID) {
+                    emit_tok(next);
+                    finish = "stop";
+                    break;
+                }
                 if (k + 1 < max_new) {
-                    if (!kv_room(pos + 1)) { std::fprintf(stderr, "kv-grow: the answer ends at %d tokens: the K/V cannot grow\n", pos); break; }
+                    if (!kv_room(pos + 1)) {
+                        emit_tok(next);
+                        std::fprintf(stderr, "kv-grow: the answer ends at %d tokens: the K/V cannot grow\n", pos);
+                        break;
+                    }
                     if (fast_greedy) {
-                        next_tok = step_greedy(next, pos++, skip_tok);
+                        if (k > 0) {
+                            step_greedy_launch(next, pos++, skip_tok);
+                            emit_tok(next);
+                            next_tok = step_greedy_wait();
+                        } else {
+                            emit_tok(next);
+                            next_tok = step_greedy(next, pos++, skip_tok);
+                        }
                     } else {
+                        emit_tok(next);
                         step(next, pos++, true, skip_tok);
                         next_tok = sample(logits, s);
                     }
+                } else {
+                    emit_tok(next);
                 }
             }
             if (fast_greedy && cache_prompt && gen.size() >= 2) {
