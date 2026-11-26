@@ -58,6 +58,8 @@ struct inkling2_worker_result {
     size_t prompt_tokens_cached = 0;
     double prompt_ms = 0.0;
     double decode_ms = 0.0;
+    double transition_ms = -1.0;
+    double ttft_ms = -1.0;
 };
 
 #ifdef LLAMA_BUILD_INKLING2_ENGINE
@@ -130,6 +132,14 @@ struct inkling2_server_worker {
                 if (done.fail() || cached > result.prompt_tokens) {
                     error_message = "direct checkpoint engine returned invalid generation statistics";
                     return false;
+                }
+                double tr_ms = -1.0;
+                double first_ms = -1.0;
+                if (done >> tr_ms) {
+                    result.transition_ms = tr_ms;
+                    if (done >> first_ms) {
+                        result.ttft_ms = first_ms;
+                    }
                 }
                 result.prompt_tokens_cached = cached;
                 result.prompt_tokens_processed = result.prompt_tokens - cached;
@@ -1522,6 +1532,7 @@ private:
             }
             set_engine_env("INK2_PIN_HOST_MIB", "512");
             set_engine_env("INK2_RING_EXTRA", "0");
+            set_engine_env("INK2_GPU_FETCH", "1");
             unsetenv("INK2_NUMA_POOL");
             unsetenv("INK2_SPEC_DRAFT_N_MAX");
             unsetenv("INK2_SPEC_FORCE");
@@ -4075,6 +4086,8 @@ private:
 
             slot.stats.n_prompt_processed = result.prompt_tokens_processed;
             slot.stats.n_prompt_cached = result.prompt_tokens_cached;
+            slot.stats.t_transition_ms = result.transition_ms;
+            slot.stats.t_ttft_ms = result.ttft_ms;
             slot.stats.t_prompt_last = std::max<int64_t>(slot.stats.t_start + 1,
                 slot.stats.t_start + (int64_t) (result.prompt_ms * 1000.0));
             slot.stats.t_gen_last = std::max<int64_t>(slot.stats.t_prompt_last + 1,

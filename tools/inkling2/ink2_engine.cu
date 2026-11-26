@@ -24,10 +24,12 @@
 #include "ink2_embedded.h"
 #include "ink2_iq_tables.h"
 #include "ink2_image.hpp"
+#include "ink2_native_lowbit.cuh"
 
 #include <cuda.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <mma.h>
 #include <cuda_runtime.h>
 
@@ -44,6 +46,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <type_traits>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -1837,49 +1840,66 @@ __global__ void __launch_bounds__(256, GRP_MINB) k_moe_gemv_grp(const float* __r
 // MXFP8 (layers 20-23): e4m3 * 2^(s-127) with s in [113, 118] in this checkpoint (measured, mx_range.py): multiples of
 // 2^-23 below 1, exact in fp16; stored * 2^10 (clear of the subnormals), the 2^-10 back as the output factor.
 constexpr int TM = 64, TN = 128, TK = 32, TLD = TK + 8, TCLD = TN + 4;
-template <bool NV>
-__global__ void __launch_bounds__(256) kb_moe_gemm_tc(const half* __restrict__ A, int lda,
+template <bool NV, bool PACK = false, int BN = TN, typename T = half, bool FUSED = false>
+__global__ void __launch_bounds__(BN * 2) kb_moe_gemm_tc(const T* __restrict__ A, int lda,
                                                       const uint8_t* const* __restrict__ tab,
                                                       const float* __restrict__ factors, const int* __restrict__ tile_e,
                                                       const int* __restrict__ tile_r0, const int* __restrict__ ntiles,
                                                       const int* __restrict__ eoff, const int* __restrict__ ecnt,
                                                       float* __restrict__ C, int N, int K) {
-    __shared__ __align__(32) unsigned char smraw[TM * TCLD * 4];   // As + Bs during the loop, C staging after
-    half* As = reinterpret_cast<half*>(smraw);
-    half* Bs = As + TM * TLD;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    if constexpr (!std::is_same_v<T, half>) {
+        return;
+    } else {
+#endif
+    constexpr bool FP16 = std::is_same_v<T, half>, TF32 = std::is_same_v<T, float>;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    using Operand = half;
+#else
+    using Operand = std::conditional_t<TF32, wmma::precision::tf32, T>;
+#endif
+    constexpr int NW = BN / 32, NT = BN * 2, LD = BN + 4, AK = TF32 ? 8 : 16;
+    constexpr int AB = TM * 4 / NT, AV = TF32 ? 2 : 1;
+    static_assert(BN == 64 || BN == 128);
+    constexpr size_t operand_bytes = (TM + BN) * TLD * sizeof(T);
+    constexpr size_t output_bytes = TM * LD * sizeof(float);
+    __shared__ __align__(32) unsigned char smraw[operand_bytes > output_bytes ? operand_bytes : output_bytes];
+    T* As = reinterpret_cast<T*>(smraw);
+    T* Bs = As + TM * TLD;
     float* Cs = reinterpret_cast<float*>(smraw);
     if ((int) blockIdx.x >= *ntiles) return;
-    const int e = tile_e[blockIdx.x], r0 = tile_r0[blockIdx.x], rend = eoff[e] + ecnt[e], n0 = blockIdx.y * TN;
+    const int e = tile_e[blockIdx.x], r0 = tile_r0[blockIdx.x], rend = eoff[e] + ecnt[e], n0 = blockIdx.y * BN;
     const uint8_t* W = tab[e];
     if (!W) return;
     const uint8_t* S = W + (size_t) N * (NV ? K / 2 : K);
-    const int tid = threadIdx.x, warp = tid / 32, wm = warp / 4, wn = warp % 4;
-    // A: fp16 rows in expert order (gathered / converted once per layer, not once per N block): 16 B per thread
-    const int arow = tid / 4, akq = tid % 4;
-    const half* asrc = r0 + arow < rend ? A + (size_t) (r0 + arow) * lda + akq * 8 : nullptr;
-    int wn_[2], wq_[2];
+    const int tid = threadIdx.x, warp = tid / 32, wm = warp / NW, wn = warp % NW;
+    const T* asrc[AB];
 #pragma unroll
-    for (int u = 0; u < 2; ++u) {
-        const int idx = tid + 256 * u;
-        wn_[u] = idx / 4;
-        wq_[u] = idx % 4;
+    for (int i = 0; i < AB; ++i) {
+        const int row = (tid + NT * i) / 4;
+        asrc[i] = r0 + row < rend ? A + (size_t) (r0 + row) * lda + (tid % 4) * 8 : nullptr;
     }
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[2][2];
+    wmma::fragment<wmma::accumulator, 16, 16, AK, float> c[2][2];
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
         for (int j = 0; j < 2; ++j) wmma::fill_fragment(c[i][j], 0.0f);
-    // register prefetch: tile k0 + TK is loaded from global while tile k0 (in smem) goes through the MMAs.  The
-    // conversions and the MMA order are unchanged (bit-identical to the single-buffered loop).
-    uint4 av;
+    // register prefetch: tile k0 + TK is loaded from global while tile k0 (in smem) goes through the MMAs.
+    const bool live[2] = {r0 + wm * 32 < rend, r0 + wm * 32 + 16 < rend};
+    uint4 av[AB][AV];
     uint2 wv[2];
     uint8_t sv[2];
     auto gload = [&](int k0) {
-        av = asrc ? *reinterpret_cast<const uint4*>(asrc + k0) : make_uint4(0, 0, 0, 0);
+#pragma unroll
+        for (int i = 0; i < AB; ++i)
+#pragma unroll
+            for (int j = 0; j < AV; ++j)
+                av[i][j] = asrc[i] ? reinterpret_cast<const uint4*>(asrc[i] + k0)[j] : make_uint4(0, 0, 0, 0);
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
-            const size_t wrow = (size_t) n0 + wn_[u];
-            const int kc = k0 + wq_[u] * 8;
+            const int idx = tid + NT * u;
+            const size_t wrow = (size_t) n0 + idx / 4;
+            const int kc = k0 + (idx % 4) * 8;
             if (NV) {
                 wv[u].x = __ldg(reinterpret_cast<const uint32_t*>(W + wrow * (K / 2) + kc / 2));
                 sv[u] = __ldg(S + wrow * (K / 16) + kc / 16);
@@ -1891,11 +1911,67 @@ __global__ void __launch_bounds__(256) kb_moe_gemm_tc(const half* __restrict__ A
     };
     gload(0);
     for (int k0 = 0; k0 < K; k0 += TK) {
-        *reinterpret_cast<uint4*>(As + arow * TLD + akq * 8) = av;
+#pragma unroll
+        for (int i = 0; i < AB; ++i)
+#pragma unroll
+            for (int j = 0; j < AV; ++j)
+                reinterpret_cast<uint4*>(As + ((tid + NT * i) / 4) * TLD + (tid % 4) * 8)[j] = av[i][j];
 #pragma unroll
         for (int u = 0; u < 2; ++u) {
+            T* dst = Bs + ((tid + NT * u) / 4) * TLD + (tid % 4) * 8;
+            if constexpr (!FP16) {
+                const float scale = NV ? e4m3_scale(sv[u]) * 16384.0f : exp2f((float) sv[u] - 119.0f);
+                const uint2 bytes = NV ? e2m1_half_bytes(wv[u].x) : uint2{};
+                const float2 values[4] = {
+                    __half22float2(NV ? e2m1_half2<0>(bytes) : e4m3_half2<0>(wv[u].x)),
+                    __half22float2(NV ? e2m1_half2<1>(bytes) : e4m3_half2<1>(wv[u].x)),
+                    __half22float2(NV ? e2m1_half2<2>(bytes) : e4m3_half2<0>(wv[u].y)),
+                    __half22float2(NV ? e2m1_half2<3>(bytes) : e4m3_half2<1>(wv[u].y)),
+                };
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    const float x = values[b].x * scale, y = values[b].y * scale;
+                    if constexpr (TF32) {
+                        dst[2 * b] = x;
+                        dst[2 * b + 1] = y;
+                    } else {
+                        reinterpret_cast<__nv_bfloat162*>(dst)[b] = __floats2bfloat162_rn(x, y);
+                    }
+                }
+                continue;
+            }
             half2 h[4];
-            if (NV) {
+            if constexpr (FUSED && NV) {
+                const uint2 lo = e2m1_half_lut_bytes(wv[u].x);
+                const uint2 hi = e2m1_half_lut_bytes(wv[u].x >> 16);
+                const half2 scale = __float2half2_rn(e4m3_scale(sv[u]));
+                h[0] = __hmul2(*reinterpret_cast<const half2*>(&lo.x), scale);
+                h[1] = __hmul2(*reinterpret_cast<const half2*>(&lo.y), scale);
+                h[2] = __hmul2(*reinterpret_cast<const half2*>(&hi.x), scale);
+                h[3] = __hmul2(*reinterpret_cast<const half2*>(&hi.y), scale);
+            } else if constexpr (PACK && NV) {
+                const uint2 bytes = e2m1_half_bytes(wv[u].x);
+                const half2 bias = __float2half2_rn(16384.0f);
+                const half2 scale = __float2half2_rn(e4m3_scale(sv[u]));
+                h[0] = __hmul2(__hmul2(e2m1_half2<0>(bytes), bias), scale);
+                h[1] = __hmul2(__hmul2(e2m1_half2<1>(bytes), bias), scale);
+                h[2] = __hmul2(__hmul2(e2m1_half2<2>(bytes), bias), scale);
+                h[3] = __hmul2(__hmul2(e2m1_half2<3>(bytes), bias), scale);
+            } else if (PACK && sv[u] >= 85 && sv[u] <= 124) {
+                const half2 scale = __float2half2_rn(__uint_as_float((sv[u] + 18u) << 23));
+                if constexpr (FUSED) {
+                    const uint2 lo = e4m3_half_bytes(wv[u].x), hi = e4m3_half_bytes(wv[u].y);
+                    h[0] = __hmul2(e4m3_half2<0>(lo), scale);
+                    h[1] = __hmul2(e4m3_half2<1>(lo), scale);
+                    h[2] = __hmul2(e4m3_half2<0>(hi), scale);
+                    h[3] = __hmul2(e4m3_half2<1>(hi), scale);
+                } else {
+                    h[0] = __hmul2(e4m3_half2<0>(wv[u].x), scale);
+                    h[1] = __hmul2(e4m3_half2<1>(wv[u].x), scale);
+                    h[2] = __hmul2(e4m3_half2<0>(wv[u].y), scale);
+                    h[3] = __hmul2(e4m3_half2<1>(wv[u].y), scale);
+                }
+            } else if (NV) {
                 const uint32_t v = wv[u].x;
                 const float sc = e4m3_decode(sv[u]) * 16384.0f;
 #pragma unroll
@@ -1914,22 +1990,26 @@ __global__ void __launch_bounds__(256) kb_moe_gemm_tc(const half* __restrict__ A
                     h[2 * b + 1] = __floats2half2_rn(p23.x * sc, p23.y * sc);
                 }
             }
-            *reinterpret_cast<uint4*>(Bs + wn_[u] * TLD + wq_[u] * 8) = *reinterpret_cast<uint4*>(h);
+            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4*>(h);
         }
         __syncthreads();
         if (k0 + TK < K) gload(k0 + TK);
 #pragma unroll
-        for (int kk = 0; kk < TK; kk += 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a[2];
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b[2];
+        for (int kk = 0; kk < TK; kk += AK) {
+            if (FUSED && !live[0]) continue;
+            wmma::fragment<wmma::matrix_a, 16, 16, AK, Operand, wmma::row_major> a[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, AK, Operand, wmma::col_major> b[2];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) wmma::load_matrix_sync(a[i], As + (wm * 32 + i * 16) * TLD + kk, TLD);
+            for (int i = 0; i < 2; ++i)
+                if (!FUSED || live[i]) wmma::load_matrix_sync(a[i], As + (wm * 32 + i * 16) * TLD + kk, TLD);
 #pragma unroll
             for (int j = 0; j < 2; ++j) wmma::load_matrix_sync(b[j], Bs + (wn * 32 + j * 16) * TLD + kk, TLD);
 #pragma unroll
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < 2; ++i) {
+                if (FUSED && !live[i]) continue;
 #pragma unroll
                 for (int j = 0; j < 2; ++j) wmma::mma_sync(c[i][j], a[i], b[j], c[i][j]);
+            }
         }
         __syncthreads();
     }
@@ -1937,16 +2017,19 @@ __global__ void __launch_bounds__(256) kb_moe_gemm_tc(const half* __restrict__ A
     for (int i = 0; i < 2; ++i)
 #pragma unroll
         for (int j = 0; j < 2; ++j)
-            wmma::store_matrix_sync(Cs + (wm * 32 + i * 16) * TCLD + wn * 32 + j * 16, c[i][j], TCLD, wmma::mem_row_major);
+            if (!FUSED || live[i]) wmma::store_matrix_sync(Cs + (wm * 32 + i * 16) * LD + wn * 32 + j * 16, c[i][j], LD, wmma::mem_row_major);
     __syncthreads();
-    const float f = NV ? factors[e] : 1.0f / 1024.0f;
+    const float f = NV ? factors[e] : FP16 ? 1.0f / 1024.0f : 1.0f;
 #pragma unroll
     for (int u = 0; u < 8; ++u) {
-        const int idx = tid + 256 * u, row = idx / 32, c4 = idx % 32, r = r0 + row;
+        const int idx = tid + NT * u, row = idx / (BN / 4), c4 = idx % (BN / 4), r = r0 + row;
         if (r >= rend) continue;
-        const float4 v = *reinterpret_cast<const float4*>(Cs + row * TCLD + c4 * 4);
+        const float4 v = *reinterpret_cast<const float4*>(Cs + row * LD + c4 * 4);
         *reinterpret_cast<float4*>(C + (size_t) r * N + n0 + c4 * 4) = make_float4(v.x * f, v.y * f, v.z * f, v.w * f);
     }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    }
+#endif
 }
 
 // Grouped expert products for GGUF experts (prompt): as kb_moe_gemm / kb_moe_gemm_tc, the weights decoded by gg_ld8
@@ -2316,19 +2399,32 @@ __global__ void kb_swiglu(const float* gu, float* act, int nr) {
 }
 
 // expert-ordered fp16 copy of the MoE input: ah[r][k] = fp16(x[rows[r]][k]) (the rounding the TC GEMM applied per tile)
-__global__ void kb_gather_h(const float* __restrict__ x, const int* __restrict__ rows, half* __restrict__ ah) {
+template <typename T>
+__global__ void kb_gather_h(const float* __restrict__ x, const int* __restrict__ rows, T* __restrict__ ah) {
     const int r = blockIdx.x, src = rows[r];
-    for (int k = threadIdx.x * 2; k < H; k += blockDim.x * 2)
-        *reinterpret_cast<half2*>(ah + (size_t) r * H + k) =
-            __floats2half2_rn(x[(size_t) src * H + k], x[(size_t) src * H + k + 1]);
+    for (int k = threadIdx.x * 2; k < H; k += blockDim.x * 2) {
+        const float* in = x + (size_t) src * H + k;
+        T* out = ah + (size_t) r * H + k;
+        if constexpr (std::is_same_v<T, half>) {
+            *reinterpret_cast<half2*>(out) = __floats2half2_rn(in[0], in[1]);
+        } else {
+            *reinterpret_cast<__nv_bfloat162*>(out) = __floats2bfloat162_rn(in[0], in[1]);
+        }
+    }
 }
 // kb_swiglu with an fp16 output (the down GEMM's A, same values as converting the fp32 act per tile)
-__global__ void kb_swiglu_h(const float* gu, half* act, int nr) {
+template <typename T>
+__global__ void kb_swiglu_h(const float* gu, T* act, int nr) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) nr * FF) return;
     const size_t k = i / FF, j = i % FF;
     const float g = gu[k * 2 * FF + 2 * j], u = gu[k * 2 * FF + 2 * j + 1];
-    act[i] = __float2half_rn((tanhf(g / GATE_CAP) * GATE_CAP) * (1.0f / (1.0f + expf(-g))) * (tanhf(u / UP_CAP) * UP_CAP));
+    const float value = swiglu1(g, u);
+    if constexpr (std::is_same_v<T, half>) {
+        act[i] = __float2half_rn(value);
+    } else {
+        act[i] = __float2bfloat16_rn(value);
+    }
 }
 
 // out[t][i] = sum_k wts[t][k] ey[slot[t][k]][i] (k in routing order, as k_moe_tail); grid (H / 256, T)
@@ -3694,9 +3790,18 @@ void refill_lazy_pool() {
     CK(cudaMemcpy(owner_nv.data(), E.owner_nv, owner_nv.size() * sizeof(int), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(owner_mx.data(), E.owner_mx, owner_mx.size() * sizeof(int), cudaMemcpyDeviceToHost));
     const std::vector<int> order = expert_placement_order();
-    std::vector<uint8_t> packed(MX_BYTES);
+    std::vector<uint8_t> packed;
     size_t bytes = 0;
     int filled_nv = 0, filled_mx = 0;
+    bool used_async = false;
+    auto is_pinned_contiguous = [&](const ink2cpu::ExpertParts& p, size_t eb) {
+        return E.pinned_host_experts &&
+               p.w13 >= E.pinned_host_experts &&
+               p.w13 + eb <= E.pinned_host_experts + E.pinned_host_expert_bytes &&
+               p.s13 == p.w13 + p.w13_bytes &&
+               p.w2 == p.s13 + p.s13_bytes &&
+               p.s2 == p.w2 + p.w2_bytes;
+    };
     auto fill = [&](bool nv, std::vector<int>& owners, int& filled) {
         size_t next = 0;
         for (int s = 0; s < (int) owners.size(); ++s) {
@@ -3714,13 +3819,19 @@ void refill_lazy_pool() {
                 std::fprintf(stderr, "layer %d expert %d: source size mismatch during pool refill\n", l, key % NE);
                 std::exit(1);
             }
-            std::memcpy(packed.data(), p.w13, p.w13_bytes);
-            std::memcpy(packed.data() + p.w13_bytes, p.s13, p.s13_bytes);
-            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
-            std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
             uint8_t* pool = nv ? E.pool_nv : E.pool_mx;
             uint8_t* dst = pool + (size_t) s * eb;
-            CK(cudaMemcpy(dst, packed.data(), eb, cudaMemcpyHostToDevice));
+            if (is_pinned_contiguous(p, eb)) {
+                CK(cudaMemcpyAsync(dst, p.w13, eb, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                used_async = true;
+            } else {
+                if (packed.size() < eb) packed.resize(MX_BYTES);
+                std::memcpy(packed.data(), p.w13, p.w13_bytes);
+                std::memcpy(packed.data() + p.w13_bytes, p.s13, p.s13_bytes);
+                std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
+                std::memcpy(packed.data() + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
+                CK(cudaMemcpy(dst, packed.data(), eb, cudaMemcpyHostToDevice));
+            }
             slot_of[key] = s;
             owners[s] = key;
             bytes += eb;
@@ -3729,6 +3840,7 @@ void refill_lazy_pool() {
     };
     fill(true, owner_nv, filled_nv);
     fill(false, owner_mx, filled_mx);
+    if (used_async) CK(cudaStreamSynchronize(cudaStreamPerThread));
     if (!bytes) return;
     std::fill(E.htabA.begin(), E.htabA.end(), nullptr);
     std::fill(E.htabB.begin(), E.htabB.end(), nullptr);
@@ -3976,7 +4088,27 @@ void slide_capacity(int cap, int last_pos) {
             if (!b) continue;
             uint8_t* src = (uint8_t*) *arr[a];
             const size_t bytes = (size_t) cap * b;
-            uint8_t* dst = (uint8_t*) dalloc(bytes);
+            // release cached VMM pages only incrementally if needed so pools_fill() reuses the rest
+            uint8_t* dst = nullptr;
+            if (new_bytes < old_bytes) {
+                while (cudaMalloc(&dst, bytes) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    if (g_vmm_cached.empty()) {
+                        dst = (uint8_t*) dalloc(bytes);
+                        break;
+                    }
+                    if (g_vmm.release(g_vmm_cached.back()) != CUDA_SUCCESS) {
+                        std::fprintf(stderr, "cuMemRelease of cached allocation failed\n");
+                        std::exit(1);
+                    }
+                    g_vmm_cached.pop_back();
+                    g_vmm_cached_bytes -= g_vmm.gran;
+                    g_vram -= g_vmm.gran;
+                }
+                if (dst) { CK(cudaMemset(dst, 0, bytes)); g_vram += bytes; }
+            } else {
+                dst = (uint8_t*) dalloc(bytes);
+            }
             if (rows) k_repack_ring<<<(unsigned) ((b * rows + 255) / 256), 256>>>(src, dst, b, old_cap, cap, last_pos, rows);
             old.push_back({src, (size_t) old_cap * b});
             *arr[a] = dst;
@@ -3993,8 +4125,13 @@ void slide_capacity(int cap, int last_pos) {
 void slide_compact() {
     if (!g_slide_compact && E.offload && E.grow && PF_RING_EXTRA > 0) slide_capacity(WINDOW, g_slide_last_pos);
 }
-void slide_expand(int last_pos) {
-    if (g_slide_compact) slide_capacity(WINDOW + PF_RING_EXTRA, last_pos);
+void slide_expand(int last_pos, int req_extra = -1) {
+    if (!E.grow || !E.offload || PF_RING_EXTRA <= 0) return;
+    const int target_extra = req_extra > 0 ? std::min(PF_RING_EXTRA, req_extra) : PF_RING_EXTRA;
+    const int target = WINDOW + target_extra;
+    int cur_cap = -1;
+    for (const Slot& S : E.S) if (!S.full) { cur_cap = S.cap; break; }
+    if (g_slide_compact || (cur_cap > 0 && cur_cap < target)) slide_capacity(target, last_pos);
 }
 // the full slots hold `need` cells (grown in --kv-grow-step steps, from the expert pools when VRAM is short)
 void kv_fit(int need) {
@@ -4785,25 +4922,32 @@ void gpu_fetch_rebuild() {
     E.htabB.assign((size_t) NL * NE, nullptr);
     CK(cudaMemcpy(E.htabA.data(), E.tabA, E.htabA.size() * sizeof(void*), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(E.htabB.data(), E.tabB, E.htabB.size() * sizeof(void*), cudaMemcpyDeviceToHost));
-    if (E.nslot_nv < LOOP_NV_SLOTS + FETCH_MAX && E.fetch_ok_d) {
+    if (E.fetch_ok_d) {
+        const bool allow_nv_fetch = E.nslot_nv >= LOOP_NV_SLOTS + FETCH_MAX;
         std::vector<uint8_t> ok((size_t) NL * NE, 0);
         for (int l = 0; l < NL; ++l) {
-            const bool en = !(l >= LOOP_BEGIN && l < LOOP_END) && !ex_nv(l);
+            const bool en = !(l >= LOOP_BEGIN && l < LOOP_END) && (!ex_nv(l) || allow_nv_fetch);
             E.fetch_layer[l] = en ? 1 : 0;
             if (en) std::fill(ok.begin() + (size_t) l * NE, ok.begin() + (size_t) (l + 1) * NE, 1);
         }
         CK(cudaMemcpy(E.fetch_ok_d, ok.data(), ok.size(), cudaMemcpyHostToDevice));
     }
+    if (E.fetch_stats) CK(cudaMemset(E.fetch_stats, 0, 4 * sizeof(int)));
     invalidate_engine_graphs();
 }
 void gpu_fetch_enable() {
     if (!E.gpu_fetch || !E.lazy_experts || !E.ck || E.gpu_fetch_active) return;
     const size_t count = (size_t) NL * NE;
     size_t bytes = 0;
+    std::vector<size_t> item_off(count, 0);
+    std::vector<size_t> active_keys;
+    active_keys.reserve(count);
     for (size_t k = 0; k < count; ++k) {
         const int l = (int) (k / NE);
         if (l >= LOOP_BEGIN && l < LOOP_END) continue;
         const ink2cpu::ExpertParts& p = E.expert_parts[k];
+        item_off[k] = bytes;
+        active_keys.push_back(k);
         bytes += (p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes + 255) & ~(size_t) 255;
     }
     void* arena = nullptr;
@@ -4821,30 +4965,40 @@ void gpu_fetch_enable() {
     CK(cudaMemset(E.fetch_ok_d, 0, count));
     CK(cudaMemset(E.fetch_stats, 0, 4 * sizeof(int)));
     E.orig_expert_parts = E.expert_parts;
+    const int nthreads = std::min<int>((int) active_keys.size(), std::max(1, E.cpu_threads > 0 ? E.cpu_threads : 5));
+    std::vector<std::thread> workers;
+    workers.reserve((size_t) nthreads);
+    for (int t = 0; t < nthreads; ++t) {
+        workers.emplace_back([&, t]() {
+            const size_t i0 = (active_keys.size() * (size_t) t) / (size_t) nthreads;
+            const size_t i1 = (active_keys.size() * (size_t) (t + 1)) / (size_t) nthreads;
+            for (size_t idx = i0; idx < i1; ++idx) {
+                const size_t k = active_keys[idx];
+                const ink2cpu::ExpertParts p = E.orig_expert_parts[k];
+                uint8_t* d = (uint8_t*) arena + item_off[k];
+                std::memcpy(d, p.w13, p.w13_bytes);
+                std::memcpy(d + p.w13_bytes, p.s13, p.s13_bytes);
+                std::memcpy(d + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
+                std::memcpy(d + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
+                E.expert_parts[k] = {d, d + p.w13_bytes, d + p.w13_bytes + p.s13_bytes,
+                                     d + p.w13_bytes + p.s13_bytes + p.w2_bytes,
+                                     p.w13_bytes, p.s13_bytes, p.w2_bytes, p.s2_bytes};
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
     std::vector<const uint8_t*> dev(count, nullptr);
     std::vector<uint8_t> ok(count, 0);
     const bool allow_nv_fetch = E.nslot_nv >= LOOP_NV_SLOTS + FETCH_MAX;
-    size_t off = 0;
-    for (size_t k = 0; k < count; ++k) {
+    for (size_t k : active_keys) {
         const int l = (int) (k / NE);
-        if (l >= LOOP_BEGIN && l < LOOP_END) continue;
-        const ink2cpu::ExpertParts p = E.expert_parts[k];
-        const size_t eb = p.w13_bytes + p.s13_bytes + p.w2_bytes + p.s2_bytes;
-        uint8_t* d = (uint8_t*) arena + off;
-        std::memcpy(d, p.w13, p.w13_bytes);
-        std::memcpy(d + p.w13_bytes, p.s13, p.s13_bytes);
-        std::memcpy(d + p.w13_bytes + p.s13_bytes, p.w2, p.w2_bytes);
-        std::memcpy(d + p.w13_bytes + p.s13_bytes + p.w2_bytes, p.s2, p.s2_bytes);
+        uint8_t* d = (uint8_t*) arena + item_off[k];
         void* dv = nullptr;
         CK(cudaHostGetDevicePointer(&dv, d, 0));
         dev[k] = (const uint8_t*) dv;
         const bool en = !ex_nv(l) || allow_nv_fetch;
         ok[k] = en ? 1 : 0;
         E.fetch_layer[l] = en ? 1 : 0;
-        E.expert_parts[k] = {d, d + p.w13_bytes, d + p.w13_bytes + p.s13_bytes,
-                             d + p.w13_bytes + p.s13_bytes + p.w2_bytes,
-                             p.w13_bytes, p.s13_bytes, p.w2_bytes, p.s2_bytes};
-        off += (eb + 255) & ~(size_t) 255;
     }
     CK(cudaMemcpy(E.xsrc_d, dev.data(), count * sizeof(void*), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(E.fetch_ok_d, ok.data(), count, cudaMemcpyHostToDevice));
@@ -4989,6 +5143,9 @@ void gg_sel(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs,
 }
 
 bool g_nv_h16 = true;
+int g_native_gemm = 0;
+bool g_native_gemm_fast = false;
+bool g_native_gemm_bf16 = false;
 bool cpu_active_for_decode();
 void launch_moe_up(const Experts& X, const int* ids, const float* x) {
     if (X.gg13) {
@@ -5224,6 +5381,14 @@ void forward_device() {
     if (E.offload && E.cnt && g_place_freq) k_decay<<<(NL * NE + 255) / 256, 256>>>(E.cnt, NL * NE, g_decay);
     if (run_promote) promote_join();
 }
+void capture_decode_graph() {
+    if (!E.graph || E.exec) return;
+    cudaGraph_t g;
+    CK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
+    forward_device();
+    CK(cudaStreamEndCapture(cudaStreamPerThread, &g));
+    CK(cudaGraphInstantiate(&E.exec, g, 0));
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Prefill: the prompt in chunks of up to TP tokens.  Same math as forward_device, row-batched: dense products as
@@ -5296,30 +5461,43 @@ float* pf_floats(size_t n, int whole = 0) { return (float*) pf_alloc(n * 4, whol
 
 // the shared region's phases laid out for a chunk of T tokens (P / rel, gu / ey / act, lg)
 float* g_region = nullptr;
+float* g_attn_moe_tmp = nullptr;
 int g_cur_T = 0;
 void pf_layout(int T) {
     g_cur_T = T;
+    const size_t ES = (size_t) T * H;
     PF.P = g_region; PF.rel = g_region + (size_t) T * PF.np_max;
     PF.gu = g_region; PF.ey = g_region; PF.act = g_region + (size_t) T * TOPK * 2 * FF;
     PF.lg = g_region;
+    PF.cat = g_region;
+    PF.gfg = g_region + 2 * ES;
+    PF.gdown = g_region + 4 * ES;
+    PF.a = g_attn_moe_tmp;
+    PF.xq = g_attn_moe_tmp + 3 * ES;
+    PF.m = g_attn_moe_tmp;
+    PF.mn = g_attn_moe_tmp + ES;
+    PF.moe = g_attn_moe_tmp + 2 * ES;
+    PF.y2 = g_attn_moe_tmp + 3 * ES;
+    PF.x0 = PF.moe;
 }
 
-void alloc_prefill() {
+void alloc_prefill(bool full_wf = true) {
     g_pfr.reserve(64);
     const size_t T = PF.TP, TH = T * H;
     CK(cublasCreate(&PF.cb) == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cudaErrorUnknown);
     cublasSetStream(PF.cb, cudaStreamPerThread);
     cublasSetMathMode(PF.cb, CUBLAS_PEDANTIC_MATH);   // full FP32, no TF32 / reduced-precision shortcuts
     for (int l = 0; l < NL; ++l) PF.np_max = std::max(PF.np_max, E.L[l].proj.n);
-    PF.wf_cap = std::max((size_t) PF.np_max * H, (size_t) 8192 * H);
+    PF.wf_cap = (PF.tc && !full_wf) ? std::max<size_t>((size_t) NE * H, (size_t) GATE_RANK * 2 * H)
+                                    : std::max((size_t) PF.np_max * H, (size_t) 8192 * H);
     PF.wf = pf_floats(PF.wf_cap, 1);
-    PF.x0 = pf_floats(TH); PF.h = pf_floats(TH); PF.out = pf_floats(TH); PF.B = pf_floats(8 * TH); PF.preB = pf_floats(8 * TH);
-    PF.pre_h = pf_floats(TH); PF.prev = pf_floats(8 * TH); PF.msgs = pf_floats(4 * TH); PF.a = pf_floats(3 * TH);
-    PF.xq = pf_floats(TH); PF.xk = pf_floats(TH); PF.xv = pf_floats(TH);
+    PF.h = pf_floats(TH); PF.out = pf_floats(TH); PF.B = pf_floats(8 * TH); PF.preB = pf_floats(3 * TH);
+    PF.pre_h = pf_floats(TH); PF.prev = pf_floats(4 * TH); PF.msgs = pf_floats(4 * TH);
+    g_attn_moe_tmp = pf_floats(4 * TH);
+    PF.xk = pf_floats(TH); PF.xv = pf_floats(TH);
     PF.kc = pf_floats(T * KVD); PF.vc = pf_floats(T * KVD); PF.att = pf_floats(((T + 63) / 64 * 64) * QD);
-    PF.attn_out = pf_floats(TH); PF.att2 = pf_floats(TH); PF.r = pf_floats(TH); PF.m = pf_floats(TH); PF.mn = pf_floats(TH);
-    PF.moe = pf_floats(TH); PF.y2 = pf_floats(TH); PF.cat = pf_floats(2 * TH); PF.gdown = pf_floats(T * GATE_RANK);
-    PF.gfg = pf_floats(2 * TH); PF.rl = pf_floats(T * NE); PF.wts = pf_floats(T * TOPK);
+    PF.attn_out = pf_floats(TH); PF.att2 = pf_floats(TH); PF.r = pf_floats(TH);
+    PF.rl = pf_floats(T * NE); PF.wts = pf_floats(T * TOPK);
     // One region, phases with disjoint lifetimes (saves ~217 KB per chunk token, 445 MB at chunk 2048):
     //   attention: P [T][np_max], rel [T][NQ][EXTENT];  MoE: gu [T*TOPK][2FF] then ey (same rows, H = 2FF) after the
     //   SwiGLU has read gu, act [T*TOPK][FF] after gu;  after the last layer: lg [T][8192] (all-logits dumps only)
@@ -5354,7 +5532,7 @@ void alloc_prefill() {
         cublasSetStream(PF.cbh, cudaStreamPerThread);
         PF.wh = (half*) pf_alloc((size_t) PF.np_max * H * 2, 1);
         if (g_is_gguf) for (auto& d : g_dq) d = (half*) dalloc((size_t) 2 * FF * H * 2);   // one expert part (w13: 2FF x H)
-        PF.xh = (half*) pf_alloc(3 * T * QD * 2);
+        PF.xh = (half*) pf_alloc(T * QD * 2);
         PF.qh = (half*) pf_alloc(((T + 63) / 64 * 64) * QD * 2);
     }
     // cuBLAS loads its kernels and workspace at the first call of each shape class: run them once now, before the
@@ -5452,15 +5630,24 @@ void pf_unmap(bool refill) {
     for (auto& r : g_pfr) r.unmap_to(0);
     g_pf_mapped_T = 0;
     if (refill) slide_compact();
-    pools_fill(refill);
+    pools_fill(false);
     if (refill) {
+        const bool had_fetch = E.gpu_fetch_active;
         gpu_fetch_enable();
+        if (E.nslot_nv > nv0 || E.nslot_mx > mx0) {
+            std::fprintf(stderr, "pools: %d NVFP4 + %d MXFP8 slots (%.2f GiB)\n", E.nslot_nv, E.nslot_mx,
+                         (E.nslot_nv * (double) ex_bytes(0) + E.nslot_mx * (double) MX_BYTES) / 1073741824.0);
+        }
+        refill_lazy_pool();
+        if (had_fetch) gpu_fetch_rebuild();
+        full_split_fit(std::max(0, g_slide_last_pos));
+        capture_decode_graph();
         const double elapsed = now_ms() - t0;
         g_pf_route_active = false;
         std::fprintf(stderr,
-                     "prefill->decode: released %zu MiB, reused %zu MiB, transition %.1f ms, experts %d + %d (%+d + %+d), cached VMM %zu MiB\n",
+                     "prefill->decode: released %zu MiB, reused %zu MiB, transition %.1f ms, experts %d + %d (%+d + %+d), graph %s, cached VMM %zu MiB\n",
                      unmapped >> 20, (g_vmm_reused_bytes - reused0) >> 20, elapsed, E.nslot_nv, E.nslot_mx,
-                     E.nslot_nv - nv0, E.nslot_mx - mx0, g_vmm_cached_bytes >> 20);
+                     E.nslot_nv - nv0, E.nslot_mx - mx0, E.exec ? "ready" : "off", g_vmm_cached_bytes >> 20);
     }
 }
 void pf_unmap() { pf_unmap(true); }
@@ -5475,7 +5662,7 @@ void hgemm(const DMat& W, bool wcvt, int first, int n, const float* X, int ldx, 
         if (W.q) kb_q8_to_f16<<<(unsigned) ((nw / 8 + 255) / 256), 256>>>(W.q, W.qs, PF.wh, nw / 8);
         else kb_bf16_to_f16<<<(unsigned) ((nw + 255) / 256), 256>>>(W.d, PF.wh, nw);
     }
-    half* xh = PF.xh + (size_t) xslot * g_cur_T * QD;   // (thirds of the chunk being read)
+    half* xh = PF.xh;   // sequential callers reuse the single scratch buffer
     const size_t nx = (size_t) T * K;
     kb_f32_to_f16<<<(unsigned) ((nx + 255) / 256), 256>>>(X, ldx, K, xh, nx);
     const float one = 1.0f, zero = 0.0f;
@@ -5628,6 +5815,73 @@ void attention_b(const Layer& Y, Slot& S, const float* xq, int sq, const float* 
 // tiles skipped), then over the others in batches streamed into two staging halves on PF.cs (copy of batch b + 1
 // overlapping the product of batch b).  Each row still sees exactly its expert's weights: bit-identical.
 // part B (w2) is streamed after the SwiGLU, separately from part A (w13): each byte crosses PCIe once per layer call.
+// Persistent worker pool for cold prefill staging copies (avoids thread create/join per batch).
+struct CopyPool {
+    static constexpr int NW = 3;
+    std::mutex mu;
+    std::condition_variable cv_work, cv_done;
+    std::function<void(int)> task;
+    int total = 0;
+    uint64_t gen = 0;
+    int done = 0;
+    bool stop = false;
+    std::vector<std::thread> ths;
+    CopyPool() {
+        ths.reserve(NW);
+        for (int w = 0; w < NW; ++w) {
+            ths.emplace_back([this, w]() {
+                uint64_t seen = 0;
+                for (;;) {
+                    std::function<void(int)> fn;
+                    int n = 0;
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv_work.wait(lk, [&] { return stop || gen != seen; });
+                        if (stop) return;
+                        seen = gen;
+                        fn = task;
+                        n = total;
+                    }
+                    const int nth = NW + 1, j0 = (n * (w + 1)) / nth, j1 = (n * (w + 2)) / nth;
+                    for (int j = j0; j < j1; ++j) fn(j);
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (++done == NW) cv_done.notify_one();
+                }
+            });
+        }
+    }
+    ~CopyPool() {
+        { std::lock_guard<std::mutex> lk(mu); stop = true; }
+        cv_work.notify_all();
+        for (auto& t : ths) t.join();
+    }
+    template <class Fn>
+    void run(int n, Fn&& fn) {
+        if (n < 4) {
+            for (int j = 0; j < n; ++j) fn(j);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            task = [&](int j) { fn(j); };
+            total = n;
+            done = 0;
+            ++gen;
+        }
+        cv_work.notify_all();
+        const int j1 = n / (NW + 1);
+        for (int j = 0; j < j1; ++j) fn(j);
+        std::unique_lock<std::mutex> lk(mu);
+        cv_done.wait(lk, [&] { return done == NW; });
+        task = {};
+    }
+};
+template <class Fn>
+void copy_parallel_batch(int n, Fn&& fn) {
+    static CopyPool pool;
+    pool.run(n, std::forward<Fn>(fn));
+}
+
 // The regular lazy prefill streams every nonresident expert. DSpark verification streams only its routed misses.
 template <class F> void expert_parts(int l, bool partB, F launch) {
     const Experts& X = E.L[l].ex;
@@ -5642,24 +5896,53 @@ template <class F> void expert_parts(int l, bool partB, F launch) {
         CK(cudaEventSynchronize(PF.ev_ready[h]));   // the previous table copy out of ptab[h] is done
         const uint8_t** tab = PF.ptab[h];
         std::fill(tab, tab + NE, nullptr);
-        for (int j = 0; j < n; ++j) {
-            const int e = nonres[b0 + j];
-            uint8_t* d = PF.stg[h] + (size_t) j * part;
-            if (E.lazy_experts) {
-                const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) l * NE + e];
-                uint8_t* src = PF.hstg[h] + (size_t) j * part;
-                const uint8_t* w = partB ? p.w2 : p.w13;
-                const uint8_t* s = partB ? p.s2 : p.s13;
-                const size_t nw = partB ? p.w2_bytes : p.w13_bytes;
-                const size_t ns = partB ? p.s2_bytes : p.s13_bytes;
-                if (nw + ns != part) { std::fprintf(stderr, "layer %d expert %d: prefill source size mismatch\n", l, e); std::exit(1); }
-                std::memcpy(src, w, nw);
-                std::memcpy(src + nw, s, ns);
-                CK(cudaMemcpyAsync(d, src, part, cudaMemcpyHostToDevice, PF.cs));
-            } else {
-                CK(cudaMemcpyAsync(d, E.xh[(size_t) l * NE + e] + off, part, cudaMemcpyHostToDevice, PF.cs));
+        if (E.lazy_experts) {
+            bool all_pinned = E.pinned_host_experts != nullptr;
+            if (all_pinned) {
+                for (int j = 0; j < n; ++j) {
+                    const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) l * NE + nonres[b0 + j]];
+                    const uint8_t* w = partB ? p.w2 : p.w13;
+                    const uint8_t* s = partB ? p.s2 : p.s13;
+                    const size_t nw = partB ? p.w2_bytes : p.w13_bytes;
+                    const size_t ns = partB ? p.s2_bytes : p.s13_bytes;
+                    if (nw + ns != part || s != w + nw ||
+                        w < E.pinned_host_experts || w + part > E.pinned_host_experts + E.pinned_host_expert_bytes) {
+                        all_pinned = false;
+                        break;
+                    }
+                }
             }
-            tab[e] = d;
+            if (all_pinned) {
+                for (int j = 0; j < n; ++j) {
+                    const int e = nonres[b0 + j];
+                    const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) l * NE + e];
+                    uint8_t* d = PF.stg[h] + (size_t) j * part;
+                    CK(cudaMemcpyAsync(d, partB ? p.w2 : p.w13, part, cudaMemcpyHostToDevice, PF.cs));
+                    tab[e] = d;
+                }
+            } else {
+                copy_parallel_batch(n, [&](int j) {
+                    const int e = nonres[b0 + j];
+                    const ink2cpu::ExpertParts& p = E.expert_parts[(size_t) l * NE + e];
+                    uint8_t* src = PF.hstg[h] + (size_t) j * part;
+                    const uint8_t* w = partB ? p.w2 : p.w13;
+                    const uint8_t* s = partB ? p.s2 : p.s13;
+                    const size_t nw = partB ? p.w2_bytes : p.w13_bytes;
+                    const size_t ns = partB ? p.s2_bytes : p.s13_bytes;
+                    if (nw + ns != part) { std::fprintf(stderr, "layer %d expert %d: prefill source size mismatch\n", l, e); std::exit(1); }
+                    std::memcpy(src, w, nw);
+                    std::memcpy(src + nw, s, ns);
+                });
+                for (int j = 0; j < n; ++j) tab[nonres[b0 + j]] = PF.stg[h] + (size_t) j * part;
+                CK(cudaMemcpyAsync(PF.stg[h], PF.hstg[h], (size_t) n * part, cudaMemcpyHostToDevice, PF.cs));
+            }
+        } else {
+            for (int j = 0; j < n; ++j) {
+                const int e = nonres[b0 + j];
+                uint8_t* d = PF.stg[h] + (size_t) j * part;
+                CK(cudaMemcpyAsync(d, E.xh[(size_t) l * NE + e] + off, part, cudaMemcpyHostToDevice, PF.cs));
+                tab[e] = d;
+            }
         }
         // the batch table rides on the copy stream too (pinned slot per half, reused once ev_free[h] has fired)
         CK(cudaMemcpyAsync(PF.dtab[h], PF.ptab[h], NE * sizeof(void*), cudaMemcpyHostToDevice, PF.cs));
@@ -5846,20 +6129,32 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
         });
     } else if (PF.tc) {
         const int maxt_tc = nr / TM + NE;
-        auto g = X.nvfp4 ? kb_moe_gemm_tc<true> : kb_moe_gemm_tc<false>;
-        // fp16 A copies live in the act region: the gathered input [nr][H] halves (same bytes as act [nr][FF] floats)
-        // until the SwiGLU, then the fp16 act [nr][FF]
+        const bool packed = g_native_gemm && !PF.rows_argmax;
+        auto run = [&](auto g, auto* a, int width) {
+            kb_gather_h<<<nr, 256>>>(x, PF.rows, a);
+            expert_parts(l, false, [&](const uint8_t* const* t) {
+                g<<<dim3(maxt_tc, 2 * FF / width), width * 2>>>(a, H, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                               PF.ecnt, PF.gu, 2 * FF, H);
+            });
+            kb_swiglu_h<<<(unsigned) (((size_t) nr * FF + 255) / 256), 256>>>(PF.gu, a, nr);
+            expert_parts(l, true, [&](const uint8_t* const* t) {
+                g<<<dim3(maxt_tc, H / width), width * 2>>>(a, FF, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff,
+                                                          PF.ecnt, PF.ey, H, FF);
+            });
+        };
         half* ah = reinterpret_cast<half*>(PF.act);
-        kb_gather_h<<<nr, 256>>>(x, PF.rows, ah);
-        expert_parts(l, false, [&](const uint8_t* const* t) {
-            g<<<dim3(maxt_tc, 2 * FF / TN), 256>>>(ah, H, t, X.f13, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt,
-                                                   PF.gu, 2 * FF, H);
-        });
-        kb_swiglu_h<<<(unsigned) (((size_t) nr * FF + 255) / 256), 256>>>(PF.gu, ah, nr);
-        expert_parts(l, true, [&](const uint8_t* const* t) {
-            g<<<dim3(maxt_tc, H / TN), 256>>>(ah, FF, t, X.f2, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt, PF.ey,
-                                              H, FF);
-        });
+        if (packed && g_native_gemm_bf16) {
+            run(X.nvfp4 ? kb_moe_gemm_tc<true, true, TN, __nv_bfloat16, true> : kb_moe_gemm_tc<false, true, TN, __nv_bfloat16, true>,
+                reinterpret_cast<__nv_bfloat16*>(PF.act), TN);
+        } else if (packed && g_native_gemm_fast) {
+            run(X.nvfp4 ? kb_moe_gemm_tc<true, true, TN, half, true> : kb_moe_gemm_tc<false, true, TN, half, true>, ah, TN);
+        } else if (packed && g_native_gemm == 64 && T <= 256) {
+            run(X.nvfp4 ? kb_moe_gemm_tc<true, true, 64> : kb_moe_gemm_tc<false, true, 64>, ah, 64);
+        } else if (packed) {
+            run(X.nvfp4 ? kb_moe_gemm_tc<true, true> : kb_moe_gemm_tc<false, true>, ah, TN);
+        } else {
+            run(X.nvfp4 ? kb_moe_gemm_tc<true> : kb_moe_gemm_tc<false>, ah, TN);
+        }
     } else {
         auto g = X.nvfp4 ? kb_moe_gemm<true> : kb_moe_gemm<false>;
         expert_parts(l, false, [&](const uint8_t* const* t) {
@@ -6419,7 +6714,7 @@ void draft_device(int p) {
 void forward_prefill_device(int T, int pos0, float* all);
 void forward_prefill(const int* toks, int T, int pos0, float* all) {
     if (E.prefill_routes && !PF.rows_argmax && !g_pf_route_active) {
-        gpu_fetch_release();
+        if (const char* rel = std::getenv("INK2_RELEASE_ARENA_PREFILL"); rel && std::atoi(rel) != 0) gpu_fetch_release();
         CK(cudaMemset(E.prefill_routes, 0, (size_t) NL * NE * sizeof(unsigned long long)));
         g_pf_route_active = true;
     }
@@ -6642,8 +6937,19 @@ int ink2_engine_main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_FETCH_BLOCKS")) g_fetch_blocks = std::clamp(std::atoi(r), 1, FETCH_BLOCKS);
     if (const char* r = std::getenv("INK2_NV_H16")) g_nv_h16 = std::atoi(r) != 0;
     {
-        int major = 0, sm_count = 0;   // default Q8 wide before Ampere only; tune GEMV min blocks / RPW per SM count
+        int major = 0, minor = 0, sm_count = 0;   // default Q8 wide before Ampere only; tune GEMV min blocks / RPW per SM count
         CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0));
+        CK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0));
+        const bool sm86 = major == 8 && minor == 6;
+        const char* native_gemm = std::getenv("INK2_NATIVE_GEMM");
+        if (sm86 && !native_gemm) {
+            g_native_gemm_fast = true;
+            g_native_gemm = TN;
+        } else if (sm86 && native_gemm) {
+            g_native_gemm_fast = std::strcmp(native_gemm, "fast") == 0;
+            g_native_gemm_bf16 = std::strcmp(native_gemm, "bf16") == 0;
+            g_native_gemm = g_native_gemm_fast || g_native_gemm_bf16 ? TN : std::atoi(native_gemm);
+        }
         CK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0));
         if (!std::getenv("INK2_GEMV_MINB") && sm_count > 0) g_gemv_min_blocks = 2 * sm_count;
         if (!std::getenv("INK2_RPW") && sm_count > 0 && sm_count <= 32) g_rpw = 8;
@@ -6823,7 +7129,7 @@ int ink2_engine_main(int argc, char** argv) {
     alloc_state();
     // Small-batch DSpark uses a compact verify workspace after the prompt buffers are released.
     g_pf_elastic = E.grow && E.offload && (!spec || g_spec_draft_n_max > 0);
-    if (PF.TP > 0) alloc_prefill();
+    if (PF.TP > 0) alloc_prefill(!dump_logits.empty());
     const size_t rec_n = (size_t) NCALLS * E.ctx * TOPK;
     if (E.rec_mode) {
         E.rec = (int*) dalloc(rec_n * sizeof(int));
@@ -7188,7 +7494,7 @@ int ink2_engine_main(int argc, char** argv) {
             if (start == pr.size()) {
                 logits = last_logits;
             } else {
-                slide_expand((int) start - 1);
+                slide_expand((int) start - 1, (int) (pr.size() - start));
                 for (size_t p0 = start, Tz = 0; p0 < pr.size(); p0 += Tz) {
                     const int T = sess_chunk((int) p0, pf_fit((int) std::min((size_t) PF.TP, pr.size() - p0), (int) p0));
                     if (g_pf_full) { context_full(hist, p0, pr.size()); break; }   // ink2_grow_guard.cuh
@@ -7211,12 +7517,26 @@ int ink2_engine_main(int argc, char** argv) {
                     continue;
                 }
                 CK(cudaMemcpy(logits.data(), E.logits, (size_t) VOCAB * 4, cudaMemcpyDeviceToHost));
+            }
+            const double t_pf_end = now_ms();
+            if (start < pr.size()) {
                 pf_unmap();
-            if (spec && max_new > 0) slide_expand((int) pr.size() - 1);
-            if (spec && max_new > 0 && g_spec_draft_n_max > 0 && g_pf_elastic) pf_map(g_spec_draft_n_max + 1);
+                if (spec && max_new > 0) slide_expand((int) pr.size() - 1);
+                if (spec && max_new > 0 && g_spec_draft_n_max > 0 && g_pf_elastic) pf_map(g_spec_draft_n_max + 1);
             }
             if (cache_prompt) sess_prompt_end(pr, logits);
             const double t1 = now_ms();
+            const double pure_prompt_ms = (start == pr.size()) ? 0.0 : (t_pf_end - t0);
+            const double transition_ms = (start == pr.size()) ? 0.0 : (t1 - t_pf_end);
+            double ttft_ms = t1 - t0;
+            bool got_first_tok = false;
+            auto emit_tok = [&](int tok) {
+                if (!got_first_tok) {
+                    ttft_ms = now_ms() - t0;
+                    got_first_tok = true;
+                }
+                ink2_emit("T %d", tok);
+            };
             const double draft_ms0 = D.draft_ms, verify_ms0 = D.verify_ms;
             const size_t verify_staging0 = PF.fbytes;
             std::vector<int> gen;
@@ -7225,11 +7545,11 @@ int ink2_engine_main(int argc, char** argv) {
             if (spec && max_new > 0 && !stop.load()) {
                 const int first = sample(logits, s);
                 gen.push_back(first);
-                ink2_emit("T %d", first);
+                emit_tok(first);
                 if (first == EOS_ID) finish = "stop";
                 else spec_continue(first, pos, max_new, s, [&](int t) {
                     gen.push_back(t);
-                    ink2_emit("T %d", t);
+                    emit_tok(t);
                     if (t == EOS_ID) { finish = "stop"; return false; }
                     return true;
                 }, &stop);
@@ -7242,7 +7562,7 @@ int ink2_engine_main(int argc, char** argv) {
                 if (stop.load()) { finish = "cancel"; break; }
                 const int next = next_tok;
                 gen.push_back(next);
-                ink2_emit("T %d", next);
+                emit_tok(next);
                 if (!s.ignore_eos && next == EOS_ID) { finish = "stop"; break; }
                 if (k + 1 < max_new) {
                     if (!kv_room(pos + 1)) { std::fprintf(stderr, "kv-grow: the answer ends at %d tokens: the K/V cannot grow\n", pos); break; }
@@ -7302,9 +7622,9 @@ int ink2_engine_main(int argc, char** argv) {
                 last_logits.clear();
             }
             smp.rng = std::move(s.rng);
-            // + drafts accepted / offered, prompt tokens not read (DONE fields 6-8: usage.cached_tokens)
-            ink2_emit("DONE %zu %zu %.0f %.0f %s %ld %ld %zu", gen.size(), pr.size(), t1 - t0, t2 - t1, finish,
-                      D.accepted - acc0, D.offered - off0, start);
+            // + drafts accepted / offered, prompt tokens not read (DONE fields 6-8: usage.cached_tokens, 9-10: transition/ttft)
+            ink2_emit("DONE %zu %zu %.0f %.0f %s %ld %ld %zu %.1f %.1f", gen.size(), pr.size(), pure_prompt_ms,
+                      t2 - t1, finish, D.accepted - acc0, D.offered - off0, start, transition_ms, ttft_ms);
         }
         return 0;
     }

@@ -157,6 +157,12 @@ json server_slot_stats::to_json() const {
         {"predicted_per_second",   n_gen_tps()},
     };
 
+    if (t_transition_ms >= 0.0) {
+        base["transition_ms"] = t_transition_ms;
+    }
+    if (t_ttft_ms >= 0.0) {
+        base["ttft_ms"] = t_ttft_ms;
+    }
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;

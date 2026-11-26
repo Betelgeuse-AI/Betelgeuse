@@ -435,6 +435,8 @@ struct server_slot_stats {
     int64_t t_start       = 0;
     int64_t t_prompt_last = 0;
     int64_t t_gen_last    = 0;
+    double  t_transition_ms = -1.0;
+    double  t_ttft_ms       = -1.0;
 
     // can only move one direction: start -> prompt -> gen
     void update_prompt_start() {
