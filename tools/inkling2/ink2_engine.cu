@@ -58,11 +58,16 @@
 #include <vector>
 #include <fstream>
 #include <filesystem>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -2615,24 +2620,65 @@ __global__ void kb_add(const float* a, const float* b, float* y, size_t n) {
 // ---------------------------------------------------------------------------------------------------------------------
 // Checkpoint and weights
 
-struct Ckpt {
-    std::string path;
-    StFile st;
-    const uint8_t* mapped = nullptr;
-    size_t mapped_size = 0;
-    ~Ckpt() { if (mapped) munmap((void*) mapped, mapped_size); }
-    std::string map_file() {
+struct ReadOnlyMapping {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+
+    ReadOnlyMapping() = default;
+    ReadOnlyMapping(const ReadOnlyMapping&) = delete;
+    ReadOnlyMapping& operator=(const ReadOnlyMapping&) = delete;
+
+    ~ReadOnlyMapping() {
+        if (!data) return;
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+#else
+        munmap(const_cast<uint8_t*>(data), size);
+#endif
+    }
+
+    std::string open(const std::string& path) {
+#ifdef _WIN32
+        const auto native_path = std::filesystem::path(path);
+        HANDLE file = CreateFileW(native_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return "cannot open " + path;
+        LARGE_INTEGER length{};
+        if (!GetFileSizeEx(file, &length) || length.QuadPart <= 0 ||
+            (uint64_t) length.QuadPart > std::numeric_limits<size_t>::max()) {
+            CloseHandle(file);
+            return "cannot stat " + path;
+        }
+        HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        CloseHandle(file);
+        if (!mapping) return "cannot map " + path;
+        data = static_cast<const uint8_t*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+        CloseHandle(mapping);
+        if (!data) return "cannot map " + path;
+        size = (size_t) length.QuadPart;
+#else
         const int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) return "cannot open " + path;
         struct stat info{};
-        if (fstat(fd, &info) != 0 || info.st_size <= 0) { ::close(fd); return "cannot stat " + path; }
-        mapped_size = (size_t) info.st_size;
-        void* p = mmap(nullptr, mapped_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (fstat(fd, &info) != 0 || info.st_size <= 0 || (uint64_t) info.st_size > std::numeric_limits<size_t>::max()) {
+            ::close(fd);
+            return "cannot stat " + path;
+        }
+        const size_t length = (size_t) info.st_size;
+        void* view = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
         ::close(fd);
-        if (p == MAP_FAILED) { mapped_size = 0; return "cannot map " + path; }
-        mapped = (const uint8_t*) p;
+        if (view == MAP_FAILED) return "cannot map " + path;
+        data = static_cast<const uint8_t*>(view);
+        size = length;
+#endif
         return "";
     }
+};
+
+struct Ckpt {
+    std::string path;
+    StFile st;
+    ReadOnlyMapping mapping;
+    std::string map_file() { return mapping.open(path); }
     const StTensor& t(const std::string& name) const {
         auto it = st.tensors.find(name);
         if (it == st.tensors.end()) { std::fprintf(stderr, "missing tensor %s\n", name.c_str()); std::exit(1); }
@@ -2640,11 +2686,11 @@ struct Ckpt {
     }
     const uint8_t* data(const std::string& name) const {
         const StTensor& d = t(name);
-        if (!mapped || d.end < d.begin || st.data_start + d.end > mapped_size) {
+        if (!mapping.data || d.end < d.begin || st.data_start > mapping.size || d.end > mapping.size - st.data_start) {
             std::fprintf(stderr, "%s: tensor mapping is unavailable or out of range\n", name.c_str());
             std::exit(1);
         }
-        return mapped + st.data_start + d.begin;
+        return mapping.data + st.data_start + d.begin;
     }
     std::vector<unsigned char> bytes(const std::string& name) const {
         std::vector<unsigned char> b;
@@ -3253,6 +3299,7 @@ void load() {
 // GGUF reader (one file, mapped read-only) and the loader for llama.cpp's merged inkling2_loop layout
 struct GgTensor { uint32_t type = 0; int64_t ne[4] = {1, 1, 1, 1}; int nd = 0; const uint8_t* data = nullptr; size_t bytes = 0; };
 struct Gguf {
+    ReadOnlyMapping mapping;
     const uint8_t* base = nullptr;
     size_t size = 0;
     std::map<std::string, GgTensor> t;
@@ -3276,15 +3323,10 @@ size_t gg_row_bytes(uint32_t type, int64_t ne0) {
     }
 }
 std::string gg_open(const std::string& path, Gguf& g) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) return "cannot open " + path;
-    struct stat st{};
-    fstat(fd, &st);
-    g.size = (size_t) st.st_size;
-    void* m = mmap(nullptr, g.size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED) return "cannot map " + path;
-    g.base = (const uint8_t*) m;
+    const std::string error = g.mapping.open(path);
+    if (!error.empty()) return error;
+    g.size = g.mapping.size;
+    g.base = g.mapping.data;
     size_t p = 0;
     auto rd = [&](void* dst, size_t n) { if (p + n > g.size) { std::fprintf(stderr, "GGUF: truncated\n"); std::exit(1); } std::memcpy(dst, g.base + p, n); p += n; };
     auto u32 = [&] { uint32_t v; rd(&v, 4); return v; };

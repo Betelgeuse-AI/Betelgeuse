@@ -22,9 +22,8 @@
 
 #include <algorithm>
 
-#if !defined(__linux__) || !(defined(__x86_64__) || defined(__i386__))
-// CBA: Linux x86 only (thread pinning, NUMA placement through sysfs, GCC target attributes); elsewhere --cpu-threads
-// is refused (isa() == nullptr) and the experts' host memory is plain memory
+#if !((defined(__linux__) && (defined(__x86_64__) || defined(__i386__))) || (defined(_WIN32) && defined(_M_X64)))
+// CPU expert workers are supported on Linux x86 and Windows x64. Other builds use plain host memory for experts.
 #include <cstdlib>
 namespace ink2cpu {
 int nodes() { return 1; }
@@ -41,6 +40,13 @@ void stop() {}
 #pragma GCC diagnostic ignored "-Wuninitialized"
 #endif
 #include <immintrin.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <intrin.h>
+#include <chrono>
+#else
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -48,6 +54,7 @@ void stop() {}
 #include <unistd.h>
 #include <cerrno>
 #include <time.h>
+#endif
 
 #include <atomic>
 #include <cmath>
@@ -65,6 +72,37 @@ namespace ink2cpu {
 namespace {
 
 // ------------------------------------------------------------------------------------------------ topology
+#ifdef _WIN32
+bool numa_off() { return true; }
+
+std::vector<int> node_cores(int) {
+    DWORD_PTR allowed = 0, system_mask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &allowed, &system_mask) || !allowed) return {0};
+
+    DWORD bytes = 0;
+    GetLogicalProcessorInformation(nullptr, &bytes);
+    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> topology(bytes / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+    const char* ht_env = std::getenv("INK2_CPU_HT");
+    std::vector<int> cores;
+    if (!(ht_env && std::atoi(ht_env)) && bytes && GetLogicalProcessorInformation(topology.data(), &bytes)) {
+        for (const auto& info : topology) {
+            if (info.Relationship != RelationProcessorCore || !(info.ProcessorMask & allowed)) continue;
+            unsigned long cpu = 0;
+            _BitScanForward64(&cpu, info.ProcessorMask & allowed);
+            cores.push_back((int) cpu);
+        }
+    }
+    if (cores.empty()) {
+        for (int cpu = 0; cpu < (int) (8 * sizeof(allowed)); ++cpu) {
+            if (allowed & (DWORD_PTR(1) << cpu)) cores.push_back(cpu);
+        }
+    }
+    return cores;
+}
+
+void pin(int cpu) { SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << cpu); }
+void nap_us(long us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
+#else
 std::vector<int> parse_list(const std::string& s) {   // "0-23,48-71"
     std::vector<int> out;
     std::stringstream ss(s);
@@ -117,6 +155,7 @@ void nap_us(long us) {
     timespec t{0, us * 1000};
     nanosleep(&t, nullptr);
 }
+#endif
 
 // ------------------------------------------------------------------------------------------------ tables
 float E4H[256];    // e4m3 scale * 0.5 (the doubled NVFP4 codes)
@@ -132,10 +171,19 @@ float e4m3_decode(unsigned v) {   // as the GPU's (NaN for 0x7F / 0xFF)
 }
 
 // ------------------------------------------------------------------------------------------------ fp32 kernels
+#ifdef _MSC_VER
+#define T2
+#define T2V
+#define T5
+#define T5V
+#define INK2_NOINLINE __declspec(noinline)
+#else
 #define T2 __attribute__((target("avx2,fma,f16c")))
 #define T2V __attribute__((target("avx2,avxvnni,fma,f16c")))
 #define T5 __attribute__((target("avx512f,avx512bw,avx512vl,avx2,fma,f16c")))
 #define T5V __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")))
+#define INK2_NOINLINE __attribute__((noinline))
+#endif
 
 T2 inline float hsum256(__m256 a) {
     const __m128 h = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
@@ -521,9 +569,13 @@ constexpr double IDLE_MS = 20.0;   // spinning this long without work, then naps
 constexpr long NAP_US = 100;
 
 double now_ms() {
+#ifdef _WIN32
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#else
     timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+#endif
 }
 // a share of n items in units of `align`
 void share(int n, int t, int T, int align, int& a, int& b) {
@@ -639,7 +691,7 @@ void node_work(Node& N, Priv& P, int t, int& sense) {
 // next visit then starts slowly (nh.cpp: a 1-job visit after a gap of 1 ms or more takes +50 us, 58 -> 110).  The
 // waiting threads run a few 512-bit FMAs every WARM_SPINS pauses (~0.1 ms) so that a visit always starts warm.
 constexpr unsigned WARM_SPINS = 1024;
-T5 __attribute__((noinline)) void warm512(float* p) {
+T5 INK2_NOINLINE void warm512(float* p) {
     __m512 a = _mm512_loadu_ps(p), b = _mm512_set1_ps(0.999f);
     for (int i = 0; i < 8; ++i) a = _mm512_fmadd_ps(a, b, b);
     _mm512_storeu_ps(p, a);
@@ -764,6 +816,23 @@ void master(Node* N) {
 }  // namespace
 
 // ------------------------------------------------------------------------------------------------ API
+#ifdef _WIN32
+int nodes() { return 1; }
+
+void* node_alloc(size_t bytes, int) { return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
+void node_free(void* p, size_t) { if (p) VirtualFree(p, 0, MEM_RELEASE); }
+
+const char* isa() {
+    int features[4];
+    __cpuid(features, 0);
+    if (features[0] < 7) return nullptr;
+    __cpuidex(features, 1, 0);
+    constexpr int required = (1 << 12) | (1 << 27) | (1 << 28) | (1 << 29); // FMA, OSXSAVE, AVX, F16C
+    if ((features[2] & required) != required || (_xgetbv(0) & 6) != 6) return nullptr;
+    __cpuidex(features, 7, 0);
+    return (features[1] & (1 << 5)) ? "avx2" : nullptr;
+}
+#else
 int nodes() {
     int n = 0;
     while (!read_line("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist").empty()) ++n;
@@ -810,6 +879,7 @@ const char* isa() {
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c")) return "avx2";
     return nullptr;
 }
+#endif
 
 void start(const Setup& s) {
     S = s;
@@ -820,16 +890,22 @@ void start(const Setup& s) {
     const char* k = isa();
     const bool avx2_only = std::getenv("INK2_CPU_AVX2") != nullptr;
     g_isa = k && std::string(k) == "avx512" && !avx2_only ? 5 : 2;
+#ifdef _WIN32
+    g_vnni = g_vnni256 = false;
+#else
     g_vnni = g_isa == 5 && __builtin_cpu_supports("avx512vnni");
     const char* vnni256 = std::getenv("INK2_CPU_VNNI256");
     g_vnni256 = !g_vnni && __builtin_cpu_supports("avxvnni") && (!vnni256 || std::strcmp(vnni256, "0") != 0);
+#endif
     g_C = g_vnni ? 64 : 32;
     const char* act = std::getenv("INK2_CPU_ACT");
     g_q8 = act && std::string(act) == "int8" && S.h % 64 == 0 && S.ff % 64 == 0 && S.h <= BELL_H && S.ff <= FFX;
     g_trace = std::getenv("INK2_CPU_TRACE") != nullptr;
     if (const char* e = std::getenv("INK2_CPU_OPT")) g_opt = std::atoi(e);
+#ifndef _WIN32
     const char* ht_env = std::getenv("INK2_CPU_HT");
     const bool ht = ht_env != nullptr && std::atoi(ht_env) != 0;
+#endif
     const int nn = nodes();
     g_stop = false;
     for (int n = 0; n < nn; ++n) {
@@ -840,6 +916,10 @@ void start(const Setup& s) {
         std::vector<int> cores = node_cores(n);
         // node 0 keeps its first core for the engine's own thread (graph launches, the serve loop)
         if (n == 0 && cores.size() > 1) {
+#ifdef _WIN32
+            if (g_opt & 16) pin(cores.front());
+            cores.erase(cores.begin());
+#else
             const std::vector<int> sib = parse_list(read_line("/sys/devices/system/cpu/cpu" + std::to_string(cores[0]) +
                                                               "/topology/thread_siblings_list"));
             if (g_opt & 16) {
@@ -856,6 +936,7 @@ void start(const Setup& s) {
             } else {
                 cores.erase(cores.begin());
             }
+#endif
         }
         if ((int) cores.size() > S.threads) cores.resize(S.threads);
         N->cpus = cores;
