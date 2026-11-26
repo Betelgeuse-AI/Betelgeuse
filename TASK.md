@@ -12,7 +12,7 @@ a safe pinned-host expert pool on the RTX 3060 12 GB system.
 - Keep prompt caching enabled for every production-style measured request (`cache_prompt: true`).
 - Use `--cache-type-k q8_0 --cache-type-v q4_0 -fa on` for the measured requests.
 - Use the local checkpoint; do not download model files.
-- Keep logs and prompt artifacts under `/home/zyxciss/fluxaeros-data/`; do not use `/tmp`.
+- Keep logs and prompt artifacts under `<artifact-dir>/`; do not use `/tmp`.
 - Do not push. The paired benchmark session for this task is complete; do not repeat it as a speed run.
 
 ## Completed
@@ -27,7 +27,7 @@ a safe pinned-host expert pool on the RTX 3060 12 GB system.
   reports `k8v4 KV and tiled CUDA attention`. `-fa on` was included in every measured command.
 - [x] Kept a 16,384-token coherent server-documentation briefing as the measured prompt. Its SHA-256
   is `ae012289b87cc6909e812fa5e8d818ebb824870a20ddcd555f83c901d91f47a4`; prompt text, IDs, and
-  metadata are under `/home/zyxciss/fluxaeros-data/inkling-m5/`.
+  metadata are under `<artifact-dir>/inkling-m5/`.
 - [x] Kept `cache_prompt: true` for all four measured requests. The reported cache count was zero:
   after generation, the same standalone prompt was shorter than the saved prompt-plus-generation
   history, so it did not reuse a prefix. The warm row is same-process full prefill, not a cache hit.
@@ -40,7 +40,7 @@ a safe pinned-host expert pool on the RTX 3060 12 GB system.
   766.86 pp/s, 25.52 tok/s, 41.385 s.
 - [x] Audited the old `857.35 pp/s / 40.17 tok/s` prompt IDs. They detokenize to incoherent word
   fragments; this is not a representative coherent-prompt baseline. The audit note and new prompt
-  results are in `/home/zyxciss/fluxaeros-data/inkling-m5/`.
+  results are in `<artifact-dir>/inkling-m5/`.
 - [x] Confirmed all 1,536 loop-core experts (physical layers 6-17) are resident in VRAM. Current
   placement also holds 394/1,024 outer NVFP4 and 91/512 MXFP8 experts. No extra loop-core floor is
   needed; a prior floor experiment was removed because it hurt prefill without improving decode.
@@ -51,7 +51,7 @@ a safe pinned-host expert pool on the RTX 3060 12 GB system.
   swap disabled and zero cgroup high, max, or OOM events. Peak sampled VRAM was 11,814 MiB and
   11,832 MiB, respectively.
 - [x] Recorded process and cgroup memory peaks, request JSON, output hashes, and the server log in
-  `/home/zyxciss/fluxaeros-data/inkling-m5/`. The warm output hash matches between the two expert
+  `<artifact-dir>/inkling-m5/`. The warm output hash matches between the two expert
   source modes; first-request hashes also match each other. First and warm hashes differ, so this
   does not establish cold-to-warm output identity.
 - [x] Completed the read-only DSpark verify audit: current CPU verify batches unique nonresident
@@ -77,4 +77,4 @@ a safe pinned-host expert pool on the RTX 3060 12 GB system.
 
 - `tools/inkling2/benchmarks/v6.1-integration-2026-11-23/RESULTS.md`
 - `tools/inkling2/benchmarks/v6.1-integration-2026-11-23/RUN-DIFFERENCE.md`
-- `/home/zyxciss/fluxaeros-data/inkling-m5/`
+- `<artifact-dir>/inkling-m5/`

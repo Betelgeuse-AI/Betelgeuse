@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-strata_bin=${STRATA_BIN:-/home/zyxciss/strata-inkling2-build/strata-ink2}
+strata_bin=${STRATA_BIN:-<strata-bin>}
 betelgeuse_bin=${BETELGEUSE_BIN:-build/bin/bel-inkling2}
-model=${INK2_MODEL:-/home/zyxciss/Models/Inkling-2-Mini}
-routes=${INK2_ROUTE_PROFILE:-/home/zyxciss/Docs/strata-inkling2-rtx3060/evidence/inkling2-routes-profiled.freq}
-prefix=${INK2_PREFIX_SOURCE:-/home/zyxciss/Docs/strata-inkling2-rtx3060/evidence/prefill-prefix-16384.ids}
+model=${INK2_MODEL:-<checkpoint-dir>}
+routes=${INK2_ROUTE_PROFILE:-<evidence-dir>/inkling2-routes-profiled.freq}
+prefix=${INK2_PREFIX_SOURCE:-<evidence-dir>/prefill-prefix-16384.ids}
 output_root=${INK2_OUTPUT_ROOT:-tools/inkling2/benchmarks/prefill-tuning-16k/raw/prompt-16k-maxctx32k}
 
 mkdir -p "$output_root"

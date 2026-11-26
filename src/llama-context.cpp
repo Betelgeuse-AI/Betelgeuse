@@ -272,7 +272,7 @@ static bool oracle_trace_open(int n_layer, int n_expert, int top_k, int n_embd) 
 //   char[8] "RTGATE01"; u32 version; u32 n_layer; u32 n_embd; u32 n_expert;
 //   payload [n_layer][n_expert][n_embd] fp16 (layer-major, expert-major).
 static void dump_router_gates(const llama_model & model) {
-    const char * path = "/home/zyxciss/fluxaeros-data/q38_router_gates_fp16.bin";
+    const char * path = "<artifact-dir>/q38_router_gates_fp16.bin";
     const int n_layer = (int) model.hparams.n_layer();
     const int n_embd  = (int) model.hparams.n_embd;
     const int n_expert = (int) model.hparams.n_expert;

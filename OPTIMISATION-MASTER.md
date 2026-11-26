@@ -593,3 +593,41 @@ All generated responses decoded cleanly and remained coherent; `task-lru_ttl.ids
 - **5-task summary**: median `41.9 -> 42.2 tok/s`, mean `42.42 -> 42.58 tok/s`, mean transfer `124.7 -> 122.8 MB/tok`.
 - **Prefill speeds (`--kv-grow 1 --chunk 4096 --tc 1`)**: 16K `522.2`, 32K `649.1`, 64K `677.0`, 128K `i8r` `587.3`, 128K `k8v4` `596.2`, 262K `k8v4` `467.5 tok/s`.
 
+## Final release build: v0.7.0-alpha-orionis
+
+The figures above through the 262K row are **historical development-build measurements** from
+earlier `bel-inkling2` runs. They are retained for tuning history and are **not** measurements of the
+final release binaries.
+
+The final release build is `betelgeuse-v6.1` at the integration tip `db1f05d1b` plus the release
+fixes. It merges `feat/v61-cupti-opt` through `db1f05d1b`; the validated native-lowbit work is
+already included there. Experimental activation quantisation, MLA/CISA, speculative decoding and
+unfinished research features are excluded.
+
+`bel-server` release-build measurements, greedy decoding through the unified server:
+
+| Workload | Generation |
+| --- | ---: |
+| LRU cache with TTL | 44.51 tok/s |
+| Directed cycle detection | 45.52 tok/s |
+| Race-condition reasoning | 47.11 tok/s |
+| Token-bucket rate limiter | 44.33 tok/s |
+| Serializability reasoning | 45.27 tok/s |
+| Median | 45.27 tok/s |
+| Mean | 45.35 tok/s |
+| Coherent 16K source review | 42.03 tok/s |
+
+| Prompt processing | Performance |
+| --- | ---: |
+| Cold uncached 16K prefill | 818.9 tok/s |
+| Warm uncached 16K prefill | 1,232.8 tok/s |
+| Warm 16K phase transition | 203.4 ms |
+| Initial GPU-fetch preparation | Approximately 11 seconds |
+
+A warm uncached prefill reprocesses the complete prompt; it is not a KV cache hit.
+
+Release smoke verification of the packaged binaries covered cold requests, repeated requests, warm
+continuations, streaming, GPU-fetch defaults and environment overrides, the prefill host-pin
+lifetime, KV growth from 4096 to 8192 cells and decode-graph recapture. See `docs/betelgeuse.md` and
+`validation/` in the binary archive.
+

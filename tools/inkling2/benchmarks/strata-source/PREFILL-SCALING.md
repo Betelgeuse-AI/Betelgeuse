@@ -23,7 +23,7 @@ Fixed settings:
 
 The MXFP8 expert-pool fraction was .08 for chunks 256 through 2,048, .09 for chunk 4,096, .30 for chunk 8,192, and .35 for chunk 10,240. Larger chunks reserve more GPU workspace, so the engine had to assign more of its remaining pool to MXFP8 to keep the minimum number of MXFP8 slots. The pool size and chunk changed together in the larger tests.
 
-The prompt runs used prefill-prefix-257.ids, prefill-prefix-1024.ids, prefill-prefix-4096.ids, or prefill-prefix-16384.ids, with --n 1. For reproducibility, the main command shape was strata-ink2 --model /home/zyxciss/Models/Inkling-2-Mini --max-context 32768 --chunk N --kv i8r --tc 1 --vram-reserve-mib 0 --cpu-threads 5 --tokens-file PREFIX --n 1 --expert-frequencies inkling2-routes-profiled.freq.
+The prompt runs used prefill-prefix-257.ids, prefill-prefix-1024.ids, prefill-prefix-4096.ids, or prefill-prefix-16384.ids, with --n 1. For reproducibility, the main command shape was strata-ink2 --model <checkpoint-dir> --max-context 32768 --chunk N --kv i8r --tc 1 --vram-reserve-mib 0 --cpu-threads 5 --tokens-file PREFIX --n 1 --expert-frequencies inkling2-routes-profiled.freq.
 
 Hardware: RTX 3060 12 GB; Intel i5-12400, 6 physical cores; 15 GB system RAM. No model files were downloaded.
 

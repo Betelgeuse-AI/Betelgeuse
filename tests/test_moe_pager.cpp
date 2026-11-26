@@ -18,7 +18,7 @@
 #include <cuda_runtime.h>
 
 static const char * MODEL =
-    "/home/zyxciss/Models/Qwen3.8-Flash-Next/UD-IQ2_XS/"
+    "<model-dir>/"
     "Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf";
 
 int main() {

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-strata_bin=${STRATA_BIN:-/home/zyxciss/strata-inkling2-build/strata-ink2}
+strata_bin=${STRATA_BIN:-<strata-bin>}
 betelgeuse_bin=${BETELGEUSE_BIN:-build/bin/bel-inkling2}
-model=${INK2_MODEL:-/home/zyxciss/Models/Inkling-2-Mini}
-routes=${INK2_ROUTE_PROFILE:-/home/zyxciss/Docs/strata-inkling2-rtx3060/evidence/inkling2-routes-profiled.freq}
-prefix_4k=${INK2_PREFIX_4K:-/home/zyxciss/Docs/strata-inkling2-rtx3060/evidence/betelgeuse-4k-8k/ink2-prefix-3584.ids}
-prefix_8k=${INK2_PREFIX_8K:-/home/zyxciss/Docs/strata-inkling2-rtx3060/evidence/betelgeuse-4k-8k/ink2-prefix-7680.ids}
+model=${INK2_MODEL:-<checkpoint-dir>}
+routes=${INK2_ROUTE_PROFILE:-<evidence-dir>/inkling2-routes-profiled.freq}
+prefix_4k=${INK2_PREFIX_4K:-<evidence-dir>/betelgeuse-4k-8k/ink2-prefix-3584.ids}
+prefix_8k=${INK2_PREFIX_8K:-<evidence-dir>/betelgeuse-4k-8k/ink2-prefix-7680.ids}
 out_dir=${INK2_OUTPUT_DIR:-tools/inkling2/benchmarks/paired-4k-8k/raw-rerun}
 
 mkdir -p "$out_dir"

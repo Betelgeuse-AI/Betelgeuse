@@ -34,7 +34,7 @@ generated 256 tokens. Its 16K rows were about 28.1-28.3 tok/s.
 5. The archived 16K token IDs used for the earlier 40 tok/s result detokenize to incoherent word
    fragments. That result is not a natural-prompt baseline. The coherent replacement run and its
    input audit are recorded in `RESULTS.md` under Mission 5 and in
-   `/home/zyxciss/fluxaeros-data/inkling-m5/prompt-audit.txt`.
+   `<artifact-dir>/inkling-m5/prompt-audit.txt`.
 
 ## Fix applied
 

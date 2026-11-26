@@ -11,7 +11,7 @@ host expert pin pool: 511 MiB across 73 route-ranked experts; remaining sources 
 host experts: 6242 MiB nonresident source, 511 MiB pinned host copy
 cpu experts: avx2, NVFP4 activations int8, 1 node(s) (NUMA placement off: INK2_NUMA_POOL=0), threads per node: 5
 load 13.4 s, 11.30 GiB in VRAM (ctx 32768)
-0.36.916.665 I srv  init_inkling: loaded direct Inkling checkpoint '/home/zyxciss/Models/Inkling-2-Mini' with k8v4 KV and tiled CUDA attention, context 32768, route profile /home/zyxciss/Models/Inkling-2-Mini/inkling2-routes-256k-decode.freq
+0.36.916.665 I srv  init_inkling: loaded direct Inkling checkpoint '<checkpoint-dir>' with k8v4 KV and tiled CUDA attention, context 32768, route profile <checkpoint-dir>/inkling2-routes-256k-decode.freq
 0.36.919.158 I srv  server_run_i: model loaded
 0.36.919.177 I srv  server_on_li: listening on http://127.0.0.1:18100
 1.05.221.595 I slot get_availabl: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1

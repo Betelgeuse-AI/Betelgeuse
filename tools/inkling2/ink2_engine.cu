@@ -4921,7 +4921,7 @@ void pin_host_experts(size_t requested) {
 // substantial prompt.  The recurrent core (6-17) stays in VRAM and the CPU path remains the
 // fallback whenever this allocation cannot be made.
 void gpu_fetch_release() {
-    if (!E.gpu_fetch_active && !E.pinned_host_experts) return;
+    if (!E.gpu_fetch_active) return;   // the prefill host pin pool is not a fetch arena
     CK(cudaDeviceSynchronize());
     if (E.fetch_ok_d) CK(cudaMemset(E.fetch_ok_d, 0, (size_t) NL * NE));
     if (E.fetch_stats) CK(cudaMemset(E.fetch_stats, 0, 4 * sizeof(int)));

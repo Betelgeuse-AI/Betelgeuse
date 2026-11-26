@@ -19,6 +19,6 @@ exec env \
     INK2_RING_EXTRA=8192 \
     INK2_MISS_DIAG=1 \
     "$root/build-inkling-probe/betelgeuse-build/bin/bel-server" \
-    -m /home/zyxciss/Models/Inkling-2-Mini \
+    -m <checkpoint-dir> \
     -c 32768 -t 5 --host 127.0.0.1 --port "$port" \
     --cache-type-k q8_0 --cache-type-v q4_0 -fa on

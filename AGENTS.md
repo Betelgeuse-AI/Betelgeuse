@@ -1,5 +1,26 @@
 # Instructions for llama.cpp
 
+## Betelgeuse repository notes
+
+This repository is the Betelgeuse fork of llama.cpp. The canonical development branch is
+`betelgeuse-v6.1`; release `v0.7.0-alpha-orionis` is built from its verified integration tip
+`db1f05d1b` plus the release fixes and documentation.
+
+- Product binaries are `bel-server`, `bel-cli` and the standalone `bel-inkling2`. CMake target names
+  remain `llama-server`, `llama-cli` and `llama-ink2` for upstream compatibility.
+- The native Inkling engine lives in `tools/inkling2`. Preserve `tools/inkling2/LICENSE.Strata` and
+  `tools/inkling2/CONTRIBUTING.md`; they record Strata/baptisterajaut provenance. Keep the upstream
+  `LICENSE` and `AUTHORS` notices intact.
+- The default server profile enables GPU fetch and pins 512 MiB of host experts. Overrides require
+  `INK2_ALLOW_TUNING_OVERRIDE`; see `docs/betelgeuse.md` before changing those defaults.
+- Release packaging is Linux x86-64 CUDA SM86 only. Do not bundle model weights, private prompts,
+  raw routing traces, credentials or scratch build output.
+- Do not merge experimental MLA/CISA, activation quantisation, speculative decoding or unfinished
+  research branches into the release line.
+- Publishing the canonical branch, annotated tag and GitHub release requires explicit user approval.
+  The upstream restrictions on automated PR submission below still apply to contributions to
+  ggml-org/llama.cpp.
+
 > [!IMPORTANT]
 >
 > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.

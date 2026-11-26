@@ -2289,11 +2289,11 @@ INK2_CPU_OPT=29 \
 INK2_OFF_MARGIN_MIB=64 \
 INK2_MX_POOL_FRACTION=0.08 \
 build/bin/bel-inkling2 \
-  --model /home/zyxciss/Models/Inkling-2-Mini \
+  --model <checkpoint-dir> \
   --max-context 16896 --chunk 4096 --kv i8r --tc 1 --graph 1 --spec 0 \
   --vram-reserve-mib 0 --cpu-threads 5 --kv-grow 1 --kv-grow-step 4096 \
   --tokens-file PREFIX.ids --n 512 \
-  --expert-frequencies /home/zyxciss/Models/Inkling-2-Mini/inkling2-routes-best512.freq
+  --expert-frequencies <checkpoint-dir>/inkling2-routes-best512.freq
 ```
 
 Use `inkling2-routes-256k-decode.freq` instead for 32K and longer contexts. `bel-inkling2 --serve`
@@ -2306,10 +2306,10 @@ contains the safetensors shards. `bel-cli -m <checkpoint directory>` does the sa
 `llama_server()` in a local thread. There is no `bel-inkling2` child process.
 
 ```sh
-build/bin/bel-server -m /home/zyxciss/Models/Inkling-2-Mini -c 16896 -t 5 \
+build/bin/bel-server -m <checkpoint-dir> -c 16896 -t 5 \
   --host 127.0.0.1 --port 8080
 
-build/bin/bel-cli -m /home/zyxciss/Models/Inkling-2-Mini -c 1536 -t 5 \
+build/bin/bel-cli -m <checkpoint-dir> -c 1536 -t 5 \
   -p "Hello, my name is" -n 8 --no-display-prompt -st
 ```
 

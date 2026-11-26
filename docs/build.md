@@ -1,5 +1,10 @@
 # Build llama.cpp locally
 
+> **Betelgeuse note:** For the native Inkling 2 Mini release build (`bel-server`, `bel-cli`,
+> `bel-inkling2`) see [Betelgeuse build and release guide](betelgeuse.md). It uses
+> `GGML_CUDA=ON`, `GGML_CUDA_ARCHITECTURES=86`, `CMAKE_CUDA_ARCHITECTURES=86` and
+> `LLAMA_BUILD_INKLING2_ENGINE=ON`.
+
 The main product of this project is the `llama` library. Its C-style interface can be found in [include/llama.h](../include/llama.h).
 
 The project also includes many example programs and tools using the `llama` library. The examples range from simple, minimal code snippets to sophisticated sub-projects such as an OpenAI-compatible HTTP server.

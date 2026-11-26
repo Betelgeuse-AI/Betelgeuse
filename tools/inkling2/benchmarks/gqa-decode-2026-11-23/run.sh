@@ -2,9 +2,9 @@
 set -euo pipefail
 
 binary=${BETELGEUSE_BIN:-build/bin/bel-inkling2}
-model=${INK2_MODEL:-/home/zyxciss/Models/Inkling-2-Mini}
-routes=${INK2_ROUTE_PROFILE:-/home/zyxciss/Docs/strata-inkling2-rtx3060/evidence/inkling2-routes-profiled.freq}
-prefix_source=${INK2_PREFIX_SOURCE:-/home/zyxciss/Docs/strata-inkling2-rtx3060/evidence/prefill-prefix-16384.ids}
+model=${INK2_MODEL:-<checkpoint-dir>}
+routes=${INK2_ROUTE_PROFILE:-<evidence-dir>/inkling2-routes-profiled.freq}
+prefix_source=${INK2_PREFIX_SOURCE:-<evidence-dir>/prefill-prefix-16384.ids}
 data_root=${INK2_DATA_ROOT:-$HOME/fluxaeros-data/inkling2-dspark-2026-11-23}
 output_root=${INK2_OUTPUT_ROOT:-$data_root/gqa-decode-2026-11-23/raw}
 work_dir=${INK2_PROMPT_ROOT:-$data_root/gqa-decode-2026-11-23/prompts}

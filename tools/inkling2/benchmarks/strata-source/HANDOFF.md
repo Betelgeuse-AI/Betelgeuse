@@ -7,7 +7,7 @@ Date: 2026-11-22
 - Source: Strata PR #6520 worktree, detached at `dd7fa18dc838607724191270a28d2d9e41ebb1bb`.
 - Worktree path: `~/strata-inkling2-test`.
 - This worktree contains uncommitted changes in `engine/src/inkling2/ink2_engine.cu`, `engine/src/inkling2/ink2_cpu.cpp`, and `engine/src/inkling2/ink2_cpu.hpp`.
-- Local model: `/home/zyxciss/Models/Inkling-2-Mini`.
+- Local model: `<checkpoint-dir>`.
 - Last built executable: `~/strata-inkling2-build/strata-ink2` (3,617,688 bytes). It was built from this worktree before the worktree move.
 - The 321 MiB build tree was copied to `~/strata-inkling2-build` and CMake was reconfigured against the relocated `engine/` source; the executable remains available there.
 - Machine: RTX 3060 12 GB, Intel i5-12400 (6 physical cores, AVX2), 15 GB system RAM.
@@ -32,7 +32,7 @@ INK2_CPU_OPT=29 \
 INK2_OFF_MARGIN_MIB=64 \
 INK2_MX_POOL_FRACTION=0.08 \
 ~/strata-inkling2-build/strata-ink2 \
-  --model /home/zyxciss/Models/Inkling-2-Mini \
+  --model <checkpoint-dir> \
   --max-context 32768 --chunk 256 --kv i8r --tc 1 \
   --vram-reserve-mib 0 --cpu-threads 5 \
   --tokens-file ~/Docs/strata-inkling2-rtx3060/evidence/strata-ink2-prompt-257.ids --n 512 \

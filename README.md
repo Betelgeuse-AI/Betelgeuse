@@ -1,136 +1,135 @@
-# llama.cpp
+# Betelgeuse v0.7.0 (Alpha-Orionis)
 
-![llama.cpp](https://raw.githubusercontent.com/ggml-org/llama-brand/refs/heads/master/logo/svg/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**Native Inkling 2 Mini support, built for memory-constrained hardware.**
 
-> **This is the `fluxaeros-mtp` MoE fork on top of llama.cpp v1.0.0.** Its demand-paged MoE path is a hardware-specific release candidate, not an upstream llama.cpp release. See [FluxAeros setup, cache warmup, measurements and limitations](docs/fluxaeros.md) before using this branch.
+Betelgeuse is a custom [llama.cpp](https://github.com/ggml-org/llama.cpp) fork. This release adds a
+native CUDA engine for Thinking Machines Lab's Inkling 2 Mini that executes the original mixed
+NVFP4, MXFP8 and BF16 checkpoint directly. No GGUF conversion, extra weight quantisation, expert
+skipping or speculative decoding is used in the reported benchmarks.
 
-<div align="center">
+Developed and optimised on a single RTX 3060 12 GB with 16 GB of single-channel DDR4 system memory.
 
-<b>LLM inference in C/C++</b>
+The unified server and CLI executables are **`bel-server`** and **`bel-cli`**. The llama C API and
+internal CMake target names are unchanged. The standalone **`bel-inkling2`** executable is retained
+for fixed-token benchmarking and reference work.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v1)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+> **Research preview.** Betelgeuse is not an upstream llama.cpp release. The native Inkling engine is
+> validated on Linux x86-64 with NVIDIA Ampere SM86. See [Current limitations](#current-limitations)
+> and [OPTIMISATION-MASTER.md](OPTIMISATION-MASTER.md) before using it in production.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Asanmai%20OR%20author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Athelittlefireman%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3AmasterFoad%20OR%20author%3Aallozaur%20OR%20author%3AAndreas-Krebbel%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Achaxu01%20OR%20author%3Alhez%20OR%20author%3AAlekseiNikiforovIBM%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming%20OR%20author%3Aynankani)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+## Performance
 
-</div>
+Test hardware: RTX 3060 12 GB, Intel Core i5-12400, 16 GB single-channel DDR4, Linux, CUDA SM86,
+original Inkling 2 Mini checkpoint, greedy decoding, 512 generated tokens per short workload through
+`bel-server`.
 
-## Quick start
+| Workload | Generation |
+|---|---:|
+| LRU cache with TTL | 44.51 tok/s |
+| Directed cycle detection | 45.52 tok/s |
+| Race-condition reasoning | 47.11 tok/s |
+| Token-bucket rate limiter | 44.33 tok/s |
+| Serializability reasoning | 45.27 tok/s |
+| Median | 45.27 tok/s |
+| Mean | 45.35 tok/s |
+| Coherent 16K source review | 42.03 tok/s |
 
-A few options to get `llama.cpp` installed on your machine:
+| Prompt processing | Performance |
+|---|---:|
+| Cold uncached 16K prefill | 818.9 tok/s |
+| Warm uncached 16K prefill | 1,232.8 tok/s |
+| Warm 16K phase transition | 203.4 ms |
+| Initial GPU-fetch preparation | Approximately 11 seconds |
 
-```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
+Warm uncached prefill processes the complete prompt again; it does not reuse previously calculated
+prompt KV states. Historical long-context results from earlier development builds (16K/32K/64K,
+128K and 262K) are recorded separately in [OPTIMISATION-MASTER.md](OPTIMISATION-MASTER.md) and are
+**not** measurements of this release build.
 
-# powershell
-irm https://llama.app/install.ps1 | iex
-```
+## Build
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
+Linux x86-64 with CMake 3.24+, a C++20 compiler and CUDA 12 or 13. SM86 is the validated target.
+ccache is recommended. UI assets are embedded only when present; disable the bundled UI for a
+minimal server build.
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+git clone https://github.com/Betelgeuse-AI/Betelgeuse.git
+cd Betelgeuse
+git checkout v0.7.0-alpha-orionis
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_CUDA=ON \
+  -DGGML_CUDA_ARCHITECTURES=86 \
+  -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DLLAMA_BUILD_INKLING2_ENGINE=ON \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF \
+  -DLLAMA_BUILD_UI=OFF \
+  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+cmake --build build --target bel-server bel-cli llama-ink2 -j
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+The build produces `build/bin/bel-server`, `build/bin/bel-cli` and `build/bin/bel-inkling2`.
+See [docs/betelgeuse.md](docs/betelgeuse.md) for requirements, environment variables, packaging
+notes and the release validation commands.
 
-## Description
+## Run
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+Point `-m` at the directory containing the Inkling 2 Mini safetensors shards and tokenizer:
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+```sh
+build/bin/bel-server -m <checkpoint-dir> -c 16896 -t 5 \
+  --host 127.0.0.1 --port 8080 --no-webui
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+build/bin/bel-cli -m <checkpoint-dir> -c 1536 -t 5 \
+  -p "Hello, my name is" -n 8 --no-display-prompt -st
+```
 
-## Supported backends
+`bel-server` selects the embedded native engine automatically for a safetensors checkpoint
+directory and forces the tuned engine profile unless `INK2_ALLOW_TUNING_OVERRIDE` is set. GPU fetch
+is enabled by default in the server. With `INK2_ALLOW_TUNING_OVERRIDE=1`, `INK2_GPU_FETCH=0` and
+`INK2_PIN_HOST_MIB=N` are honoured; without the override they are ignored so experiment settings
+cannot silently degrade a normal request.
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Huawei Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## What's new
 
-## Documentation
+- Direct execution of the original NVFP4, MXFP8 and BF16 checkpoint with packed expert weights.
+- Ampere low-bit GEMV kernels, packed FP16 tensor-core prefill and optimised BF16 projections.
+- GPU-side greedy sampling, full recurrent execution and original expert selection.
+- Architecture-aware residency: recurrent-core experts stay resident, nonresident experts use a
+  bounded GPU fetch cache with decayed-LFU eviction and overlapped PCIe transfers.
+- Dual-phase inference: prefill workspace is reclaimed and reused for expert residency and decode
+  inside the same process, without disturbing the model, KV cache or recurrent states.
+- Fused grouped-query attention, sliding-window attention, dynamic KV growth, memory-aware pool
+  resizing, CUDA graph reconstruction and K8/V4 KV-cache support.
+- Unified `bel-server`/`bel-cli` interface with streaming and repeated requests.
 
-#### Tools
+## Current limitations
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+- The first request can incur a one-time GPU-fetch arena preparation cost of roughly 11 seconds.
+- Performance depends on expert locality, VRAM and system-memory bandwidth.
+- Long-context generation is slower than short-context generation.
+- Validation is concentrated on Linux and NVIDIA Ampere hardware.
+- Preserved checkpoint weights can still produce numerical differences across execution and
+  KV-cache precisions.
+- Experimental MLA/CISA, activation quantisation, speculative decoding and unfinished research
+  features are not included.
 
-#### Development
+## Acknowledgements and licensing
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+Betelgeuse builds on the [llama.cpp](https://github.com/ggml-org/llama.cpp) ecosystem and native
+Inkling engine work contributed to Strata by baptisterajaut. Thanks to the developers of llama.cpp,
+Strata, Thinking Machines Lab and the wider local inference community.
 
-## Contributing
+The repository keeps the upstream llama.cpp MIT licence and AUTHORS file. The Inkling engine carries
+`tools/inkling2/LICENSE.Strata` (MIT, copyright Niko1221 and the Strata contributors) and
+`tools/inkling2/CONTRIBUTING.md`. Packaged binaries include the required CUDA toolkit licence
+notices. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for the full release notes.
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Repository: https://github.com/Betelgeuse-AI/Betelgeuse

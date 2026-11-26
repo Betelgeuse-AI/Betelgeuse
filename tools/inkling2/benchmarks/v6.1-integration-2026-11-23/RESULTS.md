@@ -96,7 +96,7 @@ from that exact decode overfit and fell to 29.4 tok/s; it was not adopted.
 ## `bel-cli`
 
 Rebuilt `bel-cli` and verified a local-server smoke test:
-`bel-cli -m /home/zyxciss/Models/Inkling-2-Mini -c 1536 -t 5 -p "Hello, my name is" -n 8
+`bel-cli -m <checkpoint-dir> -c 1536 -t 5 -p "Hello, my name is" -n 8
 --no-display-prompt -st`. It loaded the direct checkpoint in-process (1,919 NVFP4 + 90 MXFP8,
 11.32 GiB VRAM) and generated at 30.2 tok/s on the 7-token prompt. The short prompt is not
 comparable to the 512-token table above. `bel-cli` inherits the server fixes because it calls
@@ -151,7 +151,7 @@ matching `libllama-server-impl.so` ran first; the rebuilt source ran second. Bot
 16,384-token prompt IDs, context 16,896, greedy sampling, i8r KV, 4,096 prompt chunk, five CPU
 threads, `best512` route profile, and 512 output tokens. The second request per server is the warm
 row. Full commands, JSON, server logs, memory samples, and prompt IDs are in
-`/home/zyxciss/fluxaeros-data/inkling-m1/`.
+`<artifact-dir>/inkling-m1/`.
 
 | Build | Request | Prefill | Decode | Combined |
 | --- | --- | ---: | ---: | ---: |
@@ -218,7 +218,7 @@ The direct backend maps K8/V4 to its `k8v4` KV implementation and uses tiled CUD
 prompt is a server-documentation briefing, not the archived repeated-token prompt: it is 48,144
 characters, 16,384 token IDs, SHA-256 `ae012289b87cc6909e812fa5e8d818ebb824870a20ddcd555f83c901d91f47a4`.
 The prompt text, token IDs, request script, JSON results, and memory samples are under
-`/home/zyxciss/fluxaeros-data/inkling-m5/`.
+`<artifact-dir>/inkling-m5/`.
 
 | Expert source | Request | Prefill | Decode | Combined |
 | --- | --- | ---: | ---: | ---: |
