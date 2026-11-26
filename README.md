@@ -134,6 +134,22 @@ build/bin/
 
 See [docs/betelgeuse.md](docs/betelgeuse.md) for detailed requirements, environment variables, packaging and release validation commands.
 
+### Windows standalone engine
+
+On Windows x64, build `bel-inkling2` with Visual Studio 2022, CMake and the CUDA Toolkit. The commands below target SM86 and were tested with CUDA 12.6.
+
+```powershell
+cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_INKLING2_ENGINE=ON
+cmake --build build-win --config Release --target llama-ink2 --parallel
+
+$env:Path = "$env:CUDA_PATH\bin;$env:Path"
+$env:INK2_GPU_FETCH = "1"
+$env:INK2_OFF_MARGIN_MIB = "256"
+& .\build-win\bin\Release\bel-inkling2.exe --model "C:\models\Inkling-2-Mini" --serve --max-context 4096 --chunk 512 --kv k8v4 --vram-reserve-mib 0 --cpu-threads 5 --kv-grow 1 --spec 0
+```
+
+Set `--model` to the original checkpoint directory. CPU expert offload requires AVX2, FMA and F16C on Windows. The engine emits `READY` when loaded and reads token IDs over stdin. The integrated `bel-server`, `bel-cli` and bundled HTTP UI use the Linux build above.
+
 ## Run
 
 Point `-m` at the original Inkling 2 Mini checkpoint directory containing the safetensors shards and tokenizer. No intermediate GGUF conversion is required.
