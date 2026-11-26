@@ -75,6 +75,42 @@ unsupported error. No images, sleep/reload, external draft models, or parallel r
 The embedded engine uses `ink2::embedded_server` for its line protocol, so a rebuild keeps
 `bel-server` and `bel-cli` working. The checkpoint reader is shared with the reference executable.
 
+## Local Chat Completions API
+
+`local_api.py` connects OpenAI-compatible clients to the standalone engine over loopback. Use Python 3.10 or newer, Jinja2 3.x, and tokenizers 0.22 or newer.
+
+```sh
+python -m pip install "jinja2>=3,<4" "tokenizers>=0.22,<1"
+python tools/inkling2/local_api.py --engine path/to/bel-inkling2 --model path/to/checkpoint
+```
+
+On Windows, pass the path to `bel-inkling2.exe`. The checkpoint directory must contain the original model shard, `tokenizer.json`, and `chat_template.jinja`. Use `--context` to set the context limit, `--chunk` to tune prefill size, or `--ui` to serve a built Betelgeuse UI directory.
+
+Set the client base URL to `http://127.0.0.1:8080/v1` and model ID to `Inkling-2-Mini`. The API provides model discovery, streaming and non-streaming chat completions, and text function calls with `auto` or `none` tool choice. The client executes its own tools and sends their results as `tool` messages with the matching `tool_call_id`. The engine processes one completion at a time.
+
+For OpenCode v2, add this provider to `opencode.json`:
+
+```json
+{
+  "model": "betelgeuse/Inkling-2-Mini",
+  "providers": {
+    "betelgeuse": {
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "Inkling-2-Mini": {
+          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
+          "compatibility": { "reasoningField": "reasoning_content" },
+          "limit": { "context": 16384, "output": 4096 }
+        }
+      }
+    }
+  }
+}
+```
+
+Match the OpenCode context limit to the server's `--context`. Run the protocol tests with `python -m unittest discover -s tools/inkling2 -p test_local_api.py`.
+
 ## Results
 
 - Server and direct-engine measurements: `benchmarks/v6.1-integration-2026-11-23/RESULTS.md`
